@@ -1,0 +1,204 @@
+.braurser {
+  background-color: @br_bg;
+  color: @br_text;
+  font-family: "${br_font_ui}", sans-serif;
+  font-size: ${br_body_font_size}px;
+  font-weight: ${br_font_weight_regular};
+}
+.braurser .display { font-size: ${br_display_font_size}px; font-weight: ${br_font_weight_semibold}; }
+.braurser .page-title { font-size: ${br_page_title_font_size}px; font-weight: ${br_font_weight_semibold}; }
+.braurser .section-title { font-size: ${br_section_title_font_size}px; font-weight: ${br_font_weight_semibold}; }
+.braurser .secondary { color: @br_muted; font-size: ${br_secondary_font_size}px; }
+.braurser .code { font-family: "${br_font_mono}", monospace; font-size: ${br_code_font_size}px; }
+.braurser button {
+  color: @br_text;
+  background-image: none;
+  background-color: @br_surface;
+  border: ${br_border_width}px solid @br_line;
+  border-radius: ${br_radius_button}px;
+  padding: ${br_space_2}px ${br_space_3}px;
+  font-weight: ${br_font_weight_semibold};
+  box-shadow: none;
+  text-shadow: none;
+  transition: background-color ${br_hover_ms}ms ease;
+}
+.braurser button:hover { background-color: @br_hover; }
+.braurser button:active { background-color: @br_pressed; }
+.braurser button.primary {
+  background-color: @br_accent;
+  color: @br_on_accent;
+  border-color: @br_accent;
+}
+.braurser button.primary:hover { background-color: @br_accent_hover; }
+.braurser button.primary:active { background-color: @br_accent_pressed; }
+.braurser button.destructive {
+  background-color: @br_error_bg;
+  color: @br_error;
+  border-color: @br_error;
+}
+.braurser button.destructive:hover,
+.braurser button.destructive:active {
+  border-width: ${br_focus_width}px;
+  padding: ${br_emphasis_padding_y}px ${br_emphasis_padding_x}px;
+}
+.braurser button.chip { border-radius: ${br_radius_chip}px; }
+.braurser .selected, .braurser row:selected,
+.braurser button.chip:checked {
+  background-color: @br_selected;
+  color: @br_on_selected;
+}
+.braurser button.chip:checked:hover,
+.braurser button.chip:checked:active { border-color: @br_on_selected; }
+.braurser entry, .braurser textview, .braurser textview text {
+  background-color: @br_surface;
+  color: @br_text;
+}
+.braurser entry {
+  border: ${br_border_width}px solid @br_line;
+  border-radius: ${br_radius_field}px;
+  padding: ${br_space_2}px ${br_space_3}px;
+  box-shadow: none;
+}
+.braurser textview {
+  border: ${br_border_width}px solid @br_line;
+  border-radius: ${br_radius_field}px;
+  padding: ${br_space_2}px ${br_space_3}px;
+}
+.braurser entry > text > placeholder { color: @br_muted; }
+.braurser entry selection, .braurser textview text selection {
+  background-color: @br_selected;
+  color: @br_on_selected;
+}
+.braurser .card {
+  background-color: @br_surface;
+  border: ${br_border_width}px solid @br_separator;
+  border-radius: ${br_radius_card}px;
+  padding: ${br_card_padding}px;
+}
+.braurser .source-badge {
+  background-color: @br_subtle;
+  color: @br_text;
+  border-radius: ${br_radius_chip}px;
+  padding: ${br_space_1}px ${br_space_2}px;
+}
+.braurser .banner-info { background-color: @br_info_bg; color: @br_info; }
+.braurser .banner-warning { background-color: @br_warning_bg; color: @br_warning; }
+.braurser .banner-error { background-color: @br_error_bg; color: @br_error; }
+.braurser .banner-success { background-color: @br_success_bg; color: @br_success; }
+.braurser .banner-info > label { color: @br_info; }
+.braurser .banner-warning > label { color: @br_warning; }
+.braurser .banner-error > label { color: @br_error; }
+.braurser .banner-success > label { color: @br_success; }
+.braurser progressbar trough {
+  min-height: ${br_progress_height}px;
+  background-color: @br_subtle;
+  border: none;
+  border-radius: ${br_progress_radius}px;
+}
+.braurser progressbar progress {
+  min-height: ${br_progress_height}px;
+  background-color: @br_accent;
+  border: none;
+  border-radius: ${br_progress_radius}px;
+}
+.braurser checkbutton { padding: 0; color: @br_text; }
+.braurser checkbutton check, .braurser checkbutton radio {
+  min-width: ${br_indicator_size}px;
+  min-height: ${br_indicator_size}px;
+  margin: ${br_space_1}px;
+  padding: 0;
+  background-image: none;
+  background-color: @br_surface;
+  color: @br_text;
+  border: ${br_border_width}px solid @br_line;
+  box-shadow: none;
+}
+.braurser checkbutton check { border-radius: ${br_space_1}px; }
+.braurser checkbutton radio { border-radius: 50%; }
+.braurser checkbutton:hover check, .braurser checkbutton:hover radio { background-color: @br_hover; }
+.braurser checkbutton:active check, .braurser checkbutton:active radio { background-color: @br_pressed; }
+.braurser checkbutton check:checked, .braurser checkbutton radio:checked,
+.braurser checkbutton check:indeterminate {
+  background-color: @br_accent;
+  border-color: @br_accent;
+  color: @br_on_accent;
+}
+.braurser checkbutton check:checked { -gtk-icon-source: -gtk-icontheme("object-select-symbolic"); }
+.braurser checkbutton radio:checked { -gtk-icon-source: -gtk-icontheme("media-record-symbolic"); }
+.braurser checkbutton check:indeterminate { -gtk-icon-source: -gtk-icontheme("list-remove-symbolic"); }
+.braurser switch {
+  min-width: ${br_switch_width}px;
+  padding: ${br_border_width}px;
+  background-image: none;
+  background-color: @br_subtle;
+  color: @br_muted;
+  border: ${br_border_width}px solid @br_line;
+  border-radius: ${br_switch_radius}px;
+}
+.braurser switch slider {
+  min-width: ${br_indicator_size}px;
+  min-height: ${br_indicator_size}px;
+  background-image: none;
+  background-color: @br_surface;
+  border: ${br_border_width}px solid @br_line;
+  border-radius: 50%;
+  box-shadow: none;
+}
+.braurser switch:hover { background-color: @br_hover; }
+.braurser switch:checked { background-color: @br_accent; border-color: @br_accent; color: @br_on_accent; }
+.braurser switch:checked slider { background-color: @br_on_accent; border-color: @br_on_accent; }
+.braurser dropdown > button { border-radius: ${br_radius_field}px; }
+.braurser dropdown popover contents, .braurser popover contents {
+  background-color: @br_surface;
+  color: @br_text;
+  border: ${br_border_width}px solid @br_line;
+  border-radius: ${br_radius_dialog}px;
+  padding: ${br_space_2}px;
+  box-shadow: none;
+}
+.braurser popover arrow { background-color: @br_surface; border-color: @br_line; }
+.braurser list, .braurser listview { background-color: @br_surface; color: @br_text; }
+.braurser row { background-color: @br_surface; color: @br_text; }
+.braurser row:hover { background-color: @br_hover; }
+.braurser row:active { background-color: @br_pressed; }
+.braurser row:selected, .braurser row:selected:hover, .braurser row:selected:active {
+  background-color: @br_selected;
+  color: @br_on_selected;
+}
+.braurser scrollbar { background-color: @br_bg; }
+.braurser scrollbar trough { background-color: @br_subtle; }
+.braurser scrollbar slider {
+  min-width: ${br_scrollbar_width}px;
+  min-height: ${br_scrollbar_width}px;
+  background-color: @br_line;
+  border: none;
+  border-radius: ${br_radius_field}px;
+}
+.braurser scrollbar slider:hover { background-color: @br_muted; }
+.braurser scrollbar slider:active { background-color: @br_accent; }
+.braurser separator { background-color: @br_separator; min-width: ${br_border_width}px; min-height: ${br_border_width}px; }
+.braurser link, .braurser label > link { color: @br_accent; }
+.braurser link:hover, .braurser label > link:hover { color: @br_accent_hover; }
+.braurser button:disabled, .braurser button.primary:disabled,
+.braurser button.destructive:disabled, .braurser button.chip:disabled,
+.braurser button.chip:checked:disabled, .braurser entry:disabled,
+.braurser textview:disabled, .braurser textview:disabled text,
+.braurser checkbutton check:disabled, .braurser checkbutton radio:disabled,
+.braurser checkbutton:disabled check, .braurser checkbutton:disabled radio,
+.braurser switch:disabled, .braurser switch:disabled slider {
+  background-color: @br_subtle;
+  color: @br_muted;
+  border-color: @br_line;
+  opacity: 1;
+}
+.braurser button.destructive:disabled {
+  border-width: ${br_border_width}px;
+  padding: ${br_space_2}px ${br_space_3}px;
+}
+.braurser label:disabled, .braurser checkbutton:disabled { color: @br_muted; opacity: 1; }
+.braurser scrollbar:disabled slider { background-color: @br_muted; }
+.braurser :focus-visible {
+  outline: ${br_focus_width}px solid @br_accent;
+  outline-offset: ${br_focus_offset}px;
+}
+.braurser.reduced-motion, .braurser.reduced-motion * { transition: none; animation: none; }

@@ -1,0 +1,16 @@
+include(GNUInstallDirs)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(NOTIFIER_GIOMM REQUIRED IMPORTED_TARGET giomm-2.68)
+
+add_library(braurser-notifier-policy STATIC policy.cpp)
+target_include_directories(braurser-notifier-policy PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}" "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(braurser-notifier-policy PUBLIC braurser-protocol)
+braurser_harden(braurser-notifier-policy)
+add_executable(braurser-notifier main.cpp)
+target_link_libraries(braurser-notifier PRIVATE braurser-notifier-policy braurser-presenter braurser-daemon-core PkgConfig::NOTIFIER_GIOMM)
+braurser_harden(braurser-notifier)
+install(TARGETS braurser-notifier RUNTIME DESTINATION bin)
+
+set(BRAURSER_BINDIR "${CMAKE_INSTALL_PREFIX}/bin")
+configure_file("${PROJECT_SOURCE_DIR}/data/braurser-notifier.desktop.in" "${CMAKE_CURRENT_BINARY_DIR}/braurser-notifier.desktop" @ONLY)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/braurser-notifier.desktop" DESTINATION share/braurser)

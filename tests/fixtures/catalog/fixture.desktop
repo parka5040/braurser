@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Fixture
+Name[fr]=Exemple
+GenericName=Demo\sProgram
+Exec=fixture %u
+Icon=fixture
+NoDisplay=false
+Hidden=false
+Categories=Utility;Education;
+MimeType=text/plain;
+StartupWMClass=Fixture

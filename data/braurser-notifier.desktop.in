@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=braurser-notifier
+Exec=@BRAURSER_BINDIR@/braurser-notifier
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+Terminal=false

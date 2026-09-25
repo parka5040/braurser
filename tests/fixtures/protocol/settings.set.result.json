@@ -1,0 +1,12 @@
+{
+  "settings": {
+    "ui": "auto",
+    "helper": "paru",
+    "check_frequency": "daily",
+    "notifications": false,
+    "autostart": false,
+    "review_builds": false,
+    "show_log": false,
+    "theme": "system"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "packageBase": "sample",
+  "files": [
+    {
+      "name": "PKGBUILD",
+      "text": "pkgname=sample\n"
+    }
+  ],
+  "truncated": false
+}

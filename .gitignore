@@ -1,0 +1,27 @@
+# Build
+/build/
+/build-*/
+CMakeUserPresets.json
+compile_commands.json
+
+*.pkg.tar
+*.pkg.tar.*
+/pkg/
+/src/*/pkg/
+
+crash-*
+leak-*
+timeout-*
+oom-*
+slow-unit-*
+*.profraw
+*.md
+
+# Editors
+.vscode/
+.idea/
+.cache/
+*.swp
+*~
+.DS_Store
+.claude/.cc-writes/

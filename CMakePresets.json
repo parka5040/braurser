@@ -1,0 +1,96 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "devdeps",
+      "hidden": true,
+      "environment": {
+        "PKG_CONFIG_PATH": "${sourceDir}/build/devdeps/usr/lib/pkgconfig:${sourceDir}/build/devdeps/usr/share/pkgconfig:$penv{PKG_CONFIG_PATH}"
+      },
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "${sourceDir}/build/devdeps/usr",
+        "PKG_CONFIG_ARGN": "--define-prefix"
+      }
+    },
+    {
+      "name": "release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "inherits": "devdeps"
+    },
+    {
+      "name": "asan",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/asan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "BRAURSER_SANITIZE": "address;undefined"
+      },
+      "inherits": "devdeps"
+    },
+    {
+      "name": "fuzz",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/fuzz",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "BRAURSER_BUILD_FUZZERS": "ON"
+      },
+      "inherits": "devdeps"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan"
+    },
+    {
+      "name": "fuzz",
+      "configurePreset": "fuzz"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "ignore"
+      }
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "ignore"
+      },
+      "environment": {
+        "LSAN_OPTIONS": "suppressions=${sourceDir}/tests/lsan.supp:print_suppressions=0"
+      }
+    },
+    {
+      "name": "fuzz",
+      "configurePreset": "fuzz",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "ignore"
+      }
+    }
+  ]
+}

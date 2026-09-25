@@ -1,0 +1,33 @@
+{
+  "planId": "sample",
+  "transactions": [
+    {
+      "plan_id": "sample",
+      "revision": 1,
+      "kind": "install",
+      "installs": [],
+      "upgrades": [],
+      "removals": [],
+      "replacements": [],
+      "conflicts": [],
+      "restart": [],
+      "requires_build_review": false,
+      "build_review_refs": [],
+      "protected_blockers": [],
+      "blockers": [],
+      "approval_token": "opaque-token"
+    }
+  ],
+  "restartAdvice": [
+    {
+      "package": {
+        "source": "official",
+        "name": "sample"
+      },
+      "level": "none",
+      "reason_key": "error.generic_title"
+    }
+  ],
+  "requiresApproval": false,
+  "blockers": []
+}

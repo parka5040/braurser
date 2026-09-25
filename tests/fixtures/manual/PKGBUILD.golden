@@ -1,0 +1,12 @@
+pkgname=braurser-git-demo
+pkgver=19700101000000.gaaaaaaaaaaaa
+pkgrel=1
+arch=('any')
+license=('custom:unknown')
+url='https://example.org/owner/demo.git'
+source=()
+sha256sums=()
+package() {
+    mkdir -p -- "$pkgdir/usr/local"
+    cp -a -- "$BRAURSER_STAGE/." "$pkgdir/usr/local/"
+}

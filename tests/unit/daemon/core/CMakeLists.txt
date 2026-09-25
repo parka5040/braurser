@@ -1,0 +1,5 @@
+braurser_add_test(NAME core-process-tests PREFIX Core SOURCES process_test.cpp LIBS braurser-daemon-core)
+braurser_add_test(NAME core-connect-tests PREFIX Core SOURCES connect_test.cpp LIBS braurser-daemon-core)
+braurser_add_test(NAME core-http-tests PREFIX Core SOURCES http_test.cpp LIBS braurser-daemon-core)
+braurser_add_test(NAME core-files-tests PREFIX Core SOURCES files_test.cpp LIBS braurser-daemon-core)
+braurser_add_test(NAME core-text-tests PREFIX Core SOURCES text_test.cpp LIBS braurser-daemon-core)

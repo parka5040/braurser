@@ -1,0 +1,13 @@
+{
+  "receipts": [
+    {
+      "receipt_id": "sample",
+      "name": "sample",
+      "scope": "user",
+      "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "installed_at": "2026-09-25T00:00:00Z",
+      "launcher_ids": [],
+      "removable": false
+    }
+  ]
+}

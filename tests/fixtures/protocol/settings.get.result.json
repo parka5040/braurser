@@ -1,0 +1,6 @@
+{
+  "uiPreference": "auto",
+  "notifications": false,
+  "refreshPolicy": "daily",
+  "elevationPreference": "pkexec"
+}

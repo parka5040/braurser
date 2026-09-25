@@ -1,0 +1,14 @@
+{
+  "serverVersion": "sample",
+  "apiVersion": 1,
+  "helper": "paru",
+  "capabilities": {
+    "helper": "paru",
+    "helper_version": "sample",
+    "elevation": "pkexec",
+    "init": "systemd",
+    "distro_id": "arch",
+    "repos": []
+  },
+  "uiBackends": []
+}

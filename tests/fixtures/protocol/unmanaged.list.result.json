@@ -1,0 +1,12 @@
+{
+  "entries": [
+    {
+      "desktop_id": "sample",
+      "name": "sample",
+      "exec_display": "sample",
+      "path": "sample",
+      "owner": "braurser"
+    }
+  ],
+  "scanTime": "2026-09-25T00:00:00Z"
+}

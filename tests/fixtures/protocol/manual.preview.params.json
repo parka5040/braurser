@@ -1,0 +1,5 @@
+{
+  "httpsUrl": "https://example.org/repo",
+  "scriptPath": "install.sh",
+  "scope": "user"
+}

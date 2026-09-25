@@ -1,0 +1,12 @@
+{
+  "paru": {
+    "installed": false
+  },
+  "yay": {
+    "installed": true,
+    "version": "13.0.0"
+  },
+  "chosen": "yay",
+  "elevation": "unavailable",
+  "notes": []
+}

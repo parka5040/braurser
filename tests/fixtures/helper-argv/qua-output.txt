@@ -1,0 +1,10 @@
+=== paru query_aur_updates: paru -Qua
+=== exit=1 paru query_aur_updates
+--
+=== yay query_aur_updates: yay -Qua
+=== exit=1 yay query_aur_updates
+=== paru query_aur_updates_pending: paru -Qua
+downgrade 12.0.0-1 -> 12.0.3-1
+--
+=== yay query_aur_updates_pending: yay -Qua
+downgrade 12.0.0-1 -> 12.0.3-1 [1d5h]

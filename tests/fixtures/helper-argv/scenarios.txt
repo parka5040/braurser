@@ -1,0 +1,85 @@
+paru 2.1.0 libalpm 16.0.1 built from AUR source; yay 13.0.1 yay-bin; archlinux:base-devel 2026-09-24
+=== paru aur_install_prefixed: paru --sudo /usr/local/bin/fakesudo --nosudoloop --skipreview --clonedir /home/builder/.cache/braurser/build/paru/job2 --noconfirm -S --needed aur/downgrade
+=== exit=0 paru aur_install_prefixed
+=== paru aur_install_provided_name: paru --sudo /usr/local/bin/fakesudo --nosudoloop --skipreview --clonedir /home/builder/.cache/braurser/build/paru/job2 --noconfirm -S --needed aur/pfetch
+=== exit=0 paru aur_install_provided_name
+=== paru query_aur_updates_pending: paru -Qua
+=== exit=0 paru query_aur_updates_pending
+=== paru aur_single_update: paru --sudo /usr/local/bin/fakesudo --nosudoloop --skipreview --clonedir /home/builder/.cache/braurser/build/paru/job2 --noconfirm -S --needed aur/downgrade
+=== exit=0 paru aur_single_update
+=== paru aur_only_upgrade_pending: paru --sudo /usr/local/bin/fakesudo --nosudoloop --skipreview --clonedir /home/builder/.cache/braurser/build/paru/job2 --noconfirm -Sua
+=== exit=0 paru aur_only_upgrade_pending
+=== paru print_pkgbuild: paru -Gp downgrade
+=== exit=0 paru print_pkgbuild
+=== yay aur_install_prefixed: yay --sudo /usr/local/bin/fakesudo --answerclean None --answerdiff None --answeredit None --builddir /home/builder/.cache/braurser/build/yay/job2 --noconfirm -S --needed aur/downgrade
+=== exit=0 yay aur_install_prefixed
+=== yay aur_install_provided_name: yay --sudo /usr/local/bin/fakesudo --answerclean None --answerdiff None --answeredit None --builddir /home/builder/.cache/braurser/build/yay/job2 --noconfirm -S --needed aur/pfetch
+=== exit=0 yay aur_install_provided_name
+=== yay query_aur_updates_pending: yay -Qua
+=== exit=0 yay query_aur_updates_pending
+=== yay aur_single_update: yay --sudo /usr/local/bin/fakesudo --answerclean None --answerdiff None --answeredit None --builddir /home/builder/.cache/braurser/build/yay/job2 --noconfirm -S --needed aur/downgrade
+=== exit=0 yay aur_single_update
+=== yay aur_only_upgrade_pending: yay --sudo /usr/local/bin/fakesudo --answerclean None --answerdiff None --answeredit None --builddir /home/builder/.cache/braurser/build/yay/job2 --noconfirm -Sua
+=== exit=0 yay aur_only_upgrade_pending
+=== yay print_pkgbuild: yay -Gp downgrade
+=== exit=0 yay print_pkgbuild
+=== paru repo_install: paru --sudo /usr/local/bin/fakesudo --nosudoloop --skipreview --clonedir /home/builder/.cache/braurser/build/paru/job1 --noconfirm -S --needed tree
+=== exit=0 paru repo_install
+=== paru aur_install: paru --sudo /usr/local/bin/fakesudo --nosudoloop --skipreview --clonedir /home/builder/.cache/braurser/build/paru/job1 --noconfirm -S --needed downgrade
+=== exit=0 paru aur_install
+=== paru aur_install_nodeps: paru --sudo /usr/local/bin/fakesudo --nosudoloop --skipreview --clonedir /home/builder/.cache/braurser/build/paru/job1 --noconfirm -S --needed pfetch
+=== exit=0 paru aur_install_nodeps
+=== paru aur_reinstall_needed: paru --sudo /usr/local/bin/fakesudo --nosudoloop --skipreview --clonedir /home/builder/.cache/braurser/build/paru/job1 --noconfirm -S --needed pfetch
+=== exit=0 paru aur_reinstall_needed
+=== paru query_aur_updates: paru -Qua
+=== exit=1 paru query_aur_updates
+=== paru aur_only_upgrade: paru --sudo /usr/local/bin/fakesudo --nosudoloop --skipreview --clonedir /home/builder/.cache/braurser/build/paru/job1 --noconfirm -Sua
+=== exit=0 paru aur_only_upgrade
+=== paru sysupgrade: paru --sudo /usr/local/bin/fakesudo --nosudoloop --skipreview --clonedir /home/builder/.cache/braurser/build/paru/job1 --noconfirm -Syu
+=== exit=0 paru sysupgrade
+=== paru sysupgrade_with_pkg: paru --sudo /usr/local/bin/fakesudo --nosudoloop --skipreview --clonedir /home/builder/.cache/braurser/build/paru/job1 --noconfirm -Syu --needed tree
+=== exit=0 paru sysupgrade_with_pkg
+=== paru remove_repo: paru --sudo /usr/local/bin/fakesudo --nosudoloop --skipreview --clonedir /home/builder/.cache/braurser/build/paru/job1 --noconfirm -Rns tree
+=== exit=0 paru remove_repo
+=== paru remove_aur: paru --sudo /usr/local/bin/fakesudo --nosudoloop --skipreview --clonedir /home/builder/.cache/braurser/build/paru/job1 --noconfirm -Rns downgrade
+=== exit=0 paru remove_aur
+=== paru mark_asdeps: paru --sudo /usr/local/bin/fakesudo --nosudoloop --skipreview --clonedir /home/builder/.cache/braurser/build/paru/job1 --noconfirm -D --asdeps pfetch
+=== exit=1 paru mark_asdeps
+=== paru sudoloop_probe: paru --sudo /usr/local/bin/fakesudo --sudoloop --skipreview --clonedir /home/builder/.cache/braurser/build/paru/job1 --noconfirm -S --needed tree
+=== exit=0 paru sudoloop_probe
+=== paru exitcode_nothing: paru --sudo /usr/local/bin/fakesudo --nosudoloop --skipreview --clonedir /home/builder/.cache/braurser/build/paru/job1 --noconfirm -S --needed tree
+=== exit=0 paru exitcode_nothing
+=== paru exitcode_missing: paru --sudo /usr/local/bin/fakesudo --nosudoloop --skipreview --clonedir /home/builder/.cache/braurser/build/paru/job1 --noconfirm -S --needed braurser-no-such-package-xyz
+=== exit=1 paru exitcode_missing
+=== paru color_never: paru --sudo /usr/local/bin/fakesudo --nosudoloop --skipreview --clonedir /home/builder/.cache/braurser/build/paru/job1 --noconfirm --color never -S --needed tree
+=== exit=0 paru color_never
+=== yay repo_install: yay --sudo /usr/local/bin/fakesudo --answerclean None --answerdiff None --answeredit None --builddir /home/builder/.cache/braurser/build/yay/job1 --noconfirm -S --needed tree
+=== exit=0 yay repo_install
+=== yay aur_install: yay --sudo /usr/local/bin/fakesudo --answerclean None --answerdiff None --answeredit None --builddir /home/builder/.cache/braurser/build/yay/job1 --noconfirm -S --needed downgrade
+=== exit=1 yay aur_install
+=== yay aur_install_nodeps: yay --sudo /usr/local/bin/fakesudo --answerclean None --answerdiff None --answeredit None --builddir /home/builder/.cache/braurser/build/yay/job1 --noconfirm -S --needed pfetch
+=== exit=0 yay aur_install_nodeps
+=== yay aur_reinstall_needed: yay --sudo /usr/local/bin/fakesudo --answerclean None --answerdiff None --answeredit None --builddir /home/builder/.cache/braurser/build/yay/job1 --noconfirm -S --needed pfetch
+=== exit=0 yay aur_reinstall_needed
+=== yay query_aur_updates: yay -Qua
+=== exit=1 yay query_aur_updates
+=== yay aur_only_upgrade: yay --sudo /usr/local/bin/fakesudo --answerclean None --answerdiff None --answeredit None --builddir /home/builder/.cache/braurser/build/yay/job1 --noconfirm -Sua
+=== exit=0 yay aur_only_upgrade
+=== yay sysupgrade: yay --sudo /usr/local/bin/fakesudo --answerclean None --answerdiff None --answeredit None --builddir /home/builder/.cache/braurser/build/yay/job1 --noconfirm -Syu
+=== exit=0 yay sysupgrade
+=== yay sysupgrade_with_pkg: yay --sudo /usr/local/bin/fakesudo --answerclean None --answerdiff None --answeredit None --builddir /home/builder/.cache/braurser/build/yay/job1 --noconfirm -Syu --needed tree
+=== exit=0 yay sysupgrade_with_pkg
+=== yay remove_repo: yay --sudo /usr/local/bin/fakesudo --answerclean None --answerdiff None --answeredit None --builddir /home/builder/.cache/braurser/build/yay/job1 --noconfirm -Rns tree
+=== exit=0 yay remove_repo
+=== yay remove_aur: yay --sudo /usr/local/bin/fakesudo --answerclean None --answerdiff None --answeredit None --builddir /home/builder/.cache/braurser/build/yay/job1 --noconfirm -Rns downgrade
+=== exit=1 yay remove_aur
+=== yay mark_asdeps: yay --sudo /usr/local/bin/fakesudo --answerclean None --answerdiff None --answeredit None --builddir /home/builder/.cache/braurser/build/yay/job1 --noconfirm -D --asdeps pfetch
+=== exit=1 yay mark_asdeps
+=== yay sudoloop_probe: yay --sudo /usr/local/bin/fakesudo --answerclean None --answerdiff None --answeredit None --builddir /home/builder/.cache/braurser/build/yay/job1 --noconfirm --sudoloop -S --needed tree
+=== exit=0 yay sudoloop_probe
+=== yay exitcode_nothing: yay --sudo /usr/local/bin/fakesudo --answerclean None --answerdiff None --answeredit None --builddir /home/builder/.cache/braurser/build/yay/job1 --noconfirm -S --needed tree
+=== exit=0 yay exitcode_nothing
+=== yay exitcode_missing: yay --sudo /usr/local/bin/fakesudo --answerclean None --answerdiff None --answeredit None --builddir /home/builder/.cache/braurser/build/yay/job1 --noconfirm -S --needed braurser-no-such-package-xyz
+=== exit=1 yay exitcode_missing
+=== yay color_never: yay --sudo /usr/local/bin/fakesudo --answerclean None --answerdiff None --answeredit None --builddir /home/builder/.cache/braurser/build/yay/job1 --noconfirm --color never -S --needed tree
+=== exit=0 yay color_never

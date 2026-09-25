@@ -1,0 +1,10 @@
+{
+  "state": "queued",
+  "events": [
+    {
+      "sequence": 1,
+      "kind": "install",
+      "payload": {}
+    }
+  ]
+}

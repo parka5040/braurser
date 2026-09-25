@@ -1,0 +1,12 @@
+{
+  "jobId": "sample",
+  "sequence": 1,
+  "question": {
+    "question_id": "sample",
+    "token": "sample",
+    "expires_at": "2026-09-25T00:00:00Z",
+    "kind": "variant",
+    "options": [],
+    "urls_differ": false
+  }
+}

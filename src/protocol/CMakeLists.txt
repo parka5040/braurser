@@ -1,0 +1,5 @@
+find_package(nlohmann_json 3 REQUIRED)
+add_library(braurser-protocol STATIC frame.cpp dto.cpp validation.cpp rpc.cpp)
+target_include_directories(braurser-protocol PUBLIC "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(braurser-protocol PUBLIC braurser-validate nlohmann_json::nlohmann_json)
+braurser_harden(braurser-protocol)

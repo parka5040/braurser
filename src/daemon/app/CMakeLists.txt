@@ -1,0 +1,12 @@
+add_library(braurser-daemon-app STATIC services.cpp)
+target_include_directories(braurser-daemon-app PUBLIC "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(braurser-daemon-app PUBLIC braurser-daemon-api braurser-daemon-catalog braurser-daemon-cache braurser-daemon-wiki braurser-daemon-connectivity braurser-daemon-news braurser-daemon-updates braurser-daemon-manual braurser-daemon-helpers braurser-daemon-elevation braurser-domain)
+set(BRAURSER_DATA_DIR "${CMAKE_INSTALL_PREFIX}/share/braurser" CACHE PATH "Installed read-only data directory")
+target_compile_definitions(braurser-daemon-app PRIVATE BRAURSER_DATA_DIR="${BRAURSER_DATA_DIR}" BRAURSER_LIBEXEC_DIR="${BRAURSER_LIBEXEC_DIR}")
+braurser_harden(braurser-daemon-app)
+
+add_executable(braurserd main.cpp)
+target_include_directories(braurserd PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(braurserd PRIVATE braurser-daemon-app braurser-daemon-notifications braurser-daemon-jobs)
+braurser_harden(braurserd)
+install(TARGETS braurserd RUNTIME DESTINATION bin)

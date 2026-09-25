@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "kernel-headers-docs",
+      "level": "none",
+      "names": ["linux*-headers", "linux*-docs", "linux-api-headers"],
+      "paths": [],
+      "requires_running": false,
+      "reason": "restart.reason.kernel-headers"
+    },
+    {
+      "id": "kernel",
+      "level": "reboot",
+      "names": ["linux", "linux-lts", "linux-zen", "linux-hardened", "linux-rt", "linux-rt-lts", "linux-cachyos*"],
+      "paths": ["/usr/lib/modules/"],
+      "requires_running": false,
+      "reason": "restart.reason.kernel"
+    },
+    {
+      "id": "firmware-modules",
+      "level": "reboot",
+      "names": ["linux-firmware*", "*-dkms", "nvidia*", "nvidia-open*", "intel-ucode", "amd-ucode"],
+      "paths": [],
+      "requires_running": false,
+      "reason": "restart.reason.firmware"
+    },
+    {
+      "id": "core-system",
+      "level": "reboot",
+      "names": ["glibc", "lib32-glibc", "systemd", "openrc", "runit", "s6", "s6-rc", "dinit", "elogind", "seatd"],
+      "paths": [],
+      "requires_running": false,
+      "reason": "restart.reason.core-system"
+    },
+    {
+      "id": "bootloader",
+      "level": "reboot",
+      "names": ["grub", "refind", "limine", "syslinux"],
+      "paths": ["/boot/"],
+      "requires_running": false,
+      "reason": "restart.reason.bootloader"
+    },
+    {
+      "id": "system-bus",
+      "level": "reboot",
+      "names": ["dbus", "dbus-broker"],
+      "paths": [],
+      "requires_running": false,
+      "reason": "restart.reason.system-bus"
+    },
+    {
+      "id": "graphics-session",
+      "level": "logout",
+      "names": ["mesa", "lib32-mesa", "vulkan-*", "xorg-server", "xorg-xwayland", "wayland", "niri", "sway", "hyprland", "river", "labwc", "wayfire", "kwin", "mutter", "gnome-shell", "plasma-workspace", "xfwm4", "xfce4-session", "cinnamon", "muffin", "mate-session-manager", "lxqt-session", "i3-wm", "openbox", "gtk3", "gtk4", "qt6-base", "qt5-base"],
+      "paths": [],
+      "requires_running": false,
+      "reason": "restart.reason.graphics-session"
+    },
+    {
+      "id": "running-service",
+      "level": "restart-service",
+      "names": ["*-openrc", "*-runit", "*-s6", "*-dinit"],
+      "paths": ["/etc/init.d/", "/etc/runit/sv/", "/etc/s6/sv/", "/etc/dinit.d/", "/usr/lib/systemd/system/"],
+      "requires_running": true,
+      "reason": "restart.reason.running-service"
+    },
+    {
+      "id": "running-app",
+      "level": "restart-app",
+      "names": [],
+      "paths": ["/usr/share/applications/"],
+      "requires_running": true,
+      "reason": "restart.reason.running-app"
+    },
+    {
+      "id": "static-resources",
+      "level": "none",
+      "names": ["ttf-*", "otf-*", "noto-fonts*", "*-icon-theme", "*-docs", "man-pages", "tzdata", "*-themes"],
+      "paths": [],
+      "requires_running": false,
+      "reason": "restart.reason.static-resources"
+    }
+  ]
+}

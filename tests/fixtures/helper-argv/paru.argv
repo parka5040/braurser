@@ -1,0 +1,24 @@
+SCENARIO=paru:repo_install ARGV=SHIM pacman --sync --noconfirm --needed -- tree
+SCENARIO=paru:aur_install ARGV=SHIM pacman --sync --noconfirm --needed --noconfirm -- extra/pacman-contrib extra/fzf
+SCENARIO=paru:aur_install ARGV=SHIM pacman --database --noconfirm --asdeps -- pacman-contrib fzf
+SCENARIO=paru:aur_install ARGV=SHIM pacman --upgrade --noconfirm --noconfirm -- /home/builder/.cache/braurser/build/paru/job1/downgrade/downgrade-12.0.3-1-any.pkg.tar.zst
+SCENARIO=paru:aur_install ARGV=SHIM pacman --database --noconfirm --asexplicit -- downgrade
+SCENARIO=paru:aur_install_nodeps ARGV=SHIM pacman --sync --noconfirm --needed -- pfetch
+SCENARIO=paru:aur_reinstall_needed ARGV=SHIM pacman --sync --noconfirm --needed -- pfetch
+SCENARIO=paru:sysupgrade ARGV=SHIM pacman --sync --noconfirm -y -u --
+SCENARIO=paru:sysupgrade_with_pkg ARGV=SHIM pacman --sync --noconfirm -y -u --needed -- tree
+SCENARIO=paru:remove_repo ARGV=SHIM pacman --remove --noconfirm -n -s -- tree
+SCENARIO=paru:remove_aur ARGV=SHIM pacman --remove --noconfirm -n -s -- downgrade
+SCENARIO=paru:mark_asdeps ARGV=SHIM pacman --database --noconfirm --asdeps -- pfetch
+SCENARIO=paru:sudoloop_probe ARGV=SHIM -v
+SCENARIO=paru:sudoloop_probe ARGV=SHIM pacman --sync --noconfirm --needed -- tree
+SCENARIO=paru:exitcode_nothing ARGV=SHIM pacman --sync --noconfirm --needed -- tree
+SCENARIO=paru:color_never ARGV=SHIM pacman --sync --noconfirm --color=never --needed -- tree
+SCENARIO=paru:aur_install_prefixed ARGV=SHIM pacman --sync --noconfirm --needed --noconfirm -- extra/pacman-contrib extra/fzf
+SCENARIO=paru:aur_install_prefixed ARGV=SHIM pacman --database --noconfirm --asdeps -- pacman-contrib fzf
+SCENARIO=paru:aur_install_prefixed ARGV=SHIM pacman --upgrade --noconfirm --noconfirm -- /home/builder/.cache/braurser/build/paru/job2/downgrade/downgrade-12.0.3-1-any.pkg.tar.zst
+SCENARIO=paru:aur_install_prefixed ARGV=SHIM pacman --database --noconfirm --asexplicit -- downgrade
+SCENARIO=paru:aur_install_provided_name ARGV=SHIM pacman --upgrade --noconfirm --noconfirm -- /home/builder/.cache/braurser/build/paru/job2/pfetch/pfetch-1.11.0-1-any.pkg.tar.zst
+SCENARIO=paru:aur_install_provided_name ARGV=SHIM pacman --database --noconfirm --asexplicit -- pfetch
+SCENARIO=paru:aur_single_update ARGV=SHIM pacman --upgrade --noconfirm --noconfirm -- /home/builder/.cache/braurser/build/paru/job2/downgrade/downgrade-12.0.3-1-any.pkg.tar.zst
+SCENARIO=paru:aur_only_upgrade_pending ARGV=SHIM pacman --upgrade --noconfirm --noconfirm -- /home/builder/.cache/braurser/build/paru/job2/downgrade/downgrade-12.0.3-1-any.pkg.tar.zst

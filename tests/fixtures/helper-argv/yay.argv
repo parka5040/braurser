@@ -1,0 +1,31 @@
+SCENARIO=yay:repo_install ARGV=SHIM pacman -S --needed --noconfirm --config /etc/pacman.conf -- extra/tree
+SCENARIO=yay:repo_install ARGV=SHIM pacman -D -q --asexplicit --noconfirm --config /etc/pacman.conf -- tree
+SCENARIO=yay:aur_install_nodeps ARGV=SHIM pacman -S --needed --noconfirm --config /etc/pacman.conf -- extra/pfetch-rs
+SCENARIO=yay:aur_install_nodeps ARGV=SHIM pacman -D -q --asexplicit --noconfirm --config /etc/pacman.conf -- pfetch-rs
+SCENARIO=yay:aur_reinstall_needed ARGV=SHIM pacman -S --needed --noconfirm --config /etc/pacman.conf -- extra/pfetch-rs
+SCENARIO=yay:aur_reinstall_needed ARGV=SHIM pacman -D -q --asexplicit --noconfirm --config /etc/pacman.conf -- pfetch-rs
+SCENARIO=yay:sysupgrade ARGV=SHIM pacman -S -y --noconfirm --config /etc/pacman.conf --
+SCENARIO=yay:sysupgrade_with_pkg ARGV=SHIM pacman -S -y --needed --noconfirm --config /etc/pacman.conf --
+SCENARIO=yay:sysupgrade_with_pkg ARGV=SHIM pacman -S -u --needed -y --noconfirm --config /etc/pacman.conf -- extra/tree
+SCENARIO=yay:sysupgrade_with_pkg ARGV=SHIM pacman -D -q --asexplicit --noconfirm --config /etc/pacman.conf -- tree
+SCENARIO=yay:remove_repo ARGV=SHIM pacman -R -n -s --noconfirm --config /etc/pacman.conf -- tree
+SCENARIO=yay:remove_aur ARGV=SHIM pacman -R -n -s --noconfirm --config /etc/pacman.conf -- downgrade
+SCENARIO=yay:mark_asdeps ARGV=SHIM pacman -D --asdeps --noconfirm --config /etc/pacman.conf -- pfetch
+SCENARIO=yay:sudoloop_probe ARGV=SHIM -v
+SCENARIO=yay:sudoloop_probe ARGV=SHIM -v
+SCENARIO=yay:sudoloop_probe ARGV=SHIM pacman -S --needed --noconfirm --config /etc/pacman.conf -- extra/tree
+SCENARIO=yay:sudoloop_probe ARGV=SHIM pacman -D -q --asexplicit --noconfirm --config /etc/pacman.conf -- tree
+SCENARIO=yay:exitcode_nothing ARGV=SHIM pacman -S --needed --noconfirm --config /etc/pacman.conf -- extra/tree
+SCENARIO=yay:exitcode_nothing ARGV=SHIM pacman -D -q --asexplicit --noconfirm --config /etc/pacman.conf -- tree
+SCENARIO=yay:color_never ARGV=SHIM pacman --color never -S --needed --noconfirm --config /etc/pacman.conf -- extra/tree
+SCENARIO=yay:color_never ARGV=SHIM pacman --color never -D -q --asexplicit --noconfirm --config /etc/pacman.conf -- tree
+SCENARIO=yay:aur_install_prefixed ARGV=SHIM pacman -S --needed --noconfirm --config /etc/pacman.conf -- extra/fzf extra/pacman-contrib
+SCENARIO=yay:aur_install_prefixed ARGV=SHIM pacman -D -q --asdeps --noconfirm --config /etc/pacman.conf -- pacman-contrib fzf
+SCENARIO=yay:aur_install_prefixed ARGV=SHIM pacman -U --needed --noconfirm --config /etc/pacman.conf -- /home/builder/.cache/braurser/build/yay/job2/downgrade/downgrade-12.0.3-1-any.pkg.tar.zst
+SCENARIO=yay:aur_install_prefixed ARGV=SHIM pacman -D -q --asexplicit --noconfirm --config /etc/pacman.conf -- downgrade
+SCENARIO=yay:aur_install_provided_name ARGV=SHIM pacman -U --needed --noconfirm --config /etc/pacman.conf -- /home/builder/.cache/braurser/build/yay/job2/pfetch/pfetch-1.11.0-1-any.pkg.tar.zst
+SCENARIO=yay:aur_install_provided_name ARGV=SHIM pacman -D -q --asexplicit --noconfirm --config /etc/pacman.conf -- pfetch
+SCENARIO=yay:aur_single_update ARGV=SHIM pacman -U --needed --noconfirm --config /etc/pacman.conf -- /home/builder/.cache/braurser/build/yay/job2/downgrade/downgrade-12.0.3-1-any.pkg.tar.zst
+SCENARIO=yay:aur_single_update ARGV=SHIM pacman -D -q --asexplicit --noconfirm --config /etc/pacman.conf -- downgrade
+SCENARIO=yay:aur_only_upgrade_pending ARGV=SHIM pacman -U --noconfirm --config /etc/pacman.conf -- /home/builder/.cache/braurser/build/yay/job2/downgrade/downgrade-12.0.3-1-any.pkg.tar.zst
+SCENARIO=yay:aur_only_upgrade_pending ARGV=SHIM pacman -D -q --asexplicit --noconfirm --config /etc/pacman.conf -- downgrade

@@ -1,0 +1,1 @@
+<?xml version="1.0"?><!DOCTYPE components [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><components><component type="desktop-application"><id>bad</id><pkgname>fixture-app</pkgname><name>&xxe;</name></component></components>

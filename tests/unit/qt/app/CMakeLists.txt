@@ -1,0 +1,12 @@
+if(NOT TARGET braurser-qt-app)
+    return()
+endif()
+
+find_package(GTest REQUIRED)
+add_executable(braurser-qt-app-tests app_test.cpp)
+target_link_libraries(braurser-qt-app-tests PRIVATE braurser-qt-app braurser-qt-fixtures braurser-askpass-qt-ui GTest::gtest Qt6::Test)
+target_compile_definitions(braurser-qt-app-tests PRIVATE BRAURSER_QT_ASKPASS="$<TARGET_FILE:braurser-askpass-qt>")
+add_dependencies(braurser-qt-app-tests braurser-askpass-qt)
+braurser_harden(braurser-qt-app-tests)
+add_test(NAME QtApp.ScreensAndAuthentication COMMAND braurser-qt-app-tests)
+set_tests_properties(QtApp.ScreensAndAuthentication PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;TZ=UTC")

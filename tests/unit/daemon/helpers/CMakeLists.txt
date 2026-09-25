@@ -1,0 +1,6 @@
+braurser_add_test(NAME paru-helper-tests PREFIX Paru SOURCES paru_test.cpp LIBS braurser-daemon-helpers)
+braurser_add_test(NAME yay-helper-tests PREFIX Yay SOURCES yay_test.cpp LIBS braurser-daemon-helpers)
+braurser_add_test(NAME helper-parity-tests PREFIX HelperParity SOURCES parity_test.cpp LIBS braurser-daemon-helpers)
+foreach(target IN ITEMS paru-helper-tests yay-helper-tests helper-parity-tests)
+    target_compile_definitions(${target} PRIVATE BRAURSER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+endforeach()

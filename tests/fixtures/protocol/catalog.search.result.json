@@ -1,0 +1,14 @@
+{
+  "packages": [
+    {
+      "package": {
+        "source": "official",
+        "name": "sample"
+      },
+      "version": "sample",
+      "description": "sample",
+      "installed": false
+    }
+  ],
+  "stale": false
+}

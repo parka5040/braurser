@@ -1,0 +1,1 @@
+[{"Name":"fixture-app","PackageBase":"fixture-base","Version":"2.0-1","Description":"A test","NumVotes":10,"Popularity":1.25,"License":["MIT"],"Depends":["libfixture>=1"]},{"Name":"bad/name","Version":"1"}]

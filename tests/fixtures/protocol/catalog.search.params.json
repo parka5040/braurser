@@ -1,0 +1,17 @@
+{
+  "text": "sample",
+  "filters": {
+    "installed": false,
+    "explicit": false,
+    "deps": false,
+    "orphans": false,
+    "foreign": false,
+    "native": false,
+    "upgradable": false,
+    "aurOnly": false,
+    "repoOnly": false,
+    "appsOnly": false
+  },
+  "limit": 20,
+  "sort": "relevance"
+}

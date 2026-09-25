@@ -1,0 +1,5 @@
+function(braurser_component directory)
+    if(EXISTS "${CMAKE_SOURCE_DIR}/${directory}/CMakeLists.txt")
+        add_subdirectory("${CMAKE_SOURCE_DIR}/${directory}" "${CMAKE_BINARY_DIR}/${directory}")
+    endif()
+endfunction()

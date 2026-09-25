@@ -1,0 +1,7 @@
+if(NOT TARGET braurser-presenter-fixtures)
+    find_package(nlohmann_json 3 REQUIRED)
+    add_library(braurser-presenter-fixtures STATIC "${CMAKE_CURRENT_LIST_DIR}/fixtures.cpp")
+    target_include_directories(braurser-presenter-fixtures PUBLIC "${CMAKE_CURRENT_LIST_DIR}/..")
+    target_link_libraries(braurser-presenter-fixtures PUBLIC braurser-presenter nlohmann_json::nlohmann_json)
+    braurser_harden(braurser-presenter-fixtures)
+endif()

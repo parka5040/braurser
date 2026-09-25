@@ -1,0 +1,13 @@
+{
+  "details": {
+    "package": {
+      "source": "official",
+      "name": "sample"
+    },
+    "version": "sample",
+    "description": "sample",
+    "dependencies": []
+  },
+  "installedState": "not-installed",
+  "source": "official"
+}

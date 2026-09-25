@@ -1,0 +1,16 @@
+{
+  "plan_id": "plan-1",
+  "revision": 1,
+  "approval_token": "opaque-token",
+  "kind": "install",
+  "installs": [],
+  "upgrades": [],
+  "removals": [],
+  "replacements": [],
+  "conflicts": [],
+  "restart": [],
+  "requires_build_review": false,
+  "build_review_refs": [],
+  "protected_blockers": [],
+  "blockers": []
+}

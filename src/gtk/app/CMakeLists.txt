@@ -1,0 +1,8 @@
+include("${CMAKE_SOURCE_DIR}/tests/unit/presenter/fixtures.cmake")
+add_library(braurser-gtk-app STATIC application.cpp platform.cpp)
+target_link_libraries(braurser-gtk-app PUBLIC braurser-gtk-kit braurser-presenter)
+braurser_harden(braurser-gtk-app)
+add_executable(braurser-gtk main.cpp)
+target_link_libraries(braurser-gtk PRIVATE braurser-gtk-app braurser-presenter-fixtures)
+braurser_harden(braurser-gtk)
+install(TARGETS braurser-gtk RUNTIME DESTINATION bin)

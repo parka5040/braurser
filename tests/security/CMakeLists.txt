@@ -1,0 +1,7 @@
+braurser_add_test(NAME allowlist-tests PREFIX Allowlist SOURCES allowlist_test.cpp LIBS braurser-elevate-core)
+target_compile_definitions(allowlist-tests PRIVATE BRAURSER_FIXTURES="${PROJECT_SOURCE_DIR}/tests/fixtures/helper-argv")
+add_executable(braurser-test-failed-method fake_method.cpp)
+braurser_harden(braurser-test-failed-method)
+braurser_add_test(NAME pacman-helper-tests PREFIX PacmanHelper SOURCES pacman_helper_test.cpp LIBS braurser-pacman-request braurser-elevate-core)
+target_compile_definitions(pacman-helper-tests PRIVATE FAILED_METHOD_PATH="$<TARGET_FILE:braurser-test-failed-method>")
+add_dependencies(pacman-helper-tests braurser-test-failed-method)

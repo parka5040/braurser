@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=braurser
+GenericName=Software store
+Comment=Find, install, and update software
+Exec=@BRAURSER_BINDIR@/braurser %U
+Icon=braurser
+Categories=System;PackageManager;
+Keywords=software;store;packages;aur;install;update;
+Terminal=false

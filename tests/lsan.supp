@@ -1,0 +1,10 @@
+leak:libfontconfig.so
+leak:libglib-2.0.so
+leak:libgobject-2.0.so
+leak:libgio-2.0.so
+leak:libgtk-4.so
+leak:libpango-1.0.so
+leak:libpangoft2-1.0.so
+leak:libharfbuzz.so
+leak:libEGL_mesa.so
+leak:libgallium

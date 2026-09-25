@@ -1,0 +1,17 @@
+{
+  "choices": {
+    "options": [
+      {
+        "package": {
+          "source": "official",
+          "name": "sample"
+        },
+        "kind": "standard",
+        "development": false,
+        "recommended": false
+      }
+    ],
+    "urls_differ": false
+  },
+  "questionRequired": false
+}

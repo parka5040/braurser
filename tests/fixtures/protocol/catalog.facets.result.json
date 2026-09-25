@@ -1,0 +1,15 @@
+{
+  "repos": [
+    {
+      "name": "core",
+      "packageCount": 2
+    }
+  ],
+  "groups": [],
+  "categories": [
+    {
+      "id": "Utility",
+      "packageCount": 1
+    }
+  ]
+}

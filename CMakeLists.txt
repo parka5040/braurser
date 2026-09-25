@@ -1,0 +1,47 @@
+cmake_minimum_required(VERSION 3.25)
+project(braurser VERSION 0.1.0 LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+
+option(BRAURSER_BUILD_FUZZERS "Build Clang fuzz targets" OFF)
+
+include(cmake/Hardening.cmake)
+include(cmake/Components.cmake)
+include(cmake/Testing.cmake)
+include(cmake/Theme.cmake)
+
+enable_testing()
+
+braurser_generate_theme(OUTPUT_DIR "${CMAKE_BINARY_DIR}/generated/theme")
+braurser_rasterize_icons(OUTPUT_DIR "${CMAKE_BINARY_DIR}/generated/icons")
+
+braurser_component(src/validate)
+braurser_component(src/domain)
+braurser_component(src/protocol)
+braurser_component(src/presenter)
+braurser_component(src/daemon)
+braurser_component(src/elevate)
+braurser_component(src/pacman-helper)
+braurser_component(src/launcher)
+braurser_component(src/notifier)
+braurser_component(src/gtk)
+braurser_component(src/qt)
+braurser_component(src/askpass/gtk)
+braurser_component(src/askpass/qt)
+braurser_component(tests)
+
+install(FILES "${PROJECT_SOURCE_DIR}/data/restart-rules.json" DESTINATION share/braurser)
+install(FILES "${PROJECT_SOURCE_DIR}/data/copy/en.json" DESTINATION share/braurser/copy)
+install(FILES "${PROJECT_SOURCE_DIR}/data/icons/braurser.svg" DESTINATION share/icons/hicolor/scalable/apps)
+install(FILES "${PROJECT_SOURCE_DIR}/data/icons/braurser-symbolic.svg" DESTINATION share/icons/hicolor/symbolic/apps)
+install(CODE "execute_process(COMMAND \"${CMAKE_COMMAND}\" --build \"${CMAKE_BINARY_DIR}\" --target braurser_icons RESULT_VARIABLE icon_result)\nif(NOT icon_result EQUAL 0)\n    message(FATAL_ERROR \"Unable to build application icons\")\nendif()")
+foreach(size IN ITEMS 16 24 32 48 64 128 256)
+    install(FILES "${CMAKE_BINARY_DIR}/generated/icons/hicolor/${size}x${size}/apps/braurser.png"
+        DESTINATION "share/icons/hicolor/${size}x${size}/apps")
+endforeach()
