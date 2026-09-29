@@ -16,10 +16,17 @@ public:
     std::string fingerprint{"unchanged"};
     std::string kind{"install"};
     std::string helper{"auto"};
+    std::vector<std::string> review;
+    std::vector<protocol::PackageRef> protected_blockers;
+    std::vector<std::string> conflicts;
     Result<Snapshot> snapshot(const protocol::PlanParams& selection) override {
         Snapshot value;
         value.plan.kind = {selection.kind};
         value.plan.installs = {{{"official"}, "extra", selection.packageId.value_or("tree")}};
+        value.plan.requires_build_review = std::ranges::find(review, selection.packageId.value_or("tree")) != review.end();
+        if (value.plan.requires_build_review) value.plan.build_review_refs = value.plan.installs;
+        value.plan.protected_blockers = protected_blockers;
+        value.plan.conflicts = conflicts;
         value.fingerprint = fingerprint;
         value.targets = {selection.packageId.value_or("tree")};
         value.planned_version = "1-1";
@@ -431,6 +438,75 @@ TEST_F(JobsFixture, QuestionsAreBoundSingleUseAndExpire) {
     EXPECT_EQ(runner->answer(answer, 11).error().code, protocol::kExpiredQuestion);
 }
 
+TEST_F(JobsFixture, ProtectedBlockersAndConflictsAreRefusedBeforeQueueing) {
+    source.kind = "remove";
+    source.protected_blockers = {{{"official"}, {}, "linux"}};
+    auto blocked = plan("linux");
+    auto refused = runner->enqueue(blocked.plan_id, blocked.approval_token, 11, "remove");
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(refused.error().code, protocol::kUnsafeTransaction);
+    source.protected_blockers.clear();
+    source.conflicts = {"sudo"};
+    auto conflicting = plan("sudo-rs");
+    refused = runner->enqueue(conflicting.plan_id, conflicting.approval_token, 11, "remove");
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(refused.error().code, protocol::kUnsafeTransaction);
+    EXPECT_TRUE(processes.empty());
+    EXPECT_TRUE(runner->list({.limit = 100}, 11)->jobs.empty());
+    source.conflicts.clear();
+    auto allowed = plan("tree");
+    ASSERT_TRUE(runner->enqueue(allowed.plan_id, allowed.approval_token, 11, "remove"));
+    EXPECT_EQ(processes.size(), 1U);
+}
+
+TEST_F(JobsFixture, ReviewedBuildNeverStartsWithoutAnswer) {
+    source.review = {"nano"};
+    const auto review = enqueue(plan("nano"));
+    EXPECT_TRUE(processes.empty());
+    EXPECT_EQ(runner->get({review}, 11)->state.value, "needs-attention");
+    const auto next = enqueue(plan("htop"));
+    EXPECT_TRUE(processes.empty());
+    EXPECT_EQ(runner->get({next}, 11)->state.value, "queued");
+    const auto question = runner->get({review}, 11)->events.back()
+        .payload.get<protocol::JobQuestionNotification>().question;
+    ASSERT_TRUE(runner->answer({review, question.question_id, "ack", question.token}, 11));
+    ASSERT_EQ(processes.size(), 1U);
+    EXPECT_EQ(runner->get({review}, 11)->state.value, "running");
+}
+
+TEST_F(JobsFixture, ExpiredReviewIsCancelledAndReleasesQueue) {
+    const auto first = enqueue(plan("tree"));
+    source.review = {"nano"};
+    const auto review = enqueue(plan("nano"));
+    const auto third = enqueue(plan("htop"));
+    ASSERT_EQ(processes.size(), 1U);
+    now += std::chrono::minutes(10);
+    processes.front()->finish(0);
+    EXPECT_EQ(runner->get({first}, 11)->state.value, "succeeded");
+    EXPECT_EQ(runner->get({review}, 11)->state.value, "cancelled");
+    ASSERT_EQ(processes.size(), 2U);
+    EXPECT_EQ(runner->get({third}, 11)->state.value, "running");
+}
+
+TEST_F(JobsFixture, StopStartsNoFurtherJobsAndRefusesNewOnes) {
+    const auto first = enqueue(plan("tree"));
+    const auto second = enqueue(plan("nano"));
+    ASSERT_EQ(processes.size(), 1U);
+    runner->stop();
+    runner->stop();
+    EXPECT_GE(processes.front()->kills, 1);
+    processes.front()->finish(0);
+    EXPECT_EQ(runner->get({first}, 11)->state.value, "succeeded");
+    EXPECT_EQ(runner->get({second}, 11)->state.value, "queued");
+    EXPECT_EQ(processes.size(), 1U);
+    auto late = plan("htop");
+    auto refused = runner->enqueue(late.plan_id, late.approval_token, 11);
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(refused.error().code, protocol::kBusy);
+    runner->disconnect(11);
+    EXPECT_EQ(processes.size(), 1U);
+}
+
 class NoRun final : public core::ProcessRunner {
 public:
     std::expected<core::ProcessResult, core::ProcessError> run(const core::ProcessSpec&) override {
@@ -565,6 +641,27 @@ TEST(JobsStream, GioSubprocessUsesExplicitEnvironmentAndStreamsLines) {
     ASSERT_TRUE(exit.has_value());
     EXPECT_EQ(exit->exit_code, 0);
     EXPECT_EQ(lines, std::vector<std::string>{"success"});
+}
+
+TEST(JobsStream, ShortLivedChildrenAlwaysStartAndReportTheirStatus) {
+    Gio::init();
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        GioStreamingProcess process;
+        core::ProcessSpec spec;
+        spec.executable = attempt % 2 ? "/usr/bin/true" : "/usr/bin/false";
+        spec.env = {{"LC_ALL", "C"}};
+        spec.timeout = std::chrono::seconds(3);
+        auto loop = Glib::MainLoop::create();
+        std::optional<core::ProcessResult> exit;
+        ASSERT_TRUE(process.start(spec, [](std::string_view) {},
+            [&](const core::ProcessResult& result) { exit = result; loop->quit(); })) << attempt;
+        auto timer = Glib::signal_timeout().connect([&] { loop->quit(); return false; }, 5000);
+        loop->run();
+        timer.disconnect();
+        ASSERT_TRUE(exit.has_value()) << attempt;
+        EXPECT_FALSE(exit->signaled);
+        EXPECT_EQ(exit->exit_code, attempt % 2 ? 0 : 1);
+    }
 }
 
 TEST(JobsStream, RejectsUnsafeEnvironmentAndLimitsCapturedOutput) {

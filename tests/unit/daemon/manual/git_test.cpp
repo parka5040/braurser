@@ -3,8 +3,11 @@
 
 #include <git2.h>
 #include <gtest/gtest.h>
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <memory>
+#include <tuple>
 #include <unistd.h>
 
 namespace {
@@ -256,6 +259,180 @@ TEST(GitPreview, DetectsMakefileOnlyAndRejectsUnsupportedTree) {
     auto none = preview_repository(temp.path / "none.git", "HEAD", *url, "none-test");
     ASSERT_FALSE(none.has_value());
     EXPECT_EQ(none.error().code, "Unsupported");
+}
+
+using RawEntry = std::tuple<std::string, std::string, git_oid>;
+
+std::string commit_raw_tree(git_repository* repo, const std::vector<RawEntry>& entries) {
+    git_odb* raw_odb = nullptr;
+    if (git_repository_odb(&raw_odb, repo) != 0) return {};
+    std::unique_ptr<git_odb, decltype(&git_odb_free)> odb(raw_odb, git_odb_free);
+    std::string data;
+    for (const auto& [mode, name, oid] : entries) {
+        data += mode + " " + name;
+        data.push_back('\0');
+        data.append(reinterpret_cast<const char*>(oid.id), GIT_OID_SHA1_SIZE);
+    }
+    git_oid tree_oid{};
+    if (git_odb_write(&tree_oid, odb.get(), data.data(), data.size(), GIT_OBJECT_TREE) != 0) return {};
+    git_tree* raw_tree = nullptr;
+    if (git_tree_lookup(&raw_tree, repo, &tree_oid) != 0) return {};
+    std::unique_ptr<git_tree, decltype(&git_tree_free)> tree(raw_tree, git_tree_free);
+    git_signature* raw_signature = nullptr;
+    if (git_signature_new(&raw_signature, "Test", "test@example.org", 0, 0) != 0) return {};
+    std::unique_ptr<git_signature, decltype(&git_signature_free)> signature(raw_signature, git_signature_free);
+    git_oid commit{};
+    if (git_commit_create(&commit, repo, "HEAD", signature.get(), signature.get(), nullptr, "test",
+                          tree.get(), 0, nullptr) != 0) return {};
+    char hex[GIT_OID_HEXSZ + 1]{};
+    git_oid_tostr(hex, sizeof(hex), &commit);
+    return hex;
+}
+
+std::string stored_zlib(std::string_view data) {
+    std::string out{"\x78\x01\x01", 3};
+    const auto length = static_cast<std::uint16_t>(data.size());
+    const auto inverse = static_cast<std::uint16_t>(~length);
+    for (const auto value : {length, inverse}) {
+        out.push_back(static_cast<char>(value & 0xffU));
+        out.push_back(static_cast<char>(value >> 8U));
+    }
+    out.append(data);
+    std::uint32_t a = 1, b = 0;
+    for (const char ch : data) {
+        a = (a + static_cast<unsigned char>(ch)) % 65521U;
+        b = (b + a) % 65521U;
+    }
+    const std::uint32_t adler = (b << 16U) | a;
+    for (int shift = 24; shift >= 0; shift -= 8)
+        out.push_back(static_cast<char>((adler >> static_cast<unsigned>(shift)) & 0xffU));
+    return out;
+}
+
+using Repository = std::unique_ptr<git_repository, decltype(&git_repository_free)>;
+
+Repository init_bare(const std::filesystem::path& path) {
+    git_repository* raw = nullptr;
+    if (git_libgit2_init() < 0 || git_repository_init(&raw, path.c_str(), 1) != 0) raw = nullptr;
+    return Repository(raw, git_repository_free);
+}
+
+git_oid blob(git_repository* repo, std::string_view bytes) {
+    git_oid oid{};
+    EXPECT_EQ(git_blob_create_frombuffer(&oid, repo, bytes.data(), bytes.size()), 0);
+    return oid;
+}
+
+TEST(GitTree, RejectsDotGitEntriesInAnyCase) {
+    for (auto name : {".git", ".GiT"}) {
+        Temp temp;
+        ASSERT_FALSE(temp.path.empty());
+        auto repo = init_bare(temp.path / "repo.git");
+        ASSERT_TRUE(repo);
+        const auto config = blob(repo.get(), "[core]\n\tfsmonitor = touch /tmp/owned\n");
+        const auto script = blob(repo.get(), "true\n");
+        const auto commit = commit_raw_tree(repo.get(), {{"100644", name, config}, {"100644", "install.sh", script}});
+        ASSERT_EQ(commit.size(), 40U) << name;
+        std::filesystem::create_directory(temp.path / "src");
+        auto result = materialize_commit(temp.path / "repo.git", commit, temp.path / "src");
+        ASSERT_FALSE(result.has_value()) << name;
+        EXPECT_EQ(result.error().code, "tree-path");
+        EXPECT_TRUE(std::filesystem::is_empty(temp.path / "src"));
+        auto url = validate_git_url("https://example.org/demo.git");
+        ASSERT_TRUE(url.has_value());
+        auto preview = preview_repository(temp.path / "repo.git", "HEAD", *url, "dotgit-test");
+        ASSERT_FALSE(preview.has_value());
+        EXPECT_EQ(preview.error().code, "tree-path");
+    }
+}
+
+TEST(GitTree, ChecksDeclaredBlobSizeBeforeInflating) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    auto repo = init_bare(temp.path / "repo.git");
+    ASSERT_TRUE(repo);
+    constexpr std::string_view hex = "0123456789abcdef0123456789abcdef01234567";
+    const auto object = temp.path / "repo.git/objects" / std::string(hex.substr(0, 2)) / std::string(hex.substr(2));
+    std::filesystem::create_directories(object.parent_path());
+    const std::string header("blob 1099511627776\0abc", 22);
+    std::ofstream(object, std::ios::binary) << stored_zlib(header);
+    git_oid huge{};
+    ASSERT_EQ(git_oid_fromstr(&huge, std::string(hex).c_str()), 0);
+    const auto script = blob(repo.get(), "true\n");
+    const auto commit = commit_raw_tree(repo.get(), {{"100644", "huge.bin", huge}, {"100644", "install.sh", script}});
+    ASSERT_EQ(commit.size(), 40U);
+    auto url = validate_git_url("https://example.org/demo.git");
+    ASSERT_TRUE(url.has_value());
+    auto preview = preview_repository(temp.path / "repo.git", "HEAD", *url, "bomb-test", EntryKind::Script);
+    ASSERT_FALSE(preview.has_value());
+    EXPECT_EQ(preview.error().code, "tree-size");
+    std::filesystem::create_directory(temp.path / "src");
+    auto materialized = materialize_commit(temp.path / "repo.git", commit, temp.path / "src");
+    ASSERT_FALSE(materialized.has_value());
+    EXPECT_EQ(materialized.error().code, "tree-size");
+}
+
+TEST(GitPreview, RefusesOversizedScriptFromDeclaredSize) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    const auto commit = build_repo(temp.path / "repo.git", std::string(256 * 1024 + 1, 'x'));
+    ASSERT_EQ(commit.size(), 40U);
+    auto url = validate_git_url("https://example.org/demo.git");
+    ASSERT_TRUE(url.has_value());
+    auto preview = preview_repository(temp.path / "repo.git", "HEAD", *url, "size-test", EntryKind::Script);
+    ASSERT_FALSE(preview.has_value());
+    EXPECT_EQ(preview.error().code, "script-size");
+}
+
+TEST(GitFetch, RejectsUnsafeRefspecsBeforeNetwork) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    FakeHttp http;
+    http.reply = {200, {}, {}};
+    for (auto revision : {"refs/heads/a:refs/heads/b", "refs/tags/*", "refs/heads/", "refs/heads/../x",
+                          "refs/tags/a b", "refs/heads//x", "a:b", "*"}) {
+        auto result = fetch_preview(http, "https://example.org/demo.git", temp.path / "cache", "ref-test", revision);
+        ASSERT_FALSE(result.has_value()) << revision;
+        EXPECT_EQ(result.error().code, "fetch-ref") << revision;
+    }
+    EXPECT_TRUE(http.requested.empty());
+}
+
+class RecordingHttp final : public GitHttp {
+public:
+    explicit RecordingHttp(GitHttp& inner) : inner_(inner) {}
+    std::vector<std::string> urls;
+    std::expected<GitReply, ManualError> request(std::string_view url, std::string_view body, bool post) override {
+        urls.emplace_back(url);
+        return inner_.request(url, body, post);
+    }
+private:
+    GitHttp& inner_;
+};
+
+TEST(GitFetch, IgnoresUrlRewritesFromGitConfig) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    const auto commit = build_repo(temp.path / "source.git", "true\n");
+    ASSERT_EQ(commit.size(), 40U);
+    const auto bare = temp.path / "cache/braurser/manual/rewrite-test/repo.git";
+    std::filesystem::create_directories(bare.parent_path());
+    {
+        auto repo = init_bare(bare);
+        ASSERT_TRUE(repo);
+        git_config* raw = nullptr;
+        ASSERT_EQ(git_repository_config(&raw, repo.get()), 0);
+        std::unique_ptr<git_config, decltype(&git_config_free)> config(raw, git_config_free);
+        ASSERT_EQ(git_config_set_string(config.get(), "url.https://rewritten.example/.insteadOf",
+                                        "https://example.org/"), 0);
+    }
+    FakeUploadPack upload(temp.path / "source.git");
+    RecordingHttp http(upload);
+    auto result = fetch_preview(http, "https://example.org/demo.git", temp.path / "cache", "rewrite-test");
+    ASSERT_TRUE(result.has_value()) << result.error().code << " " << result.error().detail;
+    EXPECT_EQ(result->commit, commit);
+    ASSERT_FALSE(http.urls.empty());
+    for (const auto& url : http.urls) EXPECT_TRUE(url.starts_with("https://example.org/")) << url;
 }
 
 TEST(GitTree, RejectsEscapingSymlinkAndGitlink) {

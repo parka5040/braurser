@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 #include <chrono>
+#include <csignal>
 #include <fcntl.h>
 #include <string>
 #include <unistd.h>
@@ -68,16 +69,36 @@ TEST(Process, SendsStdin) {
     EXPECT_EQ(result->out, "hello stdin\n");
 }
 
-TEST(Process, DrainsPastCaptureCap) {
+TEST(Process, StopsGroupPastCaptureCap) {
     PosixProcessRunner runner;
     auto input = spec("/usr/bin/yes");
-    input.timeout = std::chrono::milliseconds(80);
+    input.timeout = std::chrono::seconds(30);
     input.max_stdout = 19;
+    const auto start = std::chrono::steady_clock::now();
     auto result = runner.run(input);
     ASSERT_TRUE(result.has_value());
-    EXPECT_TRUE(result->timed_out);
+    EXPECT_FALSE(result->timed_out);
+    EXPECT_TRUE(result->signaled);
+    EXPECT_EQ(result->term_signal, SIGKILL);
     EXPECT_TRUE(result->out_truncated);
     EXPECT_EQ(result->out.size(), 19U);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(4));
+}
+
+TEST(Process, FloodingWritersCannotOutliveTheCap) {
+    PosixProcessRunner runner;
+    auto input = spec("/usr/bin/bash");
+    input.args = {"-c", "yes & yes & yes & wait"};
+    input.env = {{"PATH", "/usr/bin"}};
+    input.timeout = std::chrono::seconds(30);
+    input.max_stdout = 64 * 1024;
+    const auto start = std::chrono::steady_clock::now();
+    auto result = runner.run(input);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(result->out_truncated);
+    EXPECT_FALSE(result->timed_out);
+    EXPECT_EQ(result->out.size(), 64U * 1024U);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(4));
 }
 
 TEST(Process, RejectsBadExecutableAndEnvironment) {

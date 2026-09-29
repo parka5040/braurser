@@ -146,7 +146,7 @@ void Window::git_page(QVBoxLayout& box) {
         auto* code = new QPlainTextEdit;
         code->setReadOnly(true);
         code->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
-        code->setPlainText(kit::safe_text(preview.script_text));
+        code->setPlainText(kit::safe_code(preview.script_text));
         code->setAccessibleName(kit::safe_text(text("git.script")));
         code->setMinimumHeight(220);
         box.addWidget(code);

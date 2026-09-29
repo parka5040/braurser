@@ -89,7 +89,12 @@ int audit_line(int fd, uid_t caller, const br_request& req, const char* const* d
         if (!target) continue;
         size_t length = strlen(target);
         if (length > 1024 - targets) length = 1024 - targets;
-        if (length) { memcpy(line + size, target, length); size += length; targets += length; }
+        for (size_t j = 0; j < length; ++j) {
+            const unsigned char c = static_cast<unsigned char>(target[j]);
+            line[size + j] = c < 32 || c == 127 ? '?' : static_cast<char>(c);
+        }
+        size += length;
+        targets += length;
         if (targets == 1024) break;
         line[size++] = ',';
         ++targets;
@@ -251,6 +256,14 @@ int main(int argc, char** argv) {
         return reject("environment", caller, req);
     }
     char* envp[] = {const_cast<char*>("PATH=/usr/bin"), const_cast<char*>("LC_ALL=C"), nullptr};
+    umask(022);
+    struct sigaction broken_pipe{};
+    broken_pipe.sa_handler = SIG_IGN;
+    if (sigaction(SIGPIPE, &broken_pipe, nullptr)) {
+        close(log_fd);
+        clean(stage, copies, req.count);
+        return reject("signals", caller, req);
+    }
     pid_t pid = fork();
     if (pid == 0) {
         execve("/usr/bin/pacman", arguments, envp);

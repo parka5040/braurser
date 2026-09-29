@@ -2,9 +2,11 @@
 #include <braurser/daemon/catalog/sources.hpp>
 #include <braurser/daemon/core/files.hpp>
 #include <braurser/daemon/core/text.hpp>
+#include <braurser/protocol/dto.hpp>
 #include <braurser/validate/validate.hpp>
 
 #include <libxml/parser.h>
+#include <linux/openat2.h>
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -12,8 +14,10 @@
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 namespace braurser::daemon::manual {
@@ -77,24 +81,143 @@ bool within(std::filesystem::path path) {
     return depth > 0;
 }
 
-bool stage_link(const std::filesystem::path& root, const std::filesystem::path& item,
+bool beneath(int root, const std::filesystem::path& relative) {
+    open_how how{};
+    how.flags = static_cast<std::uint64_t>(O_PATH | O_CLOEXEC);
+    how.resolve = static_cast<std::uint64_t>(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS);
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const long fd = syscall(SYS_openat2, root, relative.c_str(), &how, sizeof(how));
+        if (fd >= 0) {
+            close(static_cast<int>(fd));
+            return true;
+        }
+        if (errno != EAGAIN && errno != EINTR) return false;
+    }
+    return false;
+}
+
+bool stage_link(int root_fd, const std::filesystem::path& root, const std::filesystem::path& item,
                 const std::filesystem::path& target) {
     if (target.empty() || target.is_absolute() || target.native().find('\0') != std::string::npos)
         return false;
-    auto relative = (item.lexically_relative(root).parent_path() / target).lexically_normal();
-    if (!within(relative)) return false;
-    std::error_code error;
-    const auto resolved = std::filesystem::canonical(root / relative, error);
-    return !error && within(resolved.lexically_relative(root));
+    const auto location = item.lexically_relative(root);
+    const auto relative = (location.parent_path() / target).lexically_normal();
+    return within(relative) && beneath(root_fd, location);
 }
+
+bool clean_name(std::string_view name) {
+    return protocol::valid_utf8(name) && std::ranges::none_of(name, [](unsigned char ch) {
+        return ch < 0x20 || ch == 0x7f;
+    });
+}
+
+std::string printable(std::string_view name) {
+    const bool utf8 = protocol::valid_utf8(name);
+    std::string result;
+    result.reserve(name.size());
+    for (const char raw : name) {
+        const auto ch = static_cast<unsigned char>(raw);
+        result.push_back(ch < 0x20 || ch == 0x7f || (!utf8 && ch >= 0x80) ? '?' : raw);
+    }
+    return result;
+}
+
+std::vector<std::string> parts_of(const std::filesystem::path& relative) {
+    std::vector<std::string> parts;
+    for (const auto& part : relative) parts.push_back(part.string());
+    return parts;
+}
+
+bool system_hook(const std::vector<std::string>& parts) {
+    constexpr std::array<std::string_view, 16> libraries{
+        "systemd", "udev", "tmpfiles.d", "sysctl.d", "sysusers.d", "binfmt.d", "modules-load.d",
+        "modprobe.d", "depmod.d", "environment.d", "kernel", "repart.d", "userdb", "security",
+        "perl5", "lua"};
+    if (parts.size() < 2) return false;
+    if (parts[0] == "lib" || parts[0] == "lib64")
+        return parts[1].starts_with("credstore") || std::ranges::find(libraries, parts[1]) != libraries.end();
+    if (parts[0] != "share") return false;
+    if (parts[1] == "dbus-1" || parts[1] == "perl5" || parts[1] == "lua") return true;
+    return parts[1] == "fish" && parts.size() >= 3 && parts[2] == "vendor_conf.d";
+}
+
+bool exists_below(const std::filesystem::path& system_root, const std::filesystem::path& relative) {
+    struct stat info {};
+    return lstat((system_root / relative).c_str(), &info) == 0 || (errno != ENOENT && errno != ENOTDIR);
+}
+
+std::optional<std::set<std::string>> zsh_names(const std::filesystem::path& system_root) {
+    std::set<std::string> names;
+    const auto root = system_root / "share/zsh";
+    struct stat info {};
+    if (lstat(root.c_str(), &info) != 0) {
+        if (errno == ENOENT) return names;
+        return std::nullopt;
+    }
+    if (!S_ISDIR(info.st_mode)) return std::nullopt;
+    std::error_code ec;
+    std::filesystem::recursive_directory_iterator iterator(root, std::filesystem::directory_options::none, ec);
+    if (ec) return std::nullopt;
+    std::size_t count = 0;
+    for (; iterator != std::filesystem::recursive_directory_iterator{}; iterator.increment(ec)) {
+        if (ec || ++count > 200000 || iterator.depth() > 16) return std::nullopt;
+        if (!iterator->is_directory(ec)) names.insert(iterator->path().filename().string());
+        if (ec) return std::nullopt;
+    }
+    if (ec) return std::nullopt;
+    return names;
+}
+
+using ZshNames = std::optional<std::optional<std::set<std::string>>>;
+
+bool shadows(const std::vector<std::string>& parts, const std::filesystem::path& relative,
+             const std::filesystem::path& system_root, ZshNames& zsh) {
+    constexpr std::array<std::array<std::string_view, 3>, 5> prefixes{{
+        {"bin", "", ""}, {"share", "applications", ""}, {"share", "bash-completion", "completions"},
+        {"share", "fish", "vendor_completions.d"}, {"share", "fish", "vendor_functions.d"}}};
+    for (const auto& prefix : prefixes) {
+        std::size_t length = 0;
+        while (length < prefix.size() && !prefix[length].empty()) ++length;
+        if (parts.size() <= length) continue;
+        bool matched = true;
+        for (std::size_t index = 0; index < length; ++index)
+            if (parts[index] != prefix[index]) matched = false;
+        if (matched && exists_below(system_root, relative)) return true;
+    }
+    if (parts.size() >= 3 && parts[0] == "share" && parts[1] == "zsh") {
+        if (!zsh) zsh = zsh_names(system_root);
+        return !*zsh || (*zsh)->contains(parts.back());
+    }
+    return false;
+}
+
+class Descriptor {
+public:
+    explicit Descriptor(int value) : value_(value) {}
+    ~Descriptor() { if (value_ >= 0) close(value_); }
+    Descriptor(const Descriptor&) = delete;
+    Descriptor& operator=(const Descriptor&) = delete;
+    int get() const { return value_; }
+private:
+    int value_;
+};
 
 }
 
 std::expected<StageManifest, ManualError> validate_stage(
     const std::filesystem::path& stage, Scope scope) {
+    return validate_stage(stage, scope, "/usr");
+}
+
+std::expected<StageManifest, ManualError> validate_stage(
+    const std::filesystem::path& stage, Scope scope, const std::filesystem::path& system_root) {
     if ((scope != Scope::User && scope != Scope::System) ||
         !stage.is_absolute() || std::filesystem::is_symlink(stage) ||
-        !std::filesystem::is_directory(stage)) return std::unexpected(fail("stage-root"));
+        !std::filesystem::is_directory(stage) || !system_root.is_absolute())
+        return std::unexpected(fail("stage-root"));
+    const Descriptor root(open(stage.c_str(), O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (root.get() < 0) return std::unexpected(fail("stage-root"));
+    ZshNames zsh;
     StageManifest manifest;
     std::vector<std::string> refused;
     std::uint64_t total = 0;
@@ -110,14 +233,25 @@ std::expected<StageManifest, ManualError> validate_stage(
         const auto name = relative.generic_string();
         if (++count > 50000 || name.size() > 4096 || !within(relative))
             return std::unexpected(fail("stage-limit"));
+        if (!clean_name(name)) {
+            refused.push_back(printable(name));
+            if (refused.size() > 20) break;
+            continue;
+        }
         auto top = relative.begin()->string();
         if (!allowed.contains(top) || (scope == Scope::User && top == "etc")) refused.push_back(name);
         struct stat info {};
         if (lstat(item.path().c_str(), &info) != 0) return std::unexpected(fail("stage-stat"));
         if ((info.st_mode & 07000) != 0 || info.st_uid != getuid()) refused.push_back(name);
+        if (scope == Scope::System) {
+            const auto parts = parts_of(relative);
+            if ((!S_ISLNK(info.st_mode) && (info.st_mode & 0002) != 0) || system_hook(parts) ||
+                (!S_ISDIR(info.st_mode) && shadows(parts, relative, system_root, zsh)))
+                refused.push_back(name);
+        }
         if (S_ISLNK(info.st_mode)) {
             auto target = std::filesystem::read_symlink(item.path(), ec);
-            if (ec || !stage_link(stage, item.path(), target)) refused.push_back(name);
+            if (ec || !stage_link(root.get(), stage, item.path(), target)) refused.push_back(name);
             else {
                 auto content = target.generic_string();
                 manifest.files.push_back({name, digest(content), 0120000U});
@@ -219,7 +353,7 @@ std::expected<std::string, ManualError> run_staging(
     if (!makeflags.empty()) spec.args.insert(spec.args.end(), {"--setenv", "MAKEFLAGS", std::string(makeflags)});
     spec.args.push_back("--");
     if (kind == EntryKind::Script) spec.args.insert(spec.args.end(), {"/usr/bin/bash", "./install.sh"});
-    else spec.args.insert(spec.args.end(), {"/usr/bin/make", "install", "PREFIX=" + prefix.string()});
+    else spec.args.insert(spec.args.end(), {"/usr/bin/make", "-f", "Makefile", "install", "PREFIX=" + prefix.string()});
     spec.timeout = std::chrono::minutes(30);
     spec.max_stdout = spec.max_stderr = 2 * 1024 * 1024;
     auto result = runner.run(spec);

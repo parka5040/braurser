@@ -49,7 +49,7 @@ std::string locale_base() {
     const char* lang = std::getenv("LANG");
     if (!lang) return {};
     std::string result(lang);
-    result.resize(result.find_first_of(".@"));
+    if (const auto cut = result.find_first_of(".@"); cut != std::string::npos) result.resize(cut);
     if (result.size() > 32) return {};
     return result;
 }

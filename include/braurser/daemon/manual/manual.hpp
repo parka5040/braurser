@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -146,6 +147,11 @@ struct StageManifest {
 std::expected<StageManifest, ManualError> validate_stage(
     const std::filesystem::path& stage, Scope scope);
 
+/// in: stage is an absolute prefix stage; system_root is the absolute tree system-scope names must not shadow.
+/// out: a bounded validated manifest or a list of refused paths.
+std::expected<StageManifest, ManualError> validate_stage(
+    const std::filesystem::path& stage, Scope scope, const std::filesystem::path& system_root);
+
 /// in: source contains the approved materialized tree; stage is an empty private directory.
 /// out: a completed isolated installation attempt and bounded output.
 std::expected<std::string, ManualError> run_staging(
@@ -192,7 +198,17 @@ std::expected<RemovalResult, ManualError> remove_user(
     core::ProcessRunner& runner, const std::filesystem::path& home,
     const std::filesystem::path& state, const Receipt& receipt);
 
-/// in: receipt contains validated git metadata and commit date is UTC.
+/// in: url is an untrusted repository URL.
+/// out: the system package name derived from the full repository path.
+/// err: rejects invalid URLs and names pacman would refuse.
+std::expected<std::string, ManualError> system_package_name(std::string_view url);
+
+/// in: receipts are the recorded Git installs; installed holds installed package names.
+/// out: true when pkgname is unused or already recorded as a system install of url.
+bool system_package_available(std::string_view pkgname, std::string_view url,
+                              std::span<const Receipt> receipts, const std::set<std::string>& installed);
+
+/// in: receipt contains validated git metadata, optionally its recorded pkgname, and commit date is UTC.
 /// out: fixed script-less PKGBUILD and package name.
 std::expected<std::pair<std::string, std::string>, ManualError> render_pkgbuild(
     const Receipt& receipt, std::chrono::sys_seconds commit_date, std::string_view arch);

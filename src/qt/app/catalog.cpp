@@ -306,7 +306,7 @@ void Window::details_page(QVBoxLayout& box) {
     if (state.build) {
         for (const auto& file : state.build->files) {
             label(build_box, text("detail.build_file", {{"file", file.path}}));
-            auto* code = new QPlainTextEdit(kit::safe_text(file.text));
+            auto* code = new QPlainTextEdit(kit::safe_code(file.text));
             code->setReadOnly(true); code->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
             code->setAccessibleName(kit::safe_text(text("detail.build_file", {{"file", file.path}})));
             build_box.addWidget(code);

@@ -2,9 +2,11 @@
 #include <braurser/daemon/core/process.hpp>
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace {
@@ -35,7 +37,7 @@ Receipt example_receipt() {
 TEST(ManualPackage, RendersFixedTemplate) {
     auto rendered = render_pkgbuild(example_receipt(), std::chrono::sys_seconds{std::chrono::seconds{0}}, "any");
     ASSERT_TRUE(rendered.has_value());
-    EXPECT_EQ(rendered->first, "braurser-git-demo");
+    EXPECT_EQ(rendered->first, "braurser-git-owner-demo");
     std::ifstream file(std::filesystem::path(MANUAL_FIXTURES) / "PKGBUILD.golden");
     ASSERT_TRUE(file.is_open());
     const std::string golden(std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{});
@@ -43,6 +45,81 @@ TEST(ManualPackage, RendersFixedTemplate) {
     auto request = system_remove_request("braurser-git-demo");
     ASSERT_TRUE(request.has_value());
     EXPECT_EQ(request->args, (std::vector<std::string>{"--remove", "--nosave", "--recursive", "--", "braurser-git-demo"}));
+}
+
+TEST(ManualPackage, SystemNamesIncludeTheFullRepositoryPath) {
+    EXPECT_EQ(system_package_name("https://github.com/alice/tool"), "braurser-git-alice-tool");
+    EXPECT_EQ(system_package_name("https://github.com/bob/tool.git"), "braurser-git-bob-tool");
+    EXPECT_EQ(system_package_name("https://gitlab.com/Group/Sub/My_Repo"), "braurser-git-group-sub-my_repo");
+    EXPECT_NE(system_package_name("https://github.com/alice/tool").value(),
+              system_package_name("https://github.com/bob/tool").value());
+    EXPECT_FALSE(system_package_name("http://github.com/alice/tool"));
+}
+
+TEST(ManualPackage, UpgradesKeepTheRecordedPackageName) {
+    auto receipt = example_receipt();
+    receipt.pkgname = "braurser-git-demo";
+    auto rendered = render_pkgbuild(receipt, std::chrono::sys_seconds{std::chrono::seconds{0}}, "any");
+    ASSERT_TRUE(rendered.has_value());
+    EXPECT_EQ(rendered->first, "braurser-git-demo");
+    EXPECT_TRUE(rendered->second.starts_with("pkgname=braurser-git-demo\n"));
+    for (const auto* invalid : {"demo", "braurser-git-", "braurser-git-Demo", "braurser-git-a b"}) {
+        receipt.pkgname = invalid;
+        EXPECT_FALSE(render_pkgbuild(receipt, std::chrono::sys_seconds{std::chrono::seconds{0}}, "any")) << invalid;
+    }
+}
+
+TEST(ManualPackage, SystemNameCollisionsAreRefused) {
+    const std::string url = "https://github.com/alice/tool";
+    const std::string name = "braurser-git-alice-tool";
+    Receipt same = example_receipt();
+    same.scope = Scope::System;
+    same.url = url;
+    same.pkgname = name;
+    Receipt other = same;
+    other.url = "https://gitlab.com/alice/tool";
+    Receipt user = other;
+    user.scope = Scope::User;
+    EXPECT_TRUE(system_package_available(name, url, std::vector<Receipt>{}, {}));
+    EXPECT_TRUE(system_package_available(name, url, std::vector<Receipt>{user}, {}));
+    EXPECT_TRUE(system_package_available(name, url, std::vector<Receipt>{same}, {name}));
+    EXPECT_FALSE(system_package_available(name, url, std::vector<Receipt>{}, {name}));
+    EXPECT_FALSE(system_package_available(name, url, std::vector<Receipt>{other}, {}));
+    EXPECT_FALSE(system_package_available(name, url, std::vector<Receipt>{same, other}, {name}));
+    EXPECT_FALSE(system_package_available("tool", url, std::vector<Receipt>{}, {}));
+}
+
+class FakeMakepkg final : public braurser::daemon::core::ProcessRunner {
+public:
+    std::expected<braurser::daemon::core::ProcessResult, braurser::daemon::core::ProcessError> run(
+        const braurser::daemon::core::ProcessSpec& spec) override {
+        braurser::daemon::core::ProcessResult result;
+        result.exit_code = 1;
+        if (spec.executable != "/usr/bin/makepkg" || !spec.cwd) return result;
+        for (const auto& [key, value] : spec.env) {
+            if (key != "PKGDEST") continue;
+            std::ofstream(std::filesystem::path(value) / (spec.cwd->filename().string() + "-1-1-any.pkg.tar.zst")) << "archive";
+            result.exit_code = 0;
+        }
+        return result;
+    }
+};
+
+TEST(ManualPackage, SystemPackagesMayContainStagedSymlinks) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    auto stage = temp.path / "stage";
+    auto home = temp.path / "home";
+    std::filesystem::create_directories(stage / "share/demo");
+    std::filesystem::create_directories(stage / "bin");
+    std::filesystem::create_directory(home);
+    std::ofstream(stage / "share/demo/demo") << "demo";
+    std::filesystem::create_symlink("../share/demo/demo", stage / "bin/braurser-test-unique-demo");
+    FakeMakepkg runner;
+    auto built = build_system_package(runner, stage, home, home / ".cache/braurser/build/manual/testjob",
+        example_receipt(), std::chrono::sys_seconds{std::chrono::seconds{0}});
+    ASSERT_TRUE(built.has_value()) << built.error().code << " " << built.error().detail;
+    EXPECT_TRUE(built->filename().string().starts_with("braurser-git-owner-demo-"));
 }
 
 TEST(ManualPackage, RecordsSystemPackageWithoutRunningPacman) {
@@ -95,6 +172,173 @@ TEST(ManualStage, RejectsSymlinksOutsideOrMissingFromTree) {
         EXPECT_EQ(result.error().code, "stage-refused");
         std::filesystem::remove(link);
     }
+}
+
+void tidy(const std::filesystem::path& root) {
+    for (const auto& item : std::filesystem::recursive_directory_iterator(root)) {
+        if (item.is_symlink()) continue;
+        chmod(item.path().c_str(), item.is_directory() ? 0755 : 0644);
+    }
+    chmod(root.c_str(), 0755);
+}
+
+bool refused(const std::expected<StageManifest, ManualError>& result, std::string_view path) {
+    return !result && result.error().code == "stage-refused" &&
+           result.error().detail.find(std::string(path) + "\n") != std::string::npos;
+}
+
+TEST(ManualStage, RefusesControlCharactersAndInvalidUtf8InNames) {
+    for (const auto& name : {std::string("de\nmo"), std::string("de\x1bmo"), std::string("de\x7fmo"),
+                             std::string("de\xffmo")}) {
+        Temp temp;
+        ASSERT_FALSE(temp.path.empty());
+        auto stage = temp.path / "stage";
+        std::filesystem::create_directories(stage / "bin");
+        std::ofstream(stage / "bin" / name) << "demo";
+        for (auto scope : {Scope::User, Scope::System}) {
+            auto result = validate_stage(stage, scope, temp.path / "usr");
+            ASSERT_FALSE(result.has_value()) << name;
+            EXPECT_EQ(result.error().code, "stage-refused");
+            EXPECT_EQ(result.error().detail, "bin/de?mo\n");
+        }
+    }
+}
+
+TEST(ManualStage, RefusesWorldWritableOutputOnlyForSystemScope) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    auto stage = temp.path / "stage";
+    auto usr = temp.path / "usr";
+    std::filesystem::create_directories(stage / "bin");
+    std::filesystem::create_directories(usr);
+    std::ofstream(stage / "bin/demo") << "demo";
+    tidy(stage);
+    ASSERT_TRUE(validate_stage(stage, Scope::System, usr).has_value());
+    ASSERT_EQ(chmod((stage / "bin/demo").c_str(), 0777), 0);
+    EXPECT_TRUE(validate_stage(stage, Scope::User, usr).has_value());
+    EXPECT_TRUE(refused(validate_stage(stage, Scope::System, usr), "bin/demo"));
+    ASSERT_EQ(chmod((stage / "bin/demo").c_str(), 0755), 0);
+    ASSERT_EQ(chmod((stage / "bin").c_str(), 0777), 0);
+    EXPECT_TRUE(validate_stage(stage, Scope::User, usr).has_value());
+    EXPECT_TRUE(refused(validate_stage(stage, Scope::System, usr), "bin"));
+}
+
+TEST(ManualStage, RefusesSystemHookDirectoriesOnlyForSystemScope) {
+    for (const std::string path : {"lib/systemd/system-generators/demo", "lib/udev/rules.d/99-demo.rules",
+                                   "lib/tmpfiles.d/demo.conf", "lib/sysctl.d/demo.conf",
+                                   "lib64/modprobe.d/demo.conf", "lib/credstore.encrypted/demo",
+                                   "lib/perl5/site_perl/strict.pm", "share/dbus-1/services/demo.service",
+                                   "share/lua/5.4/demo.lua", "share/fish/vendor_conf.d/demo.fish"}) {
+        Temp temp;
+        ASSERT_FALSE(temp.path.empty());
+        auto stage = temp.path / "stage";
+        auto usr = temp.path / "usr";
+        std::filesystem::create_directories(usr);
+        std::filesystem::create_directories((stage / path).parent_path());
+        std::ofstream(stage / path) << "demo";
+        EXPECT_TRUE(validate_stage(stage, Scope::User, usr).has_value()) << path;
+        EXPECT_TRUE(refused(validate_stage(stage, Scope::System, usr), path)) << path;
+    }
+}
+
+TEST(ManualStage, RefusesSystemScopeNamesThatShadowTheSystem) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    auto usr = temp.path / "usr";
+    for (auto directory : {"bin", "share/bash-completion/completions", "share/fish/vendor_functions.d",
+                           "share/zsh/functions/Completion/Unix"})
+        std::filesystem::create_directories(usr / directory);
+    std::ofstream(usr / "bin/sudo") << "real";
+    std::ofstream(usr / "share/bash-completion/completions/pacman") << "real";
+    std::ofstream(usr / "share/fish/vendor_functions.d/ls.fish") << "real";
+    std::ofstream(usr / "share/zsh/functions/Completion/Unix/_sudo") << "real";
+    for (const std::string path : {"bin/sudo", "share/bash-completion/completions/pacman",
+                                   "share/fish/vendor_functions.d/ls.fish", "share/zsh/site-functions/_sudo"}) {
+        Temp work;
+        ASSERT_FALSE(work.path.empty());
+        auto stage = work.path / "stage";
+        std::filesystem::create_directories((stage / path).parent_path());
+        std::ofstream(stage / path) << "shadow";
+        EXPECT_TRUE(validate_stage(stage, Scope::User, usr).has_value()) << path;
+        EXPECT_TRUE(refused(validate_stage(stage, Scope::System, usr), path)) << path;
+    }
+    Temp work;
+    ASSERT_FALSE(work.path.empty());
+    auto stage = work.path / "stage";
+    std::filesystem::create_directories(stage / "bin");
+    std::filesystem::create_directories(stage / "share/zsh/site-functions");
+    std::filesystem::create_directories(stage / "share/bash-completion/completions");
+    std::ofstream(stage / "bin/demo") << "demo";
+    std::ofstream(stage / "share/zsh/site-functions/_demo") << "demo";
+    std::ofstream(stage / "share/bash-completion/completions/demo") << "demo";
+    std::filesystem::create_symlink("demo", stage / "bin/demo-alias");
+    tidy(stage);
+    auto allowed = validate_stage(stage, Scope::System, usr);
+    EXPECT_TRUE(allowed.has_value()) << (allowed ? "" : allowed.error().detail);
+    std::filesystem::create_symlink("demo", stage / "bin/sudo");
+    EXPECT_TRUE(refused(validate_stage(stage, Scope::System, usr), "bin/sudo"));
+}
+
+TEST(ManualStage, RefusesSymlinkThatEscapesThroughAnotherSymlink) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    auto stage = temp.path / "stage";
+    std::filesystem::create_directories(stage / "share/mime/d");
+    std::ofstream(stage / "share/.bashrc") << "decoy";
+    std::filesystem::create_symlink("..", stage / "share/mime/d/up");
+    std::filesystem::create_symlink("d/up/../../../.bashrc", stage / "share/mime/globs.new");
+    auto result = validate_stage(stage, Scope::User);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().code, "stage-refused");
+    EXPECT_EQ(result.error().detail, "share/mime/globs.new\n");
+}
+
+TEST(ManualStage, AcceptsRelativeSymlinksThatStayInside) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    auto stage = temp.path / "stage";
+    std::filesystem::create_directories(stage / "bin");
+    std::filesystem::create_directories(stage / "share/demo");
+    std::filesystem::create_directories(stage / "lib");
+    std::ofstream(stage / "share/demo/demo") << "demo";
+    std::ofstream(stage / "lib/libdemo.so.1") << "library";
+    std::filesystem::create_symlink("../share/demo/demo", stage / "bin/demo");
+    std::filesystem::create_symlink("libdemo.so.1", stage / "lib/libdemo.so");
+    auto result = validate_stage(stage, Scope::User);
+    ASSERT_TRUE(result.has_value()) << result.error().code << " " << result.error().detail;
+    EXPECT_EQ(std::ranges::count(result->files, 0120000U, &StagedFile::mode), 2);
+}
+
+class CapturingRunner final : public braurser::daemon::core::ProcessRunner {
+public:
+    braurser::daemon::core::ProcessSpec spec;
+    std::expected<braurser::daemon::core::ProcessResult, braurser::daemon::core::ProcessError> run(
+        const braurser::daemon::core::ProcessSpec& value) override {
+        spec = value;
+        braurser::daemon::core::ProcessResult result;
+        result.exit_code = 0;
+        return result;
+    }
+};
+
+TEST(ManualStaging, MakeInstallRunsOnlyTheReviewedMakefile) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    auto src = temp.path / "src";
+    auto stage = temp.path / "stage";
+    auto home = temp.path / "home";
+    std::filesystem::create_directory(src);
+    std::filesystem::create_directory(stage);
+    std::filesystem::create_directory(home);
+    CapturingRunner runner;
+    auto output = run_staging(runner, src, stage, home, EntryKind::MakeInstall, Scope::User);
+    ASSERT_FALSE(output.has_value());
+    const auto& args = runner.spec.args;
+    const auto separator = std::ranges::find(args, "--");
+    ASSERT_NE(separator, args.end());
+    const std::vector<std::string> command(separator + 1, args.end());
+    EXPECT_EQ(command, (std::vector<std::string>{"/usr/bin/make", "-f", "Makefile", "install",
+                                                 "PREFIX=" + (home / ".local").string()}));
 }
 
 TEST(ManualStage, RefusesMalformedDesktopAndEntityXml) {

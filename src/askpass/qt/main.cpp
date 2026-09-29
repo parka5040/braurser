@@ -6,6 +6,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -36,6 +37,7 @@ public:
 
 int main(int, char** argv) {
     ::umask(0077);
+    if (::prctl(PR_SET_DUMPABLE, 0) != 0) { return 1; }
     const rlimit limit{0, 0};
     static_cast<void>(::setrlimit(RLIMIT_CORE, &limit));
     std::signal(SIGPIPE, SIG_IGN);

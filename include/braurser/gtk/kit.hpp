@@ -19,6 +19,10 @@ enum class Severity { Info, Success, Warning, Error };
 
 void ensure_resources();
 std::string safe_text(std::string_view text);
+/// in: script or build text of at most 256 KiB
+/// out: valid UTF-8 with controls, bidi and invisible format characters shown as U+FFFD
+/// err: throws std::length_error above 256 KiB
+std::string safe_code(std::string_view text);
 
 Glib::RefPtr<Gdk::Texture> icon_texture(std::string_view icon, const Gdk::RGBA& color, int size, int scale = 1);
 /// in: absolute local PNG path, at most 1 MiB and 1024 pixels per side

@@ -24,6 +24,19 @@ CatalogError error(std::string code) { return {std::move(code), {}}; }
 
 using Fields = std::unordered_map<std::string, std::vector<std::string>>;
 
+std::expected<std::string, CatalogError> pacman_conf(core::ProcessRunner& runner, std::vector<std::string> args) {
+    core::ProcessSpec spec;
+    spec.executable = "/usr/bin/pacman-conf";
+    spec.args = std::move(args);
+    spec.env = {{"LC_ALL", "C"}};
+    spec.timeout = std::chrono::seconds(10);
+    spec.max_stdout = spec.max_stderr = 64 * 1024;
+    auto result = runner.run(spec);
+    if (!result || result->exit_code != 0 || result->signaled || result->timed_out ||
+        result->out_truncated || result->err_truncated) return std::unexpected(error("pacman-conf"));
+    return result->out;
+}
+
 std::expected<Fields, CatalogError> parse_fields(std::string_view desc) {
     if (desc.size() > 256 * 1024 || desc.find('\0') != desc.npos) return std::unexpected(error("desc-size"));
     Fields fields;
@@ -119,21 +132,9 @@ bool satisfies(std::string_view dependency, std::string_view offer, std::string_
 }
 
 std::expected<Repositories, CatalogError> PacmanConfig::read() const {
-    auto run = [this](std::vector<std::string> args) -> std::expected<std::string, CatalogError> {
-        core::ProcessSpec spec;
-        spec.executable = "/usr/bin/pacman-conf";
-        spec.args = std::move(args);
-        spec.env = {{"LC_ALL", "C"}};
-        spec.timeout = std::chrono::seconds(10);
-        spec.max_stdout = spec.max_stderr = 64 * 1024;
-        auto result = runner_.run(spec);
-        if (!result || result->exit_code != 0 || result->signaled || result->timed_out ||
-            result->out_truncated || result->err_truncated) return std::unexpected(error("pacman-conf"));
-        return result->out;
-    };
-    auto names = run({"--repo-list"});
+    auto names = pacman_conf(runner_, {"--repo-list"});
     if (!names) return std::unexpected(names.error());
-    auto db = run({"DBPath"});
+    auto db = pacman_conf(runner_, {"DBPath"});
     if (!db) return std::unexpected(db.error());
     Repositories result;
     std::set<std::string> seen;
@@ -155,6 +156,24 @@ std::expected<Repositories, CatalogError> PacmanConfig::read() const {
         return std::unexpected(error("db-path"));
     if (!result.db_path.has_filename() && result.db_path.has_parent_path() && result.db_path != result.db_path.root_path())
         result.db_path = result.db_path.parent_path();
+    return result;
+}
+
+std::expected<std::vector<std::string>, CatalogError> PacmanConfig::hold_packages() const {
+    auto output = pacman_conf(runner_, {"HoldPkg"});
+    if (!output) return std::unexpected(output.error());
+    std::vector<std::string> result;
+    std::set<std::string> seen;
+    for (std::size_t start = 0; start < output->size();) {
+        auto end = output->find('\n', start);
+        if (end == output->npos) end = output->size();
+        auto name = output->substr(start, end - start);
+        start = end == output->size() ? output->size() : end + 1;
+        if (!name.empty() && name.back() == '\r') name.pop_back();
+        if (!br_valid_pkgname(name.data(), name.size()) || result.size() >= 256)
+            return std::unexpected(error("hold-name"));
+        if (seen.insert(name).second) result.push_back(std::move(name));
+    }
     return result;
 }
 

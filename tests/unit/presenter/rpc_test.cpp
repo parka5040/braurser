@@ -177,6 +177,46 @@ TEST(RpcClient, RejectsSymlinkAndConnectsToOwnedSocket) {
     FakeServer server(connected);
     EXPECT_TRUE(loop.until([&] { return completed; }));
 }
+TEST(RpcClient, FinishedJobsDoNotExhaustTheEventTracker) {
+    MainLoop loop; auto pairs = std::make_shared<Pairs>(); FakeServer server(pairs->add()); RpcClient client(loop, options(), pairs);
+    bool connected = false;
+    auto watch = client.connection_changed([&](bool value) { if (value) { connected = true; } });
+    ASSERT_TRUE(loop.until([&] { return connected; }));
+    std::size_t states = 0;
+    auto subscription = client.listen<protocol::JobStateNotification>([&](const auto&) { ++states; });
+    std::string frames;
+    for (int index = 0; index < 1100; ++index) {
+        frames += protocol::encode_frame(protocol::serialize_message(protocol::Notification{std::string(Event<protocol::JobStateNotification>::name),
+            protocol::JobStateNotification{"job-" + std::to_string(index), 1, {"succeeded"}}}));
+    }
+    server.send_bytes(frames);
+    ASSERT_TRUE(loop.until([&] { return states == 1100; }));
+    bool completed = false;
+    client.call<Method<protocol::StatusParams>>({}, [&](Reply<protocol::StatusResult> reply) { EXPECT_TRUE(reply); completed = true; });
+    ASSERT_TRUE(loop.until([&] { return completed; }));
+    EXPECT_EQ(pairs->attempts.load(), 1U);
+}
+TEST(RpcClient, ReconnectStartsFreshEventSequences) {
+    MainLoop loop; auto pairs = std::make_shared<Pairs>();
+    auto first = std::make_unique<FakeServer>(pairs->add()); FakeServer second(pairs->add());
+    RpcClient client(loop, options(), pairs);
+    std::vector<std::uint64_t> sequences;
+    auto subscription = client.listen<protocol::JobLogNotification>([&](const auto& event) { sequences.push_back(event.sequence); });
+    const auto log = [](std::uint64_t sequence) {
+        return protocol::encode_frame(protocol::serialize_message(protocol::Notification{std::string(Event<protocol::JobLogNotification>::name),
+            protocol::JobLogNotification{"job", sequence, "line"}}));
+    };
+    first->send_bytes(log(5));
+    ASSERT_TRUE(loop.until([&] { return sequences.size() == 1; }));
+    first.reset();
+    ASSERT_TRUE(loop.until([&] { return pairs->attempts.load() >= 2; }));
+    second.send_bytes(log(1));
+    ASSERT_TRUE(loop.until([&] { return sequences.size() == 2; }));
+    EXPECT_EQ(sequences, (std::vector<std::uint64_t>{5, 1}));
+    bool completed = false;
+    client.call<Method<protocol::StatusParams>>({}, [&](Reply<protocol::StatusResult> reply) { EXPECT_TRUE(reply); completed = true; });
+    ASSERT_TRUE(loop.until([&] { return completed; }));
+}
 TEST(RpcClient, BoundsQueueAndRejectsUnknownMethods) {
     MainLoop loop; auto pairs = std::make_shared<Pairs>(); auto configuration = options(); configuration.queue_limit = 1;
     RpcClient client(loop, configuration, pairs); bool full = false; bool unknown = false;

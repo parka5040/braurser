@@ -17,6 +17,38 @@ namespace {
 
 ManualError fail(std::string code) { return {std::move(code), {}, {}, {}}; }
 
+bool system_name(std::string_view pkgname) {
+    constexpr std::string_view prefix = "braurser-git-";
+    return br_valid_pkgname(pkgname.data(), pkgname.size()) && pkgname.starts_with(prefix) &&
+           pkgname.size() > prefix.size();
+}
+
+}
+
+std::expected<std::string, ManualError> system_package_name(std::string_view url) {
+    auto parsed = validate_git_url(url);
+    if (!parsed) return std::unexpected(fail("package-input"));
+    auto name = parsed->owner_repo;
+    for (char& ch : name) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (!(ch >= 'a' && ch <= 'z') && !(ch >= '0' && ch <= '9') &&
+            ch != '+' && ch != '_' && ch != '.' && ch != '-') ch = '-';
+    }
+    auto pkgname = "braurser-git-" + name;
+    if (!system_name(pkgname)) return std::unexpected(fail("package-name"));
+    return pkgname;
+}
+
+bool system_package_available(std::string_view pkgname, std::string_view url,
+                              std::span<const Receipt> receipts, const std::set<std::string>& installed) {
+    if (!system_name(pkgname)) return false;
+    bool owned = false;
+    for (const auto& receipt : receipts) {
+        if (receipt.scope != Scope::System || receipt.pkgname != pkgname) continue;
+        if (receipt.url != url) return false;
+        owned = true;
+    }
+    return owned || !installed.contains(std::string(pkgname));
 }
 
 std::expected<std::pair<std::string, std::string>, ManualError> render_pkgbuild(
@@ -29,14 +61,13 @@ std::expected<std::pair<std::string, std::string>, ManualError> render_pkgbuild(
         !std::all_of(arch.begin(), arch.end(), [](unsigned char ch) {
             return std::isalnum(ch) || ch == '_';
         })) return std::unexpected(fail("package-input"));
-    auto name = parsed->owner_repo.substr(parsed->owner_repo.find_last_of('/') + 1);
-    for (char& ch : name) {
-        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-        if (!(ch >= 'a' && ch <= 'z') && !(ch >= '0' && ch <= '9') &&
-            ch != '+' && ch != '_' && ch != '.' && ch != '-') ch = '-';
+    auto pkgname = receipt.pkgname;
+    if (pkgname.empty()) {
+        auto derived = system_package_name(receipt.url);
+        if (!derived) return std::unexpected(derived.error());
+        pkgname = std::move(*derived);
     }
-    const auto pkgname = "braurser-git-" + name;
-    if (!br_valid_pkgname(pkgname.data(), pkgname.size())) return std::unexpected(fail("package-name"));
+    if (!system_name(pkgname)) return std::unexpected(fail("package-name"));
     const auto seconds = std::chrono::system_clock::to_time_t(date);
     std::tm tm{};
     if (!gmtime_r(&seconds, &tm)) return std::unexpected(fail("package-date"));
@@ -72,6 +103,7 @@ std::expected<std::filesystem::path, ManualError> build_system_package(
     if (!validated) return std::unexpected(validated.error());
     bool has_elf = false;
     for (const auto& file : validated->files) {
+        if (file.mode == 0120000U) continue;
         const auto path = stage / file.path;
         const int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
         if (fd < 0) return std::unexpected(fail("package-file"));

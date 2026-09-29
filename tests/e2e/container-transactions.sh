@@ -47,7 +47,12 @@ transaction() {
     runuser -u builder -- env HOME=/home/builder USER=builder XDG_RUNTIME_DIR=/home/builder/runtime BRAURSER_E2E_ACK_REVIEWS=1 "$client" /home/builder/runtime/braurser/core.sock --plan "$2" "$1" 3600
 }
 
-rpc catalog.refresh '{"sources":[]}' | response >/dev/null
+refreshed=0
+for attempt in $(seq 1 120); do
+    if rpc catalog.refresh '{"sources":[]}' | response >/dev/null; then refreshed=1; break; fi
+    sleep 2
+done
+((refreshed))
 rpc catalog.search '{"text":"tree","filters":{},"limit":20,"sort":"relevance"}' | response | jq -e '.packages | any(.package.name == "tree")'
 transaction jobs.install '{"kind":"install","packageId":"tree"}'
 pacman -Q tree

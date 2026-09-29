@@ -1,3 +1,5 @@
+#include "blob.hpp"
+
 #include <braurser/daemon/manual/manual.hpp>
 
 #include <git2.h>
@@ -36,6 +38,9 @@ std::expected<std::string, ManualError> diff_script(
         if (git_tree_entry_bypath(&raw_entry, tree.get(), std::string(entry_point).c_str()) != 0)
             return std::unexpected(fail("update-entry"));
         std::unique_ptr<git_tree_entry, decltype(&git_tree_entry_free)> entry(raw_entry, git_tree_entry_free);
+        const auto declared = internal::blob_size(repo.get(), *git_tree_entry_id(entry.get()));
+        if (!declared) return std::unexpected(fail("update-blob"));
+        if (*declared > 256 * 1024) return std::unexpected(fail("update-script-size"));
         git_blob* raw_blob = nullptr;
         if (git_blob_lookup(&raw_blob, repo.get(), git_tree_entry_id(entry.get())) != 0)
             return std::unexpected(fail("update-blob"));

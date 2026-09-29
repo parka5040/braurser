@@ -57,5 +57,22 @@ TEST(DocumentMarkup, DoesNotInterpretClosingTagsOrUriQuotes) {
               "&lt;/a&gt;&lt;b&gt;bad&lt;/b&gt;");
     EXPECT_EQ(build_markup({}), "");
 }
+
+TEST(CodeText, AcceptsLargeReviewTextAndBoundsIt) {
+    const std::string large(200 * 1024, 'x');
+    EXPECT_EQ(safe_code(large), large);
+    EXPECT_EQ(safe_code(std::string(262144, 'y')).size(), 262144U);
+    EXPECT_THROW(safe_code(std::string(262145, 'x')), std::length_error);
+    EXPECT_THROW(safe_text(std::string(65537, 'x')), std::length_error);
+}
+
+TEST(CodeText, ShowsBidiAndInvisibleFormatCharacters) {
+    EXPECT_EQ(safe_code("a\u202Eb\u2066c\u2069d\u200Be\uFEFFf\u061Cg"),
+              "a\uFFFDb\uFFFDc\uFFFDd\uFFFDe\uFFFDf\uFFFDg");
+    EXPECT_EQ(safe_code(std::string("x\0y\x1b", 4)), "x\uFFFDy\uFFFD");
+    EXPECT_EQ(safe_code("if [ \"$a\" ]; then\n\techo \u05E9\u05DC\u05D5\u05DD \u0645\u0631\u062D\u0628\u0627\r\n"),
+              "if [ \"$a\" ]; then\n\techo \u05E9\u05DC\u05D5\u05DD \u0645\u0631\u062D\u0628\u0627\r\n");
+    EXPECT_EQ(safe_text("a\u202Eb"), "a\u202Eb");
+}
 }
 }

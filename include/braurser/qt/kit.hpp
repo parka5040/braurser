@@ -26,6 +26,10 @@ enum class Severity { Info, Success, Warning, Error };
 
 void ensure_resources();
 QString safe_text(std::string_view text);
+/// in: script or build text of at most 256 KiB
+/// out: text with controls, bidi and invisible format characters shown as U+FFFD
+/// err: throws std::length_error above 256 KiB
+QString safe_code(std::string_view text);
 bool allowed_link(std::string_view href);
 QColor token_color(std::string_view name, Theme theme);
 QPalette theme_palette(Theme theme);

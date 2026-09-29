@@ -60,7 +60,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     braurser::daemon::api::register_handlers(registry, *services);
-    braurser::daemon::jobs::register_handlers(registry, *services, *paths, broadcaster, [&services] { return services->latest_report(); }, server,
+    const auto stop_jobs = braurser::daemon::jobs::register_handlers(registry, *services, *paths, broadcaster,
+        [&services] { return services->latest_report(); }, server,
         [&services](std::string_view id) { return services->preview_result(id); });
     braurser::daemon::notifications::register_service(registry, *services, paths->state, std::filesystem::read_symlink("/proc/self/exe").parent_path() / "braurser");
     services->start_monitors();
@@ -70,12 +71,14 @@ int main(int argc, char** argv) {
     sigemptyset(&action.sa_mask);
     sigaction(SIGINT, &action, nullptr);
     sigaction(SIGTERM, &action, nullptr);
-    auto signals = Glib::signal_timeout().connect([&server] {
+    auto signals = Glib::signal_timeout().connect([&server, &stop_jobs] {
         if (!terminate_requested) return true;
+        stop_jobs();
         server.stop();
         return false;
     }, 100);
     server.run();
     signals.disconnect();
+    stop_jobs();
     return 0;
 }

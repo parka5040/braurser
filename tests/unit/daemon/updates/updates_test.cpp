@@ -135,6 +135,29 @@ TEST(Update, TempDbUsesPrivateSnapshotAndRemovesIt) {
     EXPECT_EQ(absent.error().code, updates::UpdateErrorCode::Unavailable);
 }
 
+TEST(Update, TempDbSweepsStaleCopiesFromEarlierDaemons) {
+    Tree tree;
+    write(tree.path / "real/local/demo-1/desc", "%NAME%\ndemo\n");
+    write(tree.path / "real/sync/core.db", "original");
+    const auto root = tree.path / "runtime/braurser/checkdb";
+    write(root / "db-999999999-4/sync/core.db", "stale");
+    ASSERT_EQ(symlink((tree.path / "real/local").c_str(), (root / "db-999999999-4/local").c_str()), 0);
+    const auto own = root / ("db-" + std::to_string(getpid()) + "-99999");
+    write(own / "sync/core.db", "current");
+    write(root / "db-x-1/keep", "x");
+    write(root / "unrelated/keep", "x");
+    Runner runner;
+    {
+        auto created = updates::TempSyncDb::create(runner, tree.path / "real", tree.path / "runtime", "/usr/bin/true");
+        ASSERT_TRUE(created) << created.error().detail;
+    }
+    EXPECT_FALSE(std::filesystem::exists(root / "db-999999999-4"));
+    EXPECT_TRUE(std::filesystem::exists(tree.path / "real/local/demo-1/desc"));
+    EXPECT_TRUE(std::filesystem::exists(own / "sync/core.db"));
+    EXPECT_TRUE(std::filesystem::exists(root / "db-x-1/keep"));
+    EXPECT_TRUE(std::filesystem::exists(root / "unrelated/keep"));
+}
+
 TEST(Update, DISABLED_LiveTempDbCheck) {
     core::PosixProcessRunner real;
     auto checked = updates::TempSyncDb::create(real, "/var/lib/pacman", std::filesystem::temp_directory_path());

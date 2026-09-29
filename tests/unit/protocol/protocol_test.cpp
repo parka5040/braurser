@@ -116,6 +116,38 @@ TEST(Protocol, FrameHandlesPartialFeedsAndConsecutiveMessages) {
     EXPECT_FALSE(decoder.next()->has_value());
 }
 
+TEST(Protocol, FrameAcceptsMaximumFrameFollowedByNextFrameInOneFeed) {
+    const std::string large = "\"" + std::string(kMaxFrameBytes - 2, 'a') + "\"";
+    const std::string small = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}";
+    const auto frames = encode_frame(large) + encode_frame(small);
+    const auto tail = encode_frame(large);
+    FrameDecoder decoder;
+    decoder.feed(std::as_bytes(std::span(frames.data(), frames.size())));
+    decoder.feed(std::as_bytes(std::span(tail.data(), 4096)));
+    auto first = decoder.next();
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(first->has_value());
+    EXPECT_EQ(**first, large);
+    auto second = decoder.next();
+    ASSERT_TRUE(second.has_value());
+    ASSERT_TRUE(second->has_value());
+    EXPECT_EQ(**second, small);
+    decoder.feed(std::as_bytes(std::span(tail.data() + 4096, tail.size() - 4096)));
+    auto third = decoder.next();
+    ASSERT_TRUE(third.has_value());
+    ASSERT_TRUE(third->has_value());
+    EXPECT_EQ(**third, large);
+    EXPECT_FALSE(decoder.next()->has_value());
+}
+
+TEST(Protocol, FrameBoundsUndrainedBuffer) {
+    const std::string large = "\"" + std::string(kMaxFrameBytes - 2, 'a') + "\"";
+    const auto frame = encode_frame(large);
+    FrameDecoder decoder;
+    for (int i = 0; i < 3; ++i) decoder.feed(std::as_bytes(std::span(frame.data(), frame.size())));
+    EXPECT_FALSE(decoder.next().has_value());
+}
+
 TEST(Protocol, FrameRejectsOversizeAndZeroBeforeReadingBody) {
     for (const std::array<std::byte, 4> prefix : {
              std::array{std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0}},

@@ -240,7 +240,7 @@ if ! command -v paru >/dev/null && ! command -v yay >/dev/null; then
         fi
         run git clone -- "$helper_url" "$helper_dir/source"
         printf 'Please review the community build recipe:\n'
-        while IFS= read -r line || [[ -n $line ]]; do printf '%s\n' "$line"; done < "$helper_dir/source/PKGBUILD"
+        LC_ALL=C cat -v -- "$helper_dir/source/PKGBUILD"
         if confirm "Build and install $choice?"; then
             (cd "$helper_dir/source" && run makepkg -si --noconfirm) || die 'The community helper could not be installed.'
         else

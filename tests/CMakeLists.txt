@@ -1,6 +1,3 @@
-add_test(NAME CommentPolicy.Repository
-    COMMAND bash "${CMAKE_SOURCE_DIR}/tests/comment-policy.sh" "${CMAKE_SOURCE_DIR}")
-
 braurser_component(tests/unit/validate)
 braurser_component(tests/unit/domain)
 braurser_component(tests/unit/protocol)

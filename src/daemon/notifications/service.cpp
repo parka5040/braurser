@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <array>
+#include <csignal>
 #include <cstdio>
 #include <format>
 #include <limits>
@@ -18,6 +19,26 @@ extern char** environ;
 
 namespace braurser::daemon::notifications {
 namespace {
+bool spawn_ui(const std::string& command, char* const* arguments, pid_t& pid) {
+    posix_spawn_file_actions_t actions{};
+    if (posix_spawn_file_actions_init(&actions) != 0) return false;
+    posix_spawnattr_t attributes{};
+    if (posix_spawnattr_init(&attributes) != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        return false;
+    }
+    sigset_t empty{};
+    sigemptyset(&empty);
+    const bool spawned = posix_spawn_file_actions_addclosefrom_np(&actions, 3) == 0 &&
+                         posix_spawn_file_actions_addchdir_np(&actions, "/") == 0 &&
+                         posix_spawnattr_setsigmask(&attributes, &empty) == 0 &&
+                         posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSIGMASK) == 0 &&
+                         posix_spawn(&pid, command.c_str(), &actions, &attributes, arguments, environ) == 0;
+    posix_spawnattr_destroy(&attributes);
+    posix_spawn_file_actions_destroy(&actions);
+    return spawned;
+}
+
 std::optional<std::string> digest(const protocol::UpdateReport& report) {
     std::set<std::string> ids;
     auto collect = [&ids](const auto& entries, std::string_view source) {
@@ -80,7 +101,7 @@ bool DesktopTransport::send(const Payload& payload) {
                 std::array<char*, 4> arguments{const_cast<char*>(command.c_str()),
                                                const_cast<char*>("--page"), const_cast<char*>("updates"), nullptr};
                 pid_t pid{};
-                if (posix_spawn(&pid, command.c_str(), nullptr, nullptr, arguments.data(), environ) == 0)
+                if (spawn_ui(command, arguments.data(), pid))
                     g_child_watch_add(pid, [](GPid child, gint, gpointer) {
                         g_spawn_close_pid(child);
                     }, nullptr);

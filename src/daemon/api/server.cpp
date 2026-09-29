@@ -18,6 +18,8 @@ namespace braurser::daemon::api {
 namespace {
 constexpr std::size_t max_queue = 4 * 1024 * 1024;
 constexpr std::size_t max_pending = 64;
+constexpr std::size_t max_clients = 128;
+constexpr std::size_t max_id_depth = 32;
 
 bool private_runtime(const std::filesystem::path& path) {
     if (!path.is_absolute() || path == "/" || path.lexically_normal() != path) return false;
@@ -26,19 +28,66 @@ bool private_runtime(const std::filesystem::path& path) {
            info.st_uid == getuid() && (info.st_mode & 0777) == 0700;
 }
 
+class RequestIdReader {
+public:
+    using json = nlohmann::json;
+    bool null() { return scalar(); }
+    bool boolean(bool) { return scalar(); }
+    bool number_integer(json::number_integer_t value) {
+        if (expect_id()) id_ = static_cast<std::int64_t>(value);
+        return scalar();
+    }
+    bool number_unsigned(json::number_unsigned_t value) {
+        if (expect_id() && value <= static_cast<json::number_unsigned_t>(std::numeric_limits<std::int64_t>::max()))
+            id_ = static_cast<std::int64_t>(value);
+        return scalar();
+    }
+    bool number_float(json::number_float_t, const json::string_t&) { return scalar(); }
+    bool string(json::string_t& value) {
+        if (expect_id() && !value.empty() && value.size() <= 64 && protocol::valid_utf8(value)) id_ = value;
+        return scalar();
+    }
+    bool binary(json::binary_t&) { return false; }
+    bool start_object(std::size_t) { return enter(true); }
+    bool end_object() { return leave(); }
+    bool start_array(std::size_t) { return enter(false); }
+    bool end_array() { return leave(); }
+    bool key(json::string_t& value) {
+        pending_id_ = depth_ == 1 && value == "id";
+        if (pending_id_) id_.reset();
+        return true;
+    }
+    bool parse_error(std::size_t, const std::string&, const nlohmann::detail::exception&) { return false; }
+    std::optional<protocol::RequestId> id() const { return object_ ? id_ : std::nullopt; }
+private:
+    bool expect_id() const { return pending_id_ && depth_ == 1; }
+    bool scalar() {
+        if (depth_ == 0) return false;
+        pending_id_ = false;
+        return true;
+    }
+    bool enter(bool object) {
+        if (depth_ == 0) object_ = object;
+        if (depth_ == 0 && !object) return false;
+        pending_id_ = false;
+        return ++depth_ <= max_id_depth;
+    }
+    bool leave() {
+        if (depth_ == 0) return false;
+        --depth_;
+        return true;
+    }
+    std::optional<protocol::RequestId> id_;
+    std::size_t depth_{};
+    bool object_{};
+    bool pending_id_{};
+};
+
 std::optional<protocol::RequestId> request_id(std::string_view bytes) {
     try {
-        auto value = nlohmann::json::parse(bytes.begin(), bytes.end());
-        if (!value.is_object() || !value.contains("id")) return std::nullopt;
-        const auto& id = value.at("id");
-        if (id.is_string()) {
-            auto text = id.get<std::string>();
-            if (!text.empty() && text.size() <= 64 && protocol::valid_utf8(text)) return text;
-        } else if (id.is_number_integer() &&
-                   (!id.is_number_unsigned() || id.get<std::uint64_t>() <=
-                    static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))) {
-            return id.get<std::int64_t>();
-        }
+        RequestIdReader reader;
+        if (!nlohmann::json::sax_parse(bytes.begin(), bytes.end(), &reader)) return std::nullopt;
+        return reader.id();
     } catch (const std::exception&) {}
     return std::nullopt;
 }
@@ -74,11 +123,7 @@ Server::Server(HandlerRegistry& registry, std::filesystem::path runtime,
 
 Server::~Server() {
     stop();
-    for (auto it = clients_.begin(); it != clients_.end();) {
-        const int fd = it->first;
-        ++it;
-        close_client(fd);
-    }
+    for (const auto& client : connected()) close_client(client->socket->get_fd());
     if (lock_fd_ >= 0) close(lock_fd_);
 }
 
@@ -152,8 +197,7 @@ std::expected<void, std::string> Server::start() {
     }
     try {
         listener_ = Gio::Socket::create_from_fd(fd);
-        accept_source_ = Glib::signal_io().connect(sigc::mem_fun(*this, &Server::accept_ready),
-            listener_->get_fd(), Glib::IOCondition::IO_IN | Glib::IOCondition::IO_ERR | Glib::IOCondition::IO_HUP);
+        watch_listener();
     } catch (const Glib::Error&) {
         close(fd);
         finish();
@@ -166,12 +210,33 @@ std::expected<void, std::string> Server::start() {
 
 void Server::run() { loop_->run(); }
 
+void Server::watch_listener() {
+    accept_source_.disconnect();
+    accept_source_ = Glib::signal_io().connect(sigc::mem_fun(*this, &Server::accept_ready),
+        listener_->get_fd(), Glib::IOCondition::IO_IN | Glib::IOCondition::IO_ERR | Glib::IOCondition::IO_HUP);
+}
+
 bool Server::accept_ready(Glib::IOCondition condition) {
     if (stopping_ || ((condition & (Glib::IOCondition::IO_ERR | Glib::IOCondition::IO_HUP)) != Glib::IOCondition(0))) return false;
     while (true) {
         const int fd = accept4(listener_->get_fd(), nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
-        if (fd < 0) return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
-        if (!peers_->allowed(fd, getuid())) { close(fd); continue; }
+        if (fd < 0) {
+            const int error = errno;
+            if (error == EAGAIN || error == EWOULDBLOCK || error == EINTR) return true;
+            if (error == ECONNABORTED || error == EPROTO || error == EPERM) continue;
+            if (error == EMFILE || error == ENFILE || error == ENOBUFS || error == ENOMEM) {
+                accept_retry_.disconnect();
+                accept_retry_ = Glib::signal_timeout().connect([this] {
+                    if (!stopping_ && listener_) {
+                        try { watch_listener(); }
+                        catch (const Glib::Error&) {}
+                    }
+                    return false;
+                }, 200);
+            }
+            return false;
+        }
+        if (!peers_->allowed(fd, getuid()) || clients_.size() >= max_clients) { close(fd); continue; }
         try {
             if (next_connection_ == std::numeric_limits<ConnectionId>::max()) { close(fd); continue; }
             auto socket = Gio::Socket::create_from_fd(fd);
@@ -298,18 +363,26 @@ void Server::process(const std::shared_ptr<Client>& client, std::string_view fra
 
 void Server::broadcast(const protocol::Notification& notification) {
     if (notification.method == JobQuestionNotificationEvent::wire_name) return;
-    for (auto it = clients_.begin(); it != clients_.end();) {
-        auto client = it->second;
-        ++it;
-        queue(client, notification);
-    }
+    for (const auto& client : connected()) queue(client, notification);
 }
 
 void Server::emit_to(ConnectionId connection, const protocol::Notification& notification) {
     if (!connection) return;
-    for (auto it = clients_.begin(); it != clients_.end(); ++it) {
-        if (it->second->id == connection) { queue(it->second, notification); return; }
+    for (const auto& client : connected()) {
+        if (client->id == connection) { queue(client, notification); return; }
     }
+}
+
+std::vector<std::shared_ptr<Server::Client>> Server::connected() const {
+    std::vector<std::shared_ptr<Client>> result;
+    result.reserve(clients_.size());
+    for (const auto& [fd, client] : clients_) result.push_back(client);
+    return result;
+}
+
+bool Server::still_connected(const std::shared_ptr<Client>& client) const {
+    const auto found = clients_.find(client->socket->get_fd());
+    return found != clients_.end() && found->second == client;
 }
 
 void Server::on_disconnect(std::function<void(ConnectionId)> callback) {
@@ -317,6 +390,7 @@ void Server::on_disconnect(std::function<void(ConnectionId)> callback) {
 }
 
 void Server::finish() {
+    accept_retry_.disconnect();
     if (listener_) { accept_source_.disconnect(); listener_.reset(); }
     struct stat info{};
     if (socket_ino_ && lstat(path_.c_str(), &info) == 0 && S_ISSOCK(info.st_mode) &&
@@ -329,18 +403,18 @@ void Server::finish() {
 void Server::stop() {
     if (stopping_) return;
     stopping_ = true;
+    accept_retry_.disconnect();
     accept_source_.disconnect();
     listener_.reset();
-    for (auto it = clients_.begin(); it != clients_.end();) {
-        auto client = it->second;
-        ++it;
+    for (const auto& client : connected()) {
+        if (!still_connected(client)) continue;
         client->input.disconnect();
         if (client->pending == 0 && client->output.empty()) close_client(client->socket->get_fd());
     }
     if (clients_.empty()) finish();
     else shutdown_source_ = Glib::signal_timeout().connect([this] {
-        for (auto it = clients_.begin(); it != clients_.end();) {
-            int fd = it->first; ++it; close_client(fd);
+        for (const auto& client : connected()) {
+            if (still_connected(client)) close_client(client->socket->get_fd());
         }
         finish(); return false;
     }, 3000);

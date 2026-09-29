@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <deque>
+#include <vector>
 #include <sys/types.h>
 
 namespace braurser::daemon::api {
@@ -65,6 +66,7 @@ private:
     Glib::RefPtr<Glib::MainLoop> loop_;
     Glib::RefPtr<Gio::Socket> listener_;
     sigc::connection accept_source_;
+    sigc::connection accept_retry_;
     sigc::connection shutdown_source_;
     std::map<int, std::shared_ptr<Client>> clients_;
     ConnectionId next_connection_{};
@@ -75,11 +77,14 @@ private:
     bool stopping_{};
 
     bool accept_ready(Glib::IOCondition condition);
+    void watch_listener();
     bool client_ready(const std::shared_ptr<Client>& client, Glib::IOCondition condition);
     void close_client(int fd);
     void queue(const std::shared_ptr<Client>& client, const protocol::Message& message);
     void process(const std::shared_ptr<Client>& client, std::string_view frame);
     void finish();
+    std::vector<std::shared_ptr<Client>> connected() const;
+    bool still_connected(const std::shared_ptr<Client>& client) const;
 };
 
 }

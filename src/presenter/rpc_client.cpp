@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <map>
 #include <mutex>
+#include <csignal>
 #include <poll.h>
 #include <spawn.h>
 #include <sys/socket.h>
@@ -50,6 +51,29 @@ public:
 private:
     std::string path_;
 };
+bool finished_job(const nlohmann::json& params) {
+    const auto state = params.find("state");
+    if (state == params.end() || !state->is_string()) { return false; }
+    const auto& value = state->get_ref<const std::string&>();
+    return value == "succeeded" || value == "failed" || value == "cancelled";
+}
+pid_t spawn_detached(const std::string& path, char* const* argv) {
+    posix_spawn_file_actions_t actions{};
+    if (::posix_spawn_file_actions_init(&actions) != 0) { return -1; }
+    posix_spawnattr_t attributes{};
+    if (::posix_spawnattr_init(&attributes) != 0) { ::posix_spawn_file_actions_destroy(&actions); return -1; }
+    sigset_t empty{};
+    sigemptyset(&empty);
+    pid_t child = -1;
+    const bool ready = ::posix_spawn_file_actions_addclosefrom_np(&actions, 3) == 0 &&
+                       ::posix_spawn_file_actions_addchdir_np(&actions, "/") == 0 &&
+                       ::posix_spawnattr_setsigmask(&attributes, &empty) == 0 &&
+                       ::posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSIGMASK) == 0;
+    if (!ready || ::posix_spawn(&child, path.c_str(), &actions, &attributes, argv, environ) != 0) { child = -1; }
+    ::posix_spawnattr_destroy(&attributes);
+    ::posix_spawn_file_actions_destroy(&actions);
+    return child;
+}
 bool owned_peer(int socket) {
     ucred peer{};
     socklen_t size = sizeof(peer);
@@ -119,6 +143,7 @@ struct RpcClient::Impl : std::enable_shared_from_this<RpcClient::Impl> {
         ::close(socket);
         socket = -1;
         decoder = {};
+        sequences = {};
         std::vector<Callback> failed;
         {
             std::lock_guard lock(mutex);
@@ -185,7 +210,11 @@ struct RpcClient::Impl : std::enable_shared_from_this<RpcClient::Impl> {
             const auto descriptor = std::ranges::find(protocol::kNotifications, event->method, &protocol::NotificationDescriptor::name);
             if (descriptor == protocol::kNotifications.end() || !descriptor->validate_params(event->params)) { return false; }
             if (event->params.contains("jobId") && event->params.contains("sequence")) {
-                if (!sequences.observe(event->params.at("jobId").get<std::string>(), event->params.at("sequence").get<std::uint64_t>())) { return false; }
+                const auto job = event->params.at("jobId").get<std::string>();
+                if (!sequences.observe(job, event->params.at("sequence").get<std::uint64_t>())) { return false; }
+                publish(event->method, event->params);
+                if (event->method == Event<protocol::JobStateNotification>::name && finished_job(event->params)) { sequences.forget(job); }
+                return true;
             }
             publish(event->method, event->params);
             return true;
@@ -215,7 +244,7 @@ struct RpcClient::Impl : std::enable_shared_from_this<RpcClient::Impl> {
                         (connection.error() == ENOENT || connection.error() == ECONNREFUSED)) {
                         launched = true;
                         std::array<char*, 3> argv{options.daemon_path.data(), const_cast<char*>("--background"), nullptr};
-                        if (::posix_spawn(&child, options.daemon_path.c_str(), nullptr, nullptr, argv.data(), environ) != 0) { child = -1; }
+                        child = spawn_detached(options.daemon_path, argv.data());
                     }
                 }
                 retry = Clock::now() + backoff;

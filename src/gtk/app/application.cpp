@@ -584,7 +584,7 @@ void AppWindow::code(Gtk::Box& box, const std::string& text) {
     auto* area = Gtk::make_managed<Gtk::TextView>();
     area->set_editable(false); area->set_cursor_visible(false); area->set_monospace(true);
     area->set_wrap_mode(Gtk::WrapMode::WORD_CHAR);
-    area->get_buffer()->set_text(kit::safe_text(text));
+    area->get_buffer()->set_text(kit::safe_code(text));
     box.append(*area);
 }
 

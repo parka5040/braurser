@@ -22,11 +22,14 @@ std::string encode_frame(std::string_view json) {
 void FrameDecoder::feed(std::span<const std::byte> data) {
     if (error_) return;
     for (const std::byte byte : data) {
-        if (buffer_.size() >= kMaxFrameBytes + 4) {
+        if (buffer_.size() - complete_bytes_ >= kMaxFrameBytes + 4 ||
+            buffer_.size() >= 2 * (kMaxFrameBytes + 4)) {
             error_ = ProtocolError{kInvalidRequest, "error.invalid_frame"};
             return;
         }
         buffer_.push_back(byte);
+        if (buffer_.size() == next_header_offset_ && next_header_offset_ > complete_bytes_)
+            complete_bytes_ = next_header_offset_;
         if (buffer_.size() == next_header_offset_ + 4) {
             std::uint32_t length = 0;
             for (std::size_t i = next_header_offset_; i < next_header_offset_ + 4; ++i) {
@@ -60,6 +63,7 @@ std::expected<std::optional<std::string>, ProtocolError> FrameDecoder::next() {
     }
     buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<std::ptrdiff_t>(length + 4));
     next_header_offset_ -= static_cast<std::size_t>(length) + 4;
+    complete_bytes_ -= static_cast<std::size_t>(length) + 4;
     if (!valid_utf8(json)) {
         error_ = ProtocolError{kParseError, "error.invalid_json"};
         return std::unexpected(*error_);

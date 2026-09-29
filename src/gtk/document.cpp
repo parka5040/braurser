@@ -8,6 +8,13 @@ namespace braurser::gtk::kit {
 namespace {
 constexpr std::size_t text_limit = 65536;
 constexpr std::size_t document_limit = 1048576;
+constexpr std::size_t code_limit = 262144;
+
+bool hidden_format(gunichar character) {
+    return character == 0x061C || (character >= 0x200B && character <= 0x200F) ||
+           (character >= 0x202A && character <= 0x202E) || (character >= 0x2060 && character <= 0x2064) ||
+           (character >= 0x2066 && character <= 0x2069) || character == 0xFEFF;
+}
 
 std::string escaped(std::string_view value) {
     return Glib::Markup::escape_text(safe_text(value));
@@ -25,11 +32,10 @@ Gtk::Label& prose(Gtk::Box& parent, const std::string& markup) {
     parent.append(*label);
     return *label;
 }
-}
 
-std::string safe_text(std::string_view text) {
+std::string sanitized(std::string_view text, std::size_t limit, bool code) {
     if (text.empty()) { return {}; }
-    if (text.size() > text_limit) {
+    if (text.size() > limit) {
         throw std::length_error("kit text exceeds limit");
     }
     std::string result;
@@ -42,7 +48,7 @@ std::string safe_text(std::string_view text) {
             result += "\xEF\xBF\xBD";
             ++current;
         } else if ((character < 32 && character != '\n' && character != '\r' && character != '\t') ||
-                   character == 0xFFFE || character == 0xFFFF) {
+                   character == 0xFFFE || character == 0xFFFF || (code && hidden_format(character))) {
             result += "\xEF\xBF\xBD";
             current = g_utf8_next_char(current);
         } else {
@@ -52,6 +58,15 @@ std::string safe_text(std::string_view text) {
         }
     }
     return result;
+}
+}
+
+std::string safe_text(std::string_view text) {
+    return sanitized(text, text_limit, false);
+}
+
+std::string safe_code(std::string_view text) {
+    return sanitized(text, code_limit, true);
 }
 
 bool allowed_link(std::string_view href) {

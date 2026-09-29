@@ -28,6 +28,9 @@ public:
     /// out: configured repositories in order and absolute database path.
     /// err: rejects invalid command output and failures.
     std::expected<Repositories, CatalogError> read() const;
+    /// out: configured HoldPkg names, empty when unset.
+    /// err: rejects invalid names, invalid command output and failures.
+    std::expected<std::vector<std::string>, CatalogError> hold_packages() const;
 private:
     core::ProcessRunner& runner_;
 };

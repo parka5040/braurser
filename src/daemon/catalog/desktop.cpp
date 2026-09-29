@@ -108,7 +108,7 @@ std::expected<DesktopEntry, CatalogError> parse_desktop_entry(std::string_view t
         return it == fields.end() ? std::string{} : it->second;
     };
     std::string base(locale);
-    base.resize(base.find_first_of(".@"));
+    if (const auto cut = base.find_first_of(".@"); cut != std::string::npos) base.resize(cut);
     if (base.size() > 32) return std::unexpected(CatalogError{"desktop-locale", {}});
     auto localized = [&](std::string_view key) {
         if (!base.empty()) {

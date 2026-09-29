@@ -1,7 +1,9 @@
 #include <braurser/daemon/jobs/register.hpp>
 #include <braurser/daemon/core/process.hpp>
 #include <braurser/domain/vercmp.hpp>
+#include "selection.hpp"
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <pwd.h>
@@ -33,10 +35,22 @@ helpers::HelperEnvironment helper_environment(const core::XdgPaths& paths) {
     return environment;
 }
 
+std::string preferred_ui(api::Services& services) {
+    std::string setting = "auto";
+    try {
+        if (auto current = services.settings_get({}); current && !current->uiPreference.value.empty())
+            setting = current->uiPreference.value;
+    } catch (const std::exception&) {}
+    const char* forced = std::getenv("BRAURSER_UI");
+    const char* desktop = std::getenv("XDG_CURRENT_DESKTOP");
+    const auto ui = launcher::select_ui(forced ? forced : "", setting, desktop ? desktop : "");
+    return elevation::askpass_ui(ui.value_or("gtk"), BRAURSER_LIBEXEC_DIR);
+}
+
 class UserManualInstaller final : public ManualInstaller {
 public:
-    UserManualInstaller(core::ProcessRunner& runner, const core::XdgPaths& paths)
-        : runner_(runner), paths_(paths) {}
+    UserManualInstaller(core::ProcessRunner& runner, const core::XdgPaths& paths, const std::atomic<bool>& qt)
+        : runner_(runner), paths_(paths), qt_(qt) {}
     Result<void> run(const Snapshot& snapshot, std::string_view job_id) override {
         if (snapshot.plan.kind.value == "setup-helper") return setup_helper(snapshot, job_id);
         const auto scope = snapshot.selection.scope;
@@ -102,16 +116,20 @@ public:
                                              std::move(receipt))) return refused();
             return {};
         }
+        if (kind == "manual-upgrade") {
+            if (!snapshot.manual_receipt || snapshot.manual_receipt->scope != manual::Scope::System) return refused();
+            receipt.pkgname = snapshot.manual_receipt->pkgname;
+        } else {
+            auto name = manual::system_package_name(receipt.url);
+            if (!name) return refused();
+            receipt.pkgname = std::move(*name);
+        }
         auto built = manual::build_system_package(runner_, job_root / "stage", environment.home,
             environment.home / ".cache/braurser/build/manual" / std::string(job_id), receipt,
             std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()));
         if (!built) return refused();
         auto request = manual::system_upgrade_request(*built);
         if (!request || !official(kind, {*built})) return refused();
-        auto name = manual::render_pkgbuild(receipt,
-            std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()), "any");
-        if (!name) return refused();
-        receipt.pkgname = name->first;
         if (!verify_installed(receipt.pkgname, true)) return refused();
         receipt.installed_at = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
         if (!manual::record_system_install(paths_.state, receipt)) return refused();
@@ -124,6 +142,7 @@ public:
 private:
     core::ProcessRunner& runner_;
     const core::XdgPaths& paths_;
+    const std::atomic<bool>& qt_;
     elevation::ProcAgentProbe probe_;
     elevation::ElevationSelector selector_{probe_};
     static Result<void> refused() {
@@ -175,10 +194,11 @@ private:
         return {};
     }
     bool official(std::string_view kind, const std::vector<std::string>& targets) {
+        const std::string ui = qt_ ? "qt" : "gtk";
         elevation::Environment env;
         env.uid = getuid();
-        env.askpass = BRAURSER_LIBEXEC_DIR "/braurser-askpass-gtk";
-        const ElevationOptions options{selector_.select(env).method, BRAURSER_LIBEXEC_DIR, "gtk", "install"};
+        env.askpass = std::filesystem::path(BRAURSER_LIBEXEC_DIR) / ("braurser-askpass-" + ui);
+        const ElevationOptions options{selector_.select(env).method, BRAURSER_LIBEXEC_DIR, ui, "install"};
         auto spec = official_spec(kind, targets, options);
         if (!spec) return false;
         spec->max_stdout = spec->max_stderr = 8 * 1024 * 1024;
@@ -204,7 +224,7 @@ public:
                 api::Broadcaster& broadcaster, LivePlanSource::Report report, LivePlanSource::PreviewLookup preview)
         : services_(services), paths_(paths), broadcaster_(broadcaster),
           report_(std::move(report)), source_(services, read_runner_, report_, paths.state, paths.cache, std::move(preview)),
-          plans_(source_), manual_installer_(read_runner_, paths_),
+          plans_(source_), qt_askpass_(preferred_ui(services) == "qt"), manual_installer_(read_runner_, paths_, qt_askpass_),
           runner_(plans_, [] { return std::make_unique<GioStreamingProcess>(); },
           [this](std::string_view, const protocol::JobEvent& event, api::ConnectionId owner) { notify(event, owner); },
           paths.state, auth(),
@@ -220,6 +240,7 @@ public:
 
     PlanManager& plans() { return plans_; }
     JobRunner& runner() { return runner_; }
+    void refresh_ui() { qt_askpass_ = preferred_ui(services_) == "qt"; }
     bool matches_report(std::string_view id) const {
         if (id.empty() || id.size() > 128 || !report_) return false;
         const auto report = report_();
@@ -233,19 +254,23 @@ private:
     core::PosixProcessRunner read_runner_;
     LivePlanSource source_;
     PlanManager plans_;
+    std::atomic<bool> qt_askpass_;
     UserManualInstaller manual_installer_;
     elevation::ProcAgentProbe probe_;
     elevation::ElevationSelector selector_{probe_};
     JobRunner runner_;
 
+    std::string ui() const { return qt_askpass_ ? "qt" : "gtk"; }
     ElevationOptions auth() {
         elevation::Environment env;
         env.uid = getuid();
-        env.askpass = BRAURSER_LIBEXEC_DIR "/braurser-askpass-gtk";
-        return {selector_.select(env).method, BRAURSER_LIBEXEC_DIR, "gtk", "install"};
+        env.askpass = std::filesystem::path(BRAURSER_LIBEXEC_DIR) / ("braurser-askpass-" + ui());
+        return {selector_.select(env).method, BRAURSER_LIBEXEC_DIR, ui(), "install"};
     }
     Result<core::ProcessSpec> build_spec(const Snapshot& snapshot, std::string_view id,
-                                         const ElevationOptions& selection) {
+                                         const ElevationOptions& configured) {
+        auto selection = configured;
+        selection.ui = ui();
         if (snapshot.helper == "auto" || snapshot.plan.kind.value == "remove")
             return official_spec(snapshot.plan.kind.value, snapshot.targets, selection);
         if (selection.method == elevation::Method::Unavailable)
@@ -374,7 +399,7 @@ void bind(api::HandlerRegistry& registry, std::shared_ptr<Coordinator> coordinat
 }
 }
 
-void register_handlers(api::HandlerRegistry& registry, api::Services& services,
+std::function<void()> register_handlers(api::HandlerRegistry& registry, api::Services& services,
                        const core::XdgPaths& paths, api::Broadcaster& broadcaster,
                        LivePlanSource::Report report, api::Server& server, LivePlanSource::PreviewLookup preview) {
     auto coordinator = std::make_shared<Coordinator>(services, paths, broadcaster, std::move(report), std::move(preview));
@@ -397,6 +422,7 @@ void register_handlers(api::HandlerRegistry& registry, api::Services& services,
         });
     auto enqueue = [](std::string_view kind) {
         return [kind](auto& context, const auto& params, api::ConnectionId owner) {
+            context.refresh_ui();
             return context.runner().enqueue(params.planId, params.approvalToken, owner, kind);
         };
     };
@@ -418,6 +444,9 @@ void register_handlers(api::HandlerRegistry& registry, api::Services& services,
         [](auto& context, const protocol::JobsAnswerParams& params, api::ConnectionId owner) { return context.runner().answer(params, owner); });
     bind<api::JobsDequeueParamsMethod>(registry, coordinator,
         [](auto& context, const protocol::JobsDequeueParams& params, api::ConnectionId owner) { return context.runner().dequeue(params.jobId, owner); });
+    return [weak = std::weak_ptr(coordinator)] {
+        if (auto owner = weak.lock()) owner->runner().stop();
+    };
 }
 
 }

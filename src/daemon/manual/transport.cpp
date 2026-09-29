@@ -1,3 +1,5 @@
+#include "blob.hpp"
+
 #include <braurser/daemon/manual/manual.hpp>
 #include <braurser/daemon/core/files.hpp>
 #include <braurser/daemon/core/text.hpp>
@@ -169,7 +171,12 @@ std::expected<std::filesystem::path, ManualError> fetch_bare(
         return std::unexpected(fail("fetch-init"));
     std::unique_ptr<git_repository, decltype(&git_repository_free)> repo(raw, git_repository_free);
     git_remote* raw_remote = nullptr;
-    if (git_remote_create_anonymous(&raw_remote, repo.get(), parsed->url.c_str()) != 0)
+    git_remote_create_options create;
+    if (git_remote_create_options_init(&create, GIT_REMOTE_CREATE_OPTIONS_VERSION) != 0)
+        return std::unexpected(fail("fetch-remote"));
+    create.repository = repo.get();
+    create.flags = GIT_REMOTE_CREATE_SKIP_INSTEADOF;
+    if (git_remote_create_with_opts(&raw_remote, parsed->url.c_str(), &create) != 0)
         return std::unexpected(fail("fetch-remote"));
     std::unique_ptr<git_remote, decltype(&git_remote_free)> remote(raw_remote, git_remote_free);
     BudgetedHttp budgeted(http);
@@ -177,15 +184,21 @@ std::expected<std::filesystem::path, ManualError> fetch_bare(
     if (!guard.ok()) return std::unexpected(fail("fetch-register"));
     last_error.reset();
     const std::string branch = std::string(revision);
+    const auto safe_ref = [](std::string_view name) {
+        return !name.empty() && name.size() <= 128 && name.find("..") == name.npos &&
+               name.front() != '/' && name.back() != '/' && name.find("//") == name.npos &&
+               std::all_of(name.begin(), name.end(), [](unsigned char ch) {
+                   return std::isalnum(ch) || ch == '-' || ch == '_' || ch == '/' || ch == '.';
+               });
+    };
+    const bool heads = branch.starts_with("refs/heads/");
     std::vector<std::string> specs;
     if (branch == "HEAD") specs = {"+HEAD:refs/heads/braurser-preview"};
-    else if (branch.starts_with("refs/heads/")) specs = {"+" + branch + ":refs/heads/braurser-preview"};
-    else if (branch.starts_with("refs/tags/")) specs = {"+" + branch + ":refs/heads/braurser-preview"};
-    else if (branch.size() <= 128 && branch.find("..") == branch.npos &&
-             std::all_of(branch.begin(), branch.end(), [](unsigned char ch) {
-                 return std::isalnum(ch) || ch == '-' || ch == '_' || ch == '/' || ch == '.';
-             })) specs = {"+refs/heads/" + branch + ":refs/heads/braurser-preview",
-                              "+refs/tags/" + branch + ":refs/tags/braurser-preview"};
+    else if (heads || branch.starts_with("refs/tags/")) {
+        if (!safe_ref(std::string_view(branch).substr(heads ? 11 : 10))) return std::unexpected(fail("fetch-ref"));
+        specs = {"+" + branch + ":refs/heads/braurser-preview"};
+    } else if (safe_ref(branch)) specs = {"+refs/heads/" + branch + ":refs/heads/braurser-preview",
+                                          "+refs/tags/" + branch + ":refs/tags/braurser-preview"};
     else return std::unexpected(fail("fetch-ref"));
     std::vector<char*> raw_specs;
     for (auto& spec : specs) raw_specs.push_back(spec.data());
@@ -236,6 +249,9 @@ std::expected<BuildRepository, ManualError> fetch_build_repository(
     std::unique_ptr<git_tree_entry, decltype(&git_tree_entry_free)> entry(raw_entry, git_tree_entry_free);
     if (git_tree_entry_filemode(entry.get()) != GIT_FILEMODE_BLOB)
         return std::unexpected(fail("build-file"));
+    const auto declared = internal::blob_size(repo.get(), *git_tree_entry_id(entry.get()));
+    if (!declared) return std::unexpected(fail("build-file"));
+    if (*declared == 0 || *declared > 256 * 1024) return std::unexpected(fail("build-file-size"));
     git_blob* raw_blob = nullptr;
     if (git_blob_lookup(&raw_blob, repo.get(), git_tree_entry_id(entry.get())) != 0)
         return std::unexpected(fail("build-file"));

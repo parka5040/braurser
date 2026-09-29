@@ -1,5 +1,6 @@
 #include <braurser/daemon/jobs/live.hpp>
 #include <braurser/daemon/core/text.hpp>
+#include <braurser/domain/protection.hpp>
 #include <braurser/domain/vercmp.hpp>
 #include <braurser/validate/validate.hpp>
 #include <algorithm>
@@ -70,6 +71,33 @@ bool parse_print(std::string_view output, Snapshot& snapshot, std::string_view k
         remaining.remove_prefix(end + 1);
     }
     return seen.size() <= 512;
+}
+
+std::optional<std::vector<std::string>> protected_names(
+    const catalog::PacmanConfig& config, const catalog::LocalDbReader& reader,
+    const std::filesystem::path& db_path, const std::vector<protocol::PackageRef>& removals,
+    const std::vector<catalog::LocalRecord>& installed) {
+    auto hold = config.hold_packages();
+    if (!hold) return std::nullopt;
+    std::vector<std::string> names;
+    names.reserve(removals.size());
+    for (const auto& item : removals) names.push_back(item.name);
+    const std::set<std::string, std::less<>> removing(names.begin(), names.end());
+    std::vector<std::string> kernels;
+    std::size_t inspected = 0;
+    for (const auto& record : installed) {
+        const auto& name = record.package.name;
+        const bool candidate = name.starts_with("linux");
+        if (!candidate && !removing.contains(name)) continue;
+        if (++inspected > 1024) return std::nullopt;
+        auto files = reader.files(db_path, name + "-" + record.package.version);
+        if (!files) {
+            if (candidate) return std::nullopt;
+            continue;
+        }
+        if (domain::installs_kernel_image(*files)) kernels.push_back(name);
+    }
+    return domain::protected_removals(names, *hold, kernels);
 }
 
 std::optional<helpers::HelperEnvironment> read_environment() {
@@ -176,6 +204,26 @@ Result<Snapshot> user_removal_snapshot(const std::filesystem::path& state, std::
     return result;
 }
 
+namespace {
+std::vector<manual::Receipt> recorded_receipts(const std::filesystem::path& state) {
+    std::vector<manual::Receipt> result;
+    const auto directory = state / "braurser/manual/receipts";
+    std::error_code error;
+    std::filesystem::directory_iterator entries(directory, error);
+    if (error) return result;
+    std::size_t count = 0;
+    for (const auto end = std::filesystem::directory_iterator{}; entries != end && ++count <= 4096;
+         entries.increment(error)) {
+        if (error) break;
+        const auto file = entries->path().filename().string();
+        if (!file.ends_with(".json")) continue;
+        auto recorded = user_removal_snapshot(state, std::string_view(file).substr(0, file.size() - 5));
+        if (recorded && recorded->manual_receipt) result.push_back(std::move(*recorded->manual_receipt));
+    }
+    return result;
+}
+}
+
 LivePlanSource::LivePlanSource(api::Services& services, core::ProcessRunner& runner, Report report,
                                std::filesystem::path state, std::filesystem::path cache, PreviewLookup preview)
     : services_(services), runner_(runner), report_(std::move(report)),
@@ -223,6 +271,18 @@ Result<Snapshot> LivePlanSource::snapshot(const protocol::PlanParams& selection)
         const auto url = manual::validate_git_url("https://" + preview->host + "/" + preview->owner_repo);
         if (!url || url->host != preview->host || url->owner_repo != preview->owner_repo)
             return std::unexpected(failure(protocol::kUntrustedInput));
+        if (selection.kind == "manual-install" && selection.scope->value == "system") {
+            auto pkgname = manual::system_package_name(url->url);
+            if (!pkgname) return std::unexpected(failure(protocol::kUntrustedInput));
+            auto repositories = config_.read();
+            if (!repositories) return std::unexpected(failure(protocol::kBusy));
+            auto installed = local_.read(repositories->db_path);
+            if (!installed) return std::unexpected(failure(protocol::kBusy));
+            std::set<std::string> names;
+            for (const auto& record : *installed) names.insert(record.package.name);
+            if (!manual::system_package_available(*pkgname, url->url, recorded_receipts(state_), names))
+                return std::unexpected(failure(protocol::kUnsafeTransaction));
+        }
         const auto kind = preview->entry_points.front().kind;
         if (preview->entry_points.size() != 1) return std::unexpected(failure(protocol::kUntrustedInput));
         auto checked = manual::preview_repository(cache_ / "braurser/manual" / *selection.previewId / "repo.git",
@@ -372,6 +432,12 @@ Result<Snapshot> LivePlanSource::snapshot(const protocol::PlanParams& selection)
                 !parse_print(preview->out, result, kind, *local))
                 return std::unexpected(failure(protocol::kUnsafeTransaction));
             result.fingerprint += preview->out;
+            if (kind == "remove") {
+                auto guarded = protected_names(config_, local_, repositories->db_path, result.plan.removals, *local);
+                if (!guarded) return std::unexpected(failure(protocol::kBusy));
+                for (auto& blocked : *guarded)
+                    result.plan.protected_blockers.push_back({{"official"}, {}, std::move(blocked)});
+            }
         }
     } else return std::unexpected(failure(protocol::kUnsupportedCapability));
     if (result.targets.size() > 512) return std::unexpected(failure(protocol::kUntrustedInput));

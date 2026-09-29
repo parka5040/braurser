@@ -174,7 +174,10 @@ JobRunner::JobRunner(PlanManager& plans, Factory factory, Notify notify, std::fi
       state_(std::move(state)), elevation_(std::move(auth)),
       build_spec_(std::move(build_spec)), verify_(std::move(verify)), classify_(std::move(classify)),
       now_(std::move(now)), success_(std::move(success)), manual_installer_(manual_installer) {}
-JobRunner::~JobRunner() {
+JobRunner::~JobRunner() { stop(); }
+
+void JobRunner::stop() {
+    stopping_ = true;
     lifetime_.reset();
     if (process_) process_->kill_group();
     if (manual_worker_.joinable()) manual_worker_.join();
@@ -201,7 +204,7 @@ void JobRunner::transition(Job& job, std::string_view state) {
 
 Result<protocol::JobIdResult> JobRunner::enqueue(std::string_view id, std::string_view token, api::ConnectionId owner,
                                                   std::string_view requested_kind) {
-    if (pending_.size() >= 256 || jobs_.size() >= 306)
+    if (stopping_ || pending_.size() >= 256 || jobs_.size() >= 306)
         return std::unexpected(failure(protocol::kBusy));
     auto approved = plans_.approve(id, token, owner);
     if (!approved) return std::unexpected(approved.error());
@@ -209,22 +212,32 @@ Result<protocol::JobIdResult> JobRunner::enqueue(std::string_view id, std::strin
     if (!requested_kind.empty() && requested_kind != kind &&
         !(requested_kind == "install" && kind == "update-and-install"))
         return std::unexpected(failure(protocol::kInvalidParams));
+    if (!approved->plan.protected_blockers.empty() || !approved->plan.blockers.empty() ||
+        !approved->plan.conflicts.empty())
+        return std::unexpected(failure(protocol::kUnsafeTransaction));
     auto job_id = random_token();
     Job job;
     job.id = job_id;
     job.owner = owner;
     job.snapshot = std::move(*approved);
     job.selection = job.snapshot.selection;
-    jobs_.emplace(job_id, std::move(job));
-    pending_.push_back(job_id);
-    transition(jobs_.at(job_id), "queued");
-    if (jobs_.at(job_id).snapshot.plan.requires_build_review) {
-        protocol::QuestionChoice choice{protocol::BuildReviewQuestion{
-            jobs_.at(job_id).snapshot.plan.build_review_refs,
-            jobs_.at(job_id).snapshot.helper_build ?
-                std::optional(jobs_.at(job_id).snapshot.helper_build->pkgbuild) : std::nullopt}};
-        ask(job_id, std::move(choice), {"ack"});
+    auto& queued = jobs_.emplace(job_id, std::move(job)).first->second;
+    transition(queued, "queued");
+    if (queued.snapshot.plan.requires_build_review) {
+        try {
+            protocol::QuestionChoice choice{protocol::BuildReviewQuestion{
+                queued.snapshot.plan.build_review_refs,
+                queued.snapshot.helper_build ?
+                    std::optional(queued.snapshot.helper_build->pkgbuild) : std::nullopt}};
+            ask(job_id, std::move(choice), {"ack"});
+        } catch (const std::exception&) {}
+        if (!queued.question) {
+            transition(queued, "failed");
+            finish_job(queued);
+            return std::unexpected(failure(protocol::kUnsafeTransaction));
+        }
     }
+    pending_.push_back(job_id);
     pump();
     return protocol::JobIdResult{job_id};
 }
@@ -305,12 +318,25 @@ void JobRunner::finish_job(Job& job) {
 }
 
 void JobRunner::pump() {
-    if (!active_.empty()) return;
+    if (stopping_ || !active_.empty()) return;
     while (!pending_.empty()) {
         const auto id = pending_.front();
         auto& job = jobs_.at(id);
-        if (job.question) return;
+        if (job.question) {
+            if (now_() < job.question_expires) return;
+            pending_.pop_front();
+            job.question.reset();
+            job.choices.clear();
+            transition(job, "cancelled");
+            finish_job(job);
+            continue;
+        }
         pending_.pop_front();
+        if (job.snapshot.plan.requires_build_review && !job.reviewed) {
+            transition(job, "failed");
+            finish_job(job);
+            continue;
+        }
         if (!plans_.unchanged(job.snapshot, job.selection)) {
             transition(job, "needs-attention");
             finish_job(job);
@@ -480,6 +506,7 @@ Result<protocol::AcceptedResult> JobRunner::answer(const protocol::JobsAnswerPar
         now_() >= job.question_expires ||
         std::ranges::find(job.choices, params.choiceId) == job.choices.end())
         return std::unexpected(failure(protocol::kExpiredQuestion));
+    if (std::holds_alternative<protocol::BuildReviewQuestion>(job.question->choice.value)) job.reviewed = true;
     job.question.reset();
     job.choices.clear();
     transition(job, "queued");

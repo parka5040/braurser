@@ -10,7 +10,9 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace braurser::daemon::updates {
 namespace {
@@ -30,6 +32,28 @@ bool valid_path(const std::filesystem::path& path) {
     return true;
 }
 UpdateError file_error() { return {UpdateErrorCode::FileFailure, "private database setup failed"}; }
+bool digits(std::string_view text) {
+    return !text.empty() && text.size() <= 20 && std::ranges::all_of(text, [](unsigned char c) { return c >= '0' && c <= '9'; });
+}
+bool stale_entry(std::string_view name) {
+    if (!name.starts_with("db-")) return false;
+    name.remove_prefix(3);
+    const auto dash = name.find('-');
+    if (dash == std::string_view::npos || !digits(name.substr(0, dash)) || !digits(name.substr(dash + 1))) return false;
+    return name.substr(0, dash) != std::to_string(getpid());
+}
+void sweep_stale(const std::filesystem::path& root) {
+    std::vector<std::filesystem::path> stale;
+    std::error_code ec;
+    std::filesystem::directory_iterator it(root, ec);
+    if (ec) return;
+    std::size_t seen = 0;
+    for (const auto end = std::filesystem::directory_iterator{}; it != end && ++seen <= 1024; it.increment(ec)) {
+        if (ec) return;
+        if (stale_entry(it->path().filename().native())) stale.push_back(it->path());
+    }
+    for (const auto& path : stale) static_cast<void>(core::remove_tree_confined(root, path));
+}
 std::expected<void, UpdateError> copy_db(int source, int target, const std::string& name, std::uint64_t& total) {
     Fd input(openat(source, name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
     if (input.value < 0) return std::unexpected(file_error());
@@ -121,6 +145,7 @@ std::expected<TempSyncDb, UpdateError> TempSyncDb::create(core::ProcessRunner& r
     const auto root = runtime / "braurser" / "checkdb";
     if (auto ensured = core::ensure_private_dir(root); !ensured)
         return std::unexpected(file_error());
+    sweep_stale(root);
     Fd parent(open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
     if (parent.value < 0) return std::unexpected(file_error());
     std::filesystem::path temp;

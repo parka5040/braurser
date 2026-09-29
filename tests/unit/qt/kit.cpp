@@ -247,6 +247,18 @@ TEST(QtKitNavigation, SelectAndActivateAreExclusiveAndAccessible) {
     EXPECT_EQ(sidebar.selected(), "discover");
 }
 
+TEST(QtKitCode, AcceptsLargeReviewTextAndShowsHiddenFormatting) {
+    const std::string large(200 * 1024, 'x');
+    EXPECT_EQ(kit::safe_code(large), QString::fromStdString(large));
+    EXPECT_THROW(kit::safe_code(std::string(262145, 'x')), std::length_error);
+    EXPECT_EQ(kit::safe_code("a\u202Eb\u2066c\u2069d\u200Be\uFEFFf\u061Cg"),
+              QString::fromUtf8("a\uFFFDb\uFFFDc\uFFFDd\uFFFDe\uFFFDf\uFFFDg"));
+    EXPECT_EQ(kit::safe_code(std::string("x\0y\x1b", 4)), QString::fromUtf8("x\uFFFDy\uFFFD"));
+    const std::string script = "echo \u05E9\u05DC\u05D5\u05DD \u0645\u0631\u062D\u0628\u0627\n\tdone\r\n";
+    EXPECT_EQ(kit::safe_code(script), QString::fromStdString(script));
+    EXPECT_EQ(kit::safe_text("a\u202Eb"), QString::fromUtf8("a\u202Eb"));
+}
+
 TEST(QtKitShell, BreakpointsAndMaximumContentWidth) {
     auto* content = new QWidget;
     auto* layout = new QVBoxLayout(content);

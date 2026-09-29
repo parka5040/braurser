@@ -1,3 +1,5 @@
+#include "blob.hpp"
+
 #include <braurser/daemon/manual/manual.hpp>
 #include <braurser/daemon/core/files.hpp>
 
@@ -12,6 +14,18 @@
 #include <sys/stat.h>
 
 namespace braurser::daemon::manual {
+
+std::optional<std::uint64_t> internal::blob_size(git_repository* repo, const git_oid& oid) {
+    git_odb* raw = nullptr;
+    if (!repo || git_repository_odb(&raw, repo) != 0) return std::nullopt;
+    std::unique_ptr<git_odb, decltype(&git_odb_free)> odb(raw, git_odb_free);
+    std::size_t length = 0;
+    git_object_t type = GIT_OBJECT_INVALID;
+    if (git_odb_read_header(&length, &type, odb.get(), &oid) != 0 || type != GIT_OBJECT_BLOB)
+        return std::nullopt;
+    return static_cast<std::uint64_t>(length);
+}
+
 namespace {
 
 ManualError fail(std::string code) { return {std::move(code), {}, {}, {}}; }
@@ -31,8 +45,15 @@ struct Node {
     git_filemode_t mode{};
 };
 
+bool git_dir(std::string_view name) {
+    return name.size() == 4 && name[0] == '.' &&
+           std::tolower(static_cast<unsigned char>(name[1])) == 'g' &&
+           std::tolower(static_cast<unsigned char>(name[2])) == 'i' &&
+           std::tolower(static_cast<unsigned char>(name[3])) == 't';
+}
+
 bool safe_name(std::string_view name) {
-    return !name.empty() && name.size() <= 255 && name != "." && name != ".." &&
+    return !name.empty() && name.size() <= 255 && name != "." && name != ".." && !git_dir(name) &&
            name.find_first_of("/\\") == name.npos && name.find('\0') == name.npos;
 }
 
@@ -86,14 +107,11 @@ std::expected<std::vector<Node>, ManualError> enumerate(git_repository* repo, gi
                 auto result = walk(child.get(), path + "/", depth + 1);
                 if (!result) return result;
             } else if (mode != GIT_FILEMODE_COMMIT) {
-                git_blob* raw_blob = nullptr;
-                if (git_blob_lookup(&raw_blob, repo, git_tree_entry_id(entry)) != 0)
-                    return std::unexpected(fail("blob-read"));
-                Owned<git_blob, git_blob_free> blob(raw_blob);
-                const auto size = git_blob_rawsize(blob.get());
-                if (static_cast<std::uint64_t>(size) > 512ULL * 1024 * 1024 - total)
+                const auto size = internal::blob_size(repo, *git_tree_entry_id(entry));
+                if (!size) return std::unexpected(fail("blob-read"));
+                if (*size > 512ULL * 1024 * 1024 - total)
                     return std::unexpected(fail("tree-size"));
-                total += static_cast<std::uint64_t>(size);
+                total += *size;
             }
         }
         return {};
@@ -140,6 +158,9 @@ std::expected<Snapshot, ManualError> snapshot(const std::filesystem::path& path,
 
 std::expected<std::string, ManualError> blob_text(git_repository* repo, const git_oid& oid,
                                                    std::size_t limit) {
+    const auto declared = internal::blob_size(repo, oid);
+    if (!declared) return std::unexpected(fail("blob-read"));
+    if (*declared > limit) return std::unexpected(fail("script-size"));
     git_blob* raw = nullptr;
     if (git_blob_lookup(&raw, repo, &oid) != 0) return std::unexpected(fail("blob-read"));
     Owned<git_blob, git_blob_free> blob(raw);
@@ -238,6 +259,8 @@ std::expected<void, ManualError> materialize_commit(
                 return std::unexpected(fail("materialize-directory"));
             continue;
         }
+        const auto declared = internal::blob_size(source->repo.get(), node.oid);
+        if (!declared || *declared > 512ULL * 1024 * 1024) return std::unexpected(fail("blob-read"));
         git_blob* raw = nullptr;
         if (git_blob_lookup(&raw, source->repo.get(), &node.oid) != 0)
             return std::unexpected(fail("blob-read"));

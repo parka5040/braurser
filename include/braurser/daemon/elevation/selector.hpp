@@ -3,6 +3,7 @@
 
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <sys/types.h>
 
 namespace braurser::daemon::elevation {
@@ -37,6 +38,10 @@ class ProcAgentProbe final : public AgentProbe {
 public:
     bool available(const Environment& environment) const override;
 };
+
+/// in: preferred is "gtk" or "qt"; libexec is the absolute private executable directory.
+/// out: preferred when its askpass dialog is installed, else the other installed one, else preferred.
+std::string askpass_ui(std::string_view preferred, const std::filesystem::path& libexec);
 
 class ElevationSelector {
 public:

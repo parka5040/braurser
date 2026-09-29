@@ -89,4 +89,28 @@ TEST(ElevationSelector, OverrideWinsAndUnavailableIsExplicit) {
     std::filesystem::remove(e.sudo);
     EXPECT_EQ(ElevationSelector(probe).select(e).method, Method::Unavailable);
 }
+
+TEST(Elevation, AskpassFollowsPreferredUiAndFallsBackToInstalledDialog) {
+    TempTree tree;
+    ASSERT_FALSE(tree.root.empty());
+    const auto libexec = tree.root / "libexec";
+    std::filesystem::create_directories(libexec);
+    EXPECT_EQ(askpass_ui("qt", libexec), "qt");
+    EXPECT_EQ(askpass_ui("gtk", libexec), "gtk");
+    EXPECT_EQ(askpass_ui("other", libexec), "gtk");
+    const auto gtk = libexec / "braurser-askpass-gtk";
+    std::ofstream(gtk) << "#!/bin/sh\n";
+    ASSERT_EQ(chmod(gtk.c_str(), 0755), 0);
+    EXPECT_EQ(askpass_ui("qt", libexec), "gtk");
+    EXPECT_EQ(askpass_ui("gtk", libexec), "gtk");
+    const auto qt = libexec / "braurser-askpass-qt";
+    std::ofstream(qt) << "#!/bin/sh\n";
+    ASSERT_EQ(chmod(qt.c_str(), 0644), 0);
+    EXPECT_EQ(askpass_ui("qt", libexec), "gtk");
+    ASSERT_EQ(chmod(qt.c_str(), 0755), 0);
+    EXPECT_EQ(askpass_ui("qt", libexec), "qt");
+    EXPECT_EQ(askpass_ui("gtk", libexec), "gtk");
+    std::filesystem::remove(gtk);
+    EXPECT_EQ(askpass_ui("gtk", libexec), "qt");
+}
 }

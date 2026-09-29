@@ -1,4 +1,4 @@
-pkgname=braurser-git-demo
+pkgname=braurser-git-owner-demo
 pkgver=19700101000000.gaaaaaaaaaaaa
 pkgrel=1
 arch=('any')

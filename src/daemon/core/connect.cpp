@@ -17,6 +17,7 @@ AddressClass classify_v4(std::uint32_t value) {
     if (a == 169 && b == 254) return AddressClass::LinkLocal;
     if (a == 192 && b == 0 && ((value >> 8) & 255U) == 0) return AddressClass::Reserved;
     if (a == 192 && b == 0 && ((value >> 8) & 255U) == 2) return AddressClass::Documentation;
+    if (a == 192 && b == 88 && ((value >> 8) & 255U) == 99) return AddressClass::Reserved;
     if (a == 198 && (b == 18 || b == 19)) return AddressClass::Reserved;
     if (a == 198 && b == 51 && ((value >> 8) & 255U) == 100) return AddressClass::Documentation;
     if (a == 203 && b == 0 && ((value >> 8) & 255U) == 113) return AddressClass::Documentation;
@@ -54,6 +55,7 @@ AddressClass classify_address(const sockaddr* address, socklen_t length) {
         }
         return category;
     }
+    if (prefix(bytes, zero, 12)) return AddressClass::Reserved;
     constexpr unsigned char nat64[12]{0x00, 0x64, 0xff, 0x9b};
     if (prefix(bytes, nat64, 12)) {
         const std::uint32_t value = static_cast<std::uint32_t>(bytes[12]) << 24 |
@@ -61,7 +63,15 @@ AddressClass classify_address(const sockaddr* address, socklen_t length) {
                                     static_cast<std::uint32_t>(bytes[14]) << 8 | bytes[15];
         return classify_v4(value);
     }
+    constexpr unsigned char local_nat64[6]{0x00, 0x64, 0xff, 0x9b, 0x00, 0x01};
+    if (prefix(bytes, local_nat64, 6)) return AddressClass::Reserved;
+    constexpr unsigned char discard[8]{0x01, 0x00};
+    if (prefix(bytes, discard, 8)) return AddressClass::Reserved;
+    constexpr unsigned char teredo[4]{0x20, 0x01, 0x00, 0x00};
+    if (prefix(bytes, teredo, 4)) return AddressClass::Reserved;
+    if (bytes[0] == 0x20 && bytes[1] == 0x02) return AddressClass::Reserved;
     if (bytes[0] == 0xfe && (bytes[1] & 0xc0U) == 0x80) return AddressClass::LinkLocal;
+    if (bytes[0] == 0xfe && (bytes[1] & 0xc0U) == 0xc0) return AddressClass::Private;
     if ((bytes[0] & 0xfeU) == 0xfc) return AddressClass::UniqueLocal;
     if (bytes[0] == 0xff) return AddressClass::Multicast;
     constexpr unsigned char documentation[4]{0x20, 0x01, 0x0d, 0xb8};

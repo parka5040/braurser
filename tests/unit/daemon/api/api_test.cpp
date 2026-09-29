@@ -18,6 +18,7 @@
 #include <fstream>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -103,6 +104,34 @@ std::optional<protocol::Message> receive(int fd) {
 
 void send_request(int fd, const protocol::Request& request) {
     const auto frame = protocol::encode_frame(protocol::serialize_message(request));
+    ASSERT_EQ(send(fd, frame.data(), frame.size(), MSG_NOSIGNAL), static_cast<ssize_t>(frame.size()));
+}
+
+void register_hello(api::HandlerRegistry& registry) {
+    registry.register_handler<api::HelloParamsMethod>([](const auto&, auto reply) {
+        protocol::Capabilities capabilities{{"auto"}, "", {"unavailable"}, {"unknown"}, "arch", {}};
+        reply.ok({"0.1.0", protocol::kApiVersion, {"auto"}, capabilities, {{"gtk"}}});
+    });
+}
+
+bool hello(int fd, std::int64_t id) {
+    const auto frame = protocol::encode_frame(protocol::serialize_message(
+        protocol::Request{id, std::string(api::HelloParamsMethod::wire_name), protocol::HelloParams{protocol::kApiVersion}}));
+    if (send(fd, frame.data(), frame.size(), MSG_NOSIGNAL) != static_cast<ssize_t>(frame.size())) return false;
+    const auto reply = receive(fd);
+    return reply && std::holds_alternative<protocol::Response>(*reply) &&
+           std::holds_alternative<nlohmann::json>(std::get<protocol::Response>(*reply).outcome);
+}
+
+bool closed_by_peer(int fd) {
+    pollfd entry{fd, POLLIN, 0};
+    if (poll(&entry, 1, 3000) <= 0) return false;
+    char byte{};
+    return recv(fd, &byte, 1, 0) == 0;
+}
+
+void send_raw(int fd, const std::string& body) {
+    const auto frame = protocol::encode_frame(body);
     ASSERT_EQ(send(fd, frame.data(), frame.size(), MSG_NOSIGNAL), static_cast<ssize_t>(frame.size()));
 }
 
@@ -570,6 +599,166 @@ TEST(SocketLimits, TooManyPendingRequestsReturnBusy) {
     ASSERT_TRUE(busy);
     EXPECT_EQ(std::get<protocol::ErrorObject>(std::get<protocol::Response>(*busy).outcome).code, protocol::kBusy);
     close(fd);
+}
+
+TEST(SocketLimits, RejectedFrameIdExtractionIsBoundedAndPositionIndependent) {
+    Gio::init();
+    Runtime runtime;
+    ASSERT_FALSE(runtime.path.empty());
+    api::HandlerRegistry registry;
+    register_hello(registry);
+    api::Server server(registry, runtime.path);
+    auto started = server.start();
+    if (!started && started.error() == "cannot create listener: 1") GTEST_SKIP() << "AF_UNIX denied by sandbox";
+    ASSERT_TRUE(started) << started.error();
+    RunningServer running(server);
+    const auto path = runtime.path / "braurser/core.sock";
+    const int late = connect_client(path);
+    ASSERT_GE(late, 0);
+    send_raw(late, R"({"jsonrpc":"2.0","method":"system.status","params":{"x":{"y":[1,[2,{"z":3}]]}},"id":"late"})");
+    auto answer = receive(late);
+    ASSERT_TRUE(answer);
+    ASSERT_TRUE(std::holds_alternative<protocol::Response>(*answer));
+    EXPECT_EQ(std::get<protocol::Response>(*answer).id, protocol::RequestId(std::string("late")));
+    EXPECT_EQ(std::get<protocol::ErrorObject>(std::get<protocol::Response>(*answer).outcome).code, protocol::kInvalidRequest);
+    close(late);
+    const int nested = connect_client(path);
+    ASSERT_GE(nested, 0);
+    std::string deep = R"({"jsonrpc":"2.0","id":7,"params":)";
+    deep += std::string(40, '[') + std::string(40, ']') + "}";
+    send_raw(nested, deep);
+    EXPECT_TRUE(closed_by_peer(nested));
+    close(nested);
+    const int flood = connect_client(path);
+    ASSERT_GE(flood, 0);
+    std::string unterminated = R"({"id":1,"params":)";
+    unterminated += std::string(protocol::kMaxFrameBytes - unterminated.size(), '[');
+    send_raw(flood, unterminated);
+    EXPECT_TRUE(closed_by_peer(flood));
+    close(flood);
+    const int after = connect_client(path);
+    ASSERT_GE(after, 0);
+    EXPECT_TRUE(hello(after, 1));
+    close(after);
+}
+
+TEST(SocketLimits, CapsConcurrentClients) {
+    Gio::init();
+    Runtime runtime;
+    ASSERT_FALSE(runtime.path.empty());
+    api::HandlerRegistry registry;
+    register_hello(registry);
+    api::Server server(registry, runtime.path);
+    std::atomic<unsigned> disconnected{};
+    server.on_disconnect([&](api::ConnectionId) { ++disconnected; });
+    auto started = server.start();
+    if (!started && started.error() == "cannot create listener: 1") GTEST_SKIP() << "AF_UNIX denied by sandbox";
+    ASSERT_TRUE(started) << started.error();
+    RunningServer running(server);
+    const auto path = runtime.path / "braurser/core.sock";
+    std::vector<int> clients;
+    for (int index = 0; index < 128; ++index) {
+        const int fd = connect_client(path);
+        ASSERT_GE(fd, 0);
+        clients.push_back(fd);
+        ASSERT_TRUE(hello(fd, index + 1)) << index;
+    }
+    const int extra = connect_client(path);
+    ASSERT_GE(extra, 0);
+    EXPECT_TRUE(closed_by_peer(extra));
+    close(extra);
+    close(clients.back());
+    clients.pop_back();
+    for (int attempt = 0; attempt < 600 && disconnected.load() == 0; ++attempt)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_EQ(disconnected.load(), 1U);
+    const int replacement = connect_client(path);
+    ASSERT_GE(replacement, 0);
+    EXPECT_TRUE(hello(replacement, 500));
+    close(replacement);
+    for (const int fd : clients) close(fd);
+}
+
+TEST(SocketLimits, NestedBroadcastFromDisconnectDoesNotReuseErasedClients) {
+    Gio::init();
+    Runtime runtime;
+    ASSERT_FALSE(runtime.path.empty());
+    api::HandlerRegistry registry;
+    register_hello(registry);
+    api::Server server(registry, runtime.path);
+    const protocol::Notification line{"job.log", protocol::JobLogNotification{"job", 1, std::string(4000, 'x')}};
+    bool nested = false;
+    std::atomic<unsigned> disconnected{};
+    server.on_disconnect([&](api::ConnectionId) {
+        ++disconnected;
+        if (nested) return;
+        nested = true;
+        server.broadcast(line);
+    });
+    auto started = server.start();
+    if (!started && started.error() == "cannot create listener: 1") GTEST_SKIP() << "AF_UNIX denied by sandbox";
+    ASSERT_TRUE(started) << started.error();
+    RunningServer running(server);
+    const auto path = runtime.path / "braurser/core.sock";
+    std::vector<int> clients;
+    for (int index = 0; index < 3; ++index) {
+        const int fd = connect_client(path);
+        ASSERT_GE(fd, 0);
+        ASSERT_TRUE(hello(fd, index + 1));
+        clients.push_back(fd);
+    }
+    std::promise<void> flooded;
+    Glib::MainContext::get_default()->invoke([&] {
+        for (int round = 0; round < 1300; ++round) server.broadcast(line);
+        flooded.set_value();
+        return false;
+    });
+    flooded.get_future().wait();
+    for (const int fd : clients) {
+        EXPECT_TRUE(closed_by_peer(fd));
+        close(fd);
+    }
+    EXPECT_EQ(disconnected.load(), 3U);
+    const int after = connect_client(path);
+    ASSERT_GE(after, 0);
+    EXPECT_TRUE(hello(after, 10));
+    close(after);
+}
+
+TEST(SocketLimits, AcceptRecoversAfterDescriptorExhaustion) {
+#if defined(__SANITIZE_ADDRESS__)
+    GTEST_SKIP() << "the sanitizer runtime needs spare descriptors";
+#endif
+    Gio::init();
+    Runtime runtime;
+    ASSERT_FALSE(runtime.path.empty());
+    api::HandlerRegistry registry;
+    register_hello(registry);
+    api::Server server(registry, runtime.path);
+    auto started = server.start();
+    if (!started && started.error() == "cannot create listener: 1") GTEST_SKIP() << "AF_UNIX denied by sandbox";
+    ASSERT_TRUE(started) << started.error();
+    RunningServer running(server);
+    const auto path = runtime.path / "braurser/core.sock";
+    const int first = connect_client(path);
+    ASSERT_GE(first, 0);
+    ASSERT_TRUE(hello(first, 1));
+    rlimit original{};
+    ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &original), 0);
+    const int probe = dup(first);
+    ASSERT_GE(probe, 0);
+    close(probe);
+    rlimit reduced = original;
+    reduced.rlim_cur = static_cast<rlim_t>(probe) + 1;
+    ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &reduced), 0);
+    const int second = connect_client(path);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    close(first);
+    const bool served = second >= 0 && hello(second, 2);
+    ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &original), 0);
+    EXPECT_GE(second, 0);
+    EXPECT_TRUE(served);
+    if (second >= 0) close(second);
 }
 
 }

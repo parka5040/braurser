@@ -2,6 +2,7 @@
 #include "../../gtk/app/platform.cpp"
 #include <csignal>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 
 namespace braurser::askpass {
@@ -82,6 +83,8 @@ int main(int argc, char** argv) {
     using namespace braurser;
     ::umask(0077);
     if (::prctl(PR_SET_DUMPABLE, 0) != 0) { return 1; }
+    const rlimit limit{0, 0};
+    static_cast<void>(::setrlimit(RLIMIT_CORE, &limit));
     std::signal(SIGPIPE, SIG_IGN);
     try {
         presenter::Copy copy;

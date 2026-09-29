@@ -67,6 +67,14 @@ bool same_session(const std::string& environment, const std::string& ours) {
 }
 }
 
+std::string askpass_ui(std::string_view preferred, const std::filesystem::path& libexec) {
+    const std::string first = preferred == "qt" ? "qt" : "gtk";
+    const std::string second = first == "qt" ? "gtk" : "qt";
+    if (executable(libexec / ("braurser-askpass-" + first))) return first;
+    if (executable(libexec / ("braurser-askpass-" + second))) return second;
+    return first;
+}
+
 bool ProcAgentProbe::available(const Environment& environment) const {
     std::error_code error;
     std::filesystem::directory_iterator entries(environment.proc_root, error);

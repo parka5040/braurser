@@ -4,5 +4,5 @@ add_library(braurser-daemon-jobs STATIC process.cpp jobs.cpp live.cpp register.c
 target_include_directories(braurser-daemon-jobs PUBLIC "${PROJECT_SOURCE_DIR}/include")
 set(BRAURSER_LIBEXEC_DIR "${CMAKE_INSTALL_PREFIX}/libexec/braurser" CACHE PATH "Private executable directory")
 target_compile_definitions(braurser-daemon-jobs PUBLIC BRAURSER_LIBEXEC_DIR="${BRAURSER_LIBEXEC_DIR}")
-target_link_libraries(braurser-daemon-jobs PUBLIC braurser-daemon-core braurser-daemon-catalog braurser-daemon-updates braurser-daemon-helpers braurser-daemon-elevation braurser-daemon-manual braurser-daemon-api braurser-protocol braurser-validate braurser-domain PkgConfig::JobsGio)
+target_link_libraries(braurser-daemon-jobs PUBLIC braurser-daemon-core braurser-daemon-catalog braurser-daemon-updates braurser-daemon-helpers braurser-daemon-elevation braurser-daemon-manual braurser-daemon-api braurser-protocol braurser-validate braurser-domain braurser-launcher-selection PkgConfig::JobsGio)
 braurser_harden(braurser-daemon-jobs)

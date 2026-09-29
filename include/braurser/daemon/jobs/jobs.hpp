@@ -123,6 +123,8 @@ public:
     void disconnect(api::ConnectionId owner);
     /// in: job_id is queued; only a build-review acknowledgement is supported.
     void ask(std::string_view job_id, protocol::QuestionChoice choice, std::vector<std::string> choices);
+    /// out: no further job starts; the active process group is killed and the manual worker joined.
+    void stop();
 private:
     struct Job {
         std::string id;
@@ -140,6 +142,7 @@ private:
         std::filesystem::path auth_marker;
         std::optional<protocol::Question> question;
         bool orphaned{};
+        bool reviewed{};
         std::vector<std::string> choices;
         std::chrono::steady_clock::time_point question_expires{};
     };
@@ -161,6 +164,7 @@ private:
     std::jthread manual_worker_;
     std::shared_ptr<int> lifetime_{std::make_shared<int>(0)};
     std::string active_;
+    bool stopping_{};
     void pump();
     void transition(Job& job, std::string_view state);
     void add_event(Job& job, std::string_view kind, nlohmann::json payload);

@@ -108,7 +108,7 @@ std::expected<void, ProcessError> validate(const ProcessSpec& spec) {
 
 void consume(Fd& fd, std::string& output, std::size_t cap, bool& truncated) {
     std::array<char, 8192> buffer{};
-    while (fd.get() >= 0) {
+    for (int reads = 0; reads < 8 && fd.get() >= 0; ++reads) {
         const ssize_t count = read(fd.get(), buffer.data(), buffer.size());
         if (count > 0) {
             const std::size_t size = static_cast<std::size_t>(count);
@@ -164,8 +164,8 @@ private:
     int status_{};
 };
 
-void signal_group(pid_t pid, int signal) {
-    if (kill(-pid, signal) == -1 && errno == ESRCH) {
+void signal_group(pid_t pid, int signal, bool reaped) {
+    if (kill(-pid, signal) == -1 && errno == ESRCH && !reaped) {
         kill(pid, signal);
     }
 }
@@ -259,17 +259,18 @@ std::expected<ProcessResult, ProcessError> PosixProcessRunner::run(const Process
     const auto deadline = start + spec.timeout;
     auto grace_deadline = deadline;
     bool sent_kill = false;
+    bool killed_for_output = false;
     while (!reaped || output->read.get() >= 0 || errors->read.get() >= 0) {
         const auto now = std::chrono::steady_clock::now();
         if (!result.timed_out && now >= deadline &&
             (!reaped || output->read.get() >= 0 || errors->read.get() >= 0)) {
             result.timed_out = true;
-            signal_group(pid, SIGTERM);
+            signal_group(pid, SIGTERM, reaped);
             grace_deadline = now + std::chrono::seconds(2);
             input->write.reset();
         }
         if (result.timed_out && !sent_kill && now >= grace_deadline) {
-            signal_group(pid, SIGKILL);
+            signal_group(pid, SIGKILL, reaped);
             sent_kill = true;
             output->read.reset();
             errors->read.reset();
@@ -283,7 +284,7 @@ std::expected<ProcessResult, ProcessError> PosixProcessRunner::run(const Process
             if (waited == -1) {
                 const int code = errno;
                 if (code != ECHILD) {
-                    signal_group(pid, SIGKILL);
+                    signal_group(pid, SIGKILL, false);
                     while (waitpid(pid, &wait_status, 0) == -1 && errno == EINTR) {}
                 }
                 return std::unexpected(ProcessError{code, "waitpid failed"});
@@ -304,7 +305,7 @@ std::expected<ProcessResult, ProcessError> PosixProcessRunner::run(const Process
             if (ready < 0) {
                 const int code = errno;
                 if (!reaped) {
-                    signal_group(pid, SIGKILL);
+                    signal_group(pid, SIGKILL, false);
                     while (waitpid(pid, &wait_status, 0) == -1 && errno == EINTR) {}
                 }
                 return std::unexpected(ProcessError{code, "poll failed"});
@@ -322,6 +323,10 @@ std::expected<ProcessResult, ProcessError> PosixProcessRunner::run(const Process
                     else if (written < 0 && errno != EINTR && errno != EAGAIN) input->write.reset();
                     if (input_offset == spec.stdin_data->size()) input->write.reset();
                 }
+            }
+            if ((result.out_truncated || result.err_truncated) && !killed_for_output) {
+                signal_group(pid, SIGKILL, reaped);
+                killed_for_output = true;
             }
         } else if (!reaped) {
             poll(nullptr, 0, 20);

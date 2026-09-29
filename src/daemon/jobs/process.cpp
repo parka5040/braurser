@@ -1,8 +1,5 @@
 #include <braurser/daemon/jobs/process.hpp>
 #include <braurser/daemon/core/text.hpp>
-#include <giomm/subprocess.h>
-#include <giomm/subprocesslauncher.h>
-#include <giomm/unixinputstream.h>
 #include <glibmm/main.h>
 #include <glib.h>
 #include <algorithm>
@@ -14,6 +11,7 @@
 #include <fcntl.h>
 #include <set>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 namespace braurser::daemon::jobs {
@@ -64,21 +62,29 @@ std::string safe_line(std::string_view text) {
 }
 
 struct GioStreamingProcess::State {
-    Glib::RefPtr<Gio::Subprocess> child;
     Line line;
     Done done;
     std::array<std::string, 2> pending;
     std::array<std::size_t, 2> received{};
     std::array<std::size_t, 2> limits{};
     std::array<bool, 2> closed{};
+    std::array<int, 2> fds{-1, -1};
     std::array<sigc::connection, 2> watches;
     sigc::connection timeout;
     sigc::connection grace;
     core::ProcessResult result;
     pid_t group{};
+    bool started{};
     bool exited{};
     bool finished{};
 
+    ~State() { close_pipes(); }
+    void close_pipes() {
+        for (auto& fd : fds) {
+            if (fd >= 0) ::close(fd);
+            fd = -1;
+        }
+    }
     void flush(std::size_t index) {
         if (!pending[index].empty()) {
             line(safe_line(pending[index]));
@@ -100,6 +106,7 @@ struct GioStreamingProcess::State {
         group = 0;
         timeout.disconnect();
         grace.disconnect();
+        close_pipes();
         auto callback = std::move(done);
         if (callback) callback(result);
     }
@@ -139,45 +146,56 @@ GioStreamingProcess::~GioStreamingProcess() {
     for (auto& watch : state_->watches) watch.disconnect();
     state_->timeout.disconnect();
     state_->grace.disconnect();
+    state_->close_pipes();
 }
 
 bool GioStreamingProcess::start(const core::ProcessSpec& spec, Line line, Done done) {
-    if (!valid_spec(spec) || !line || !done || state_->child) return false;
+    if (!valid_spec(spec) || !line || !done || state_->started) return false;
+    std::vector<std::string> environment;
+    environment.reserve(spec.env.size());
+    for (const auto& [key, value] : spec.env) environment.push_back(key + "=" + value);
+    std::vector<const gchar*> envp;
+    envp.reserve(environment.size() + 1);
+    for (const auto& item : environment) envp.push_back(item.c_str());
+    envp.push_back(nullptr);
+    const auto executable = spec.executable.string();
+    std::vector<const gchar*> argv{executable.c_str()};
+    for (const auto& argument : spec.args) argv.push_back(argument.c_str());
+    argv.push_back(nullptr);
+    const auto directory = spec.cwd ? spec.cwd->string() : std::string{};
+    GPid pid{};
+    gint out = -1;
+    gint err = -1;
+    GError* error = nullptr;
+    const auto flags = static_cast<GSpawnFlags>(G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_CLOEXEC_PIPES);
+    if (!g_spawn_async_with_pipes_and_fds(spec.cwd ? directory.c_str() : nullptr, argv.data(), envp.data(), flags,
+            [](gpointer) { if (::setpgid(0, 0) != 0) _exit(127); }, nullptr,
+            -1, -1, -1, nullptr, nullptr, 0, &pid, nullptr, &out, &err, &error)) {
+        if (error) g_error_free(error);
+        return false;
+    }
+    state_->started = true;
+    state_->group = pid;
+    state_->fds = {out, err};
+    state_->limits = {spec.max_stdout, spec.max_stderr};
+    state_->line = std::move(line);
+    state_->done = std::move(done);
+    Glib::signal_child_watch().connect([state = state_](GPid child, int status) {
+        state->exited = true;
+        if (WIFEXITED(status)) state->result.exit_code = WEXITSTATUS(status);
+        else {
+            state->result.signaled = true;
+            if (WIFSIGNALED(status)) state->result.term_signal = WTERMSIG(status);
+        }
+        g_spawn_close_pid(child);
+        state->finish();
+    }, pid);
     try {
-        auto launcher = Gio::SubprocessLauncher::create(
-            Gio::Subprocess::Flags::STDOUT_PIPE | Gio::Subprocess::Flags::STDERR_PIPE);
-        std::vector<std::string> env;
-        env.reserve(spec.env.size());
-        for (const auto& [key, value] : spec.env) env.push_back(key + "=" + value);
-        launcher->set_environ(env);
-        launcher->set_child_setup([] { if (::setpgid(0, 0) != 0) _exit(127); });
-        if (spec.cwd) launcher->set_cwd(spec.cwd->string());
-        std::vector<std::string> argv{spec.executable.string()};
-        argv.insert(argv.end(), spec.args.begin(), spec.args.end());
-        auto child = launcher->spawn(argv);
-        auto stdout_stream = std::dynamic_pointer_cast<Gio::UnixInputStream>(child->get_stdout_pipe());
-        auto stderr_stream = std::dynamic_pointer_cast<Gio::UnixInputStream>(child->get_stderr_pipe());
-        if (!stdout_stream || !stderr_stream) {
-            child->force_exit();
-            return false;
-        }
-        const auto text = std::string(child->get_identifier());
-        pid_t group{};
-        auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), group);
-        if (error != std::errc{} || end != text.data() + text.size() || group <= 1) {
-            child->force_exit();
-            return false;
-        }
-        state_->child = std::move(child);
-        state_->group = group;
-        state_->limits = {spec.max_stdout, spec.max_stderr};
-        state_->line = std::move(line);
-        state_->done = std::move(done);
-        const std::array streams{stdout_stream, stderr_stream};
         for (std::size_t index = 0; index < 2; ++index) {
-            const int fd = streams[index]->get_fd();
-            const int flags = fcntl(fd, F_GETFL);
-            if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+            const int fd = state_->fds[index];
+            const int current = fcntl(fd, F_GETFL);
+            if (current < 0 || fcntl(fd, F_SETFL, current | O_NONBLOCK) != 0) {
+                state_->done = {};
                 state_->kill_group();
                 return false;
             }
@@ -186,17 +204,6 @@ bool GioStreamingProcess::start(const core::ProcessSpec& spec, Line line, Done d
                     return state->read_pipe(index, fd);
                 }, fd, Glib::IOCondition::IO_IN | Glib::IOCondition::IO_HUP | Glib::IOCondition::IO_ERR);
         }
-        state_->child->wait_async([state = state_](const Glib::RefPtr<Gio::AsyncResult>& result) {
-            try { state->child->wait_finish(result); }
-            catch (const Glib::Error&) {}
-            state->exited = true;
-            if (state->child->get_if_exited()) state->result.exit_code = state->child->get_exit_status();
-            else if (state->child->get_if_signaled()) {
-                state->result.signaled = true;
-                state->result.term_signal = state->child->get_term_sig();
-            } else state->result.signaled = true;
-            state->finish();
-        });
         state_->timeout = Glib::signal_timeout().connect([state = state_] {
             state->result.timed_out = true;
             state->signal(SIGTERM);
@@ -208,6 +215,7 @@ bool GioStreamingProcess::start(const core::ProcessSpec& spec, Line line, Done d
         }, static_cast<unsigned>(spec.timeout.count()));
         return true;
     } catch (const Glib::Error&) {
+        state_->done = {};
         state_->kill_group();
         return false;
     }

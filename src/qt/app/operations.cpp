@@ -154,7 +154,7 @@ void Window::show_confirm() {
     auto* submit = button(*root, models_.confirm.action().render(copy_), [this, dialog] { models_.confirm.submit(); dialog->accept(); navigate("activity"); }, models_.confirm.can_confirm(), true);
     if (plan.requires_build_review) {
         if (!state.build_files.empty() && state.build_files.size() == plan.build_review_refs.size()) {
-            for (const auto& build : state.build_files) { for (const auto& file : build.files) { label(box, file.name); auto* code = new QPlainTextEdit(kit::safe_text(file.text)); code->setReadOnly(true); box.addWidget(code); } }
+            for (const auto& build : state.build_files) { for (const auto& file : build.files) { label(box, file.name); auto* code = new QPlainTextEdit(kit::safe_code(file.text)); code->setReadOnly(true); box.addWidget(code); } }
             check(box, text("confirm.build_ack"), state.build_acknowledged, [this, submit](bool value) { models_.confirm.acknowledge_build(value); submit->setEnabled(models_.confirm.can_confirm()); });
         } else { label(box, text("detail.build_unavailable")); }
     }

@@ -13,6 +13,14 @@
 namespace {
 int equal(const char* a, const char* b) { return strcmp(a, b) == 0; }
 
+int has_control(const char* s, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 32 || c == 127) return 1;
+    }
+    return 0;
+}
+
 int decimal_uid(const char* s, uid_t* value) {
     if (!s || !*s || strnlen(s, 21) > 20) return 0;
     uint64_t n = 0;
@@ -121,7 +129,7 @@ extern "C" int br_parse_request(int argc, const char* const* argv, br_request* o
         size_t n = strlen(s);
         if (!n || s[0] == '-' || strstr(s, "://") || equal(s, "--")) return 0;
         if (out->operation == 'D') {
-            if (s[0] != '/' || n > PATH_MAX) return 0;
+            if (s[0] != '/' || n > PATH_MAX || has_control(s, n)) return 0;
         } else if (out->operation == 'A' || out->operation == 'B') {
             size_t slash = 0;
             if (!br_split_target(s, n, &slash)) return 0;

@@ -124,6 +124,42 @@ TEST(CatalogSource, PacmanConfigurationBoundsAndValidates) {
     }
 }
 
+class HoldProcess final : public core::ProcessRunner {
+public:
+    std::string output;
+    int exit_code{};
+    std::vector<core::ProcessSpec> specs;
+    std::expected<core::ProcessResult, core::ProcessError> run(const core::ProcessSpec& spec) override {
+        specs.push_back(spec);
+        core::ProcessResult result;
+        result.exit_code = exit_code;
+        result.out = output;
+        return result;
+    }
+};
+
+TEST(CatalogSource, HoldPackagesAreValidatedAndFailClosed) {
+    HoldProcess runner;
+    runner.output = "pacman\nglibc\npacman\n";
+    auto hold = PacmanConfig(runner).hold_packages();
+    ASSERT_TRUE(hold);
+    EXPECT_EQ(*hold, (std::vector<std::string>{"pacman", "glibc"}));
+    ASSERT_EQ(runner.specs.size(), 1U);
+    EXPECT_EQ(runner.specs.front().executable, "/usr/bin/pacman-conf");
+    EXPECT_EQ(runner.specs.front().args, (std::vector<std::string>{"HoldPkg"}));
+    runner.output.clear();
+    hold = PacmanConfig(runner).hold_packages();
+    ASSERT_TRUE(hold);
+    EXPECT_TRUE(hold->empty());
+    for (const auto* bad : {"pacman\n--root\n", "Bad Name\n", "pacman\n\nglibc\n"}) {
+        runner.output = bad;
+        EXPECT_FALSE(PacmanConfig(runner).hold_packages()) << bad;
+    }
+    runner.output = "pacman\n";
+    runner.exit_code = 1;
+    EXPECT_FALSE(PacmanConfig(runner).hold_packages());
+}
+
 TEST(CatalogSource, SyncArchivesGeneratedInAllSupportedFormats) {
     for (int filter : {ARCHIVE_FILTER_GZIP, ARCHIVE_FILTER_ZSTD, ARCHIVE_FILTER_XZ}) {
         auto bytes = archive_bytes(filter);
@@ -217,6 +253,32 @@ TEST(CatalogSource, DesktopEntriesAreStrictAndLocalized) {
     EXPECT_FALSE(parse_desktop_entry(fixture("invalid.desktop")));
     EXPECT_FALSE(parse_desktop_entry("[Desktop Entry]\nName=Hi\nType=Application\nName=Again\n"));
     EXPECT_FALSE(parse_desktop_entry(std::string("[Desktop Entry]\nName=") + char(0xC0) + "\n"));
+}
+
+TEST(CatalogSource, DesktopLocalesWithoutCodesetDoNotThrow) {
+    for (const auto* locale : {"", "C", "POSIX", "fr", "fr_FR", "fr_FR@euro"}) {
+        auto entry = parse_desktop_entry(fixture("fixture.desktop"), locale);
+        ASSERT_TRUE(entry) << locale << " " << entry.error().code;
+        EXPECT_EQ(entry->name, std::string_view(locale).starts_with("fr") ? "Exemple" : "Fixture") << locale;
+    }
+}
+
+TEST(CatalogSource, AppStreamReadsUnderLocaleWithoutCodeset) {
+    TempDir temp;
+    const char* saved = std::getenv("LANG");
+    const std::optional<std::string> previous = saved ? std::optional<std::string>(saved) : std::nullopt;
+    auto output = temp.path / "appstream.xml.gz";
+    auto compressed = gzip(fixture("appstream.xml"));
+    std::ofstream file(output, std::ios::binary);
+    file.write(compressed.data(), static_cast<std::streamsize>(compressed.size()));
+    file.close();
+    for (const auto* lang : {"C", "POSIX", "en_US"}) {
+        ASSERT_EQ(setenv("LANG", lang, 1), 0);
+        auto metadata = AppStreamReader{}.read(output);
+        EXPECT_TRUE(metadata) << lang << " " << (metadata ? std::string() : metadata.error().code);
+    }
+    if (previous) setenv("LANG", previous->c_str(), 1);
+    else unsetenv("LANG");
 }
 
 TEST(CatalogSource, IconCacheValidatesPngAndRejectsSymlink) {

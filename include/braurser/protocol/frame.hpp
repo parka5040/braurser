@@ -32,6 +32,7 @@ public:
 private:
     std::vector<std::byte> buffer_;
     std::size_t next_header_offset_ = 0;
+    std::size_t complete_bytes_ = 0;
     std::optional<ProtocolError> error_;
 };
 

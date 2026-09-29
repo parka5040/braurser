@@ -15,6 +15,25 @@ namespace braurser::qt::kit {
 namespace {
 constexpr std::size_t text_limit = 65536;
 constexpr std::size_t document_limit = 1048576;
+constexpr std::size_t code_limit = 262144;
+
+bool hidden_format(char16_t value) {
+    return value == 0x061C || (value >= 0x200B && value <= 0x200F) || (value >= 0x202A && value <= 0x202E) ||
+           (value >= 0x2060 && value <= 0x2064) || (value >= 0x2066 && value <= 0x2069) || value == 0xFEFF;
+}
+
+QString sanitized(std::string_view text, std::size_t limit, bool code) {
+    if (text.size() > limit) { throw std::length_error("kit text exceeds limit"); }
+    auto result = QString::fromUtf8(text.data(), static_cast<qsizetype>(text.size()));
+    for (auto& character : result) {
+        const auto value = character.unicode();
+        if ((value < 32 && value != '\n' && value != '\r' && value != '\t') || value == 127 || value == 0xfffe || value == 0xffff ||
+            (code && hidden_format(value))) {
+            character = QChar::ReplacementCharacter;
+        }
+    }
+    return result;
+}
 
 class DocumentBrowser final : public QTextBrowser {
 public:
@@ -108,15 +127,11 @@ void validate_document(std::span<const DocumentBlock> document) {
 }
 
 QString safe_text(std::string_view text) {
-    if (text.size() > text_limit) { throw std::length_error("kit text exceeds limit"); }
-    auto result = QString::fromUtf8(text.data(), static_cast<qsizetype>(text.size()));
-    for (auto& character : result) {
-        const auto value = character.unicode();
-        if ((value < 32 && value != '\n' && value != '\r' && value != '\t') || value == 127 || value == 0xfffe || value == 0xffff) {
-            character = QChar::ReplacementCharacter;
-        }
-    }
-    return result;
+    return sanitized(text, text_limit, false);
+}
+
+QString safe_code(std::string_view text) {
+    return sanitized(text, code_limit, true);
 }
 
 bool allowed_link(std::string_view href) {

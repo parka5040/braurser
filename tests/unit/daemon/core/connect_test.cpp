@@ -66,7 +66,26 @@ TEST(Connect, ClassifiesIpv4AndIpv6) {
         {"64:ff9b::10.0.0.1", AddressClass::Private},
         {"64:ff9b::127.0.0.1", AddressClass::Loopback},
         {"64:ff9b::8.8.8.8", AddressClass::Public},
-        {"64:ff9b::192.0.2.1", AddressClass::Documentation}
+        {"64:ff9b::192.0.2.1", AddressClass::Documentation},
+        {"192.88.99.1", AddressClass::Reserved},
+        {"192.88.100.1", AddressClass::Public},
+        {"::127.0.0.1", AddressClass::Reserved},
+        {"::8.8.8.8", AddressClass::Reserved},
+        {"::2", AddressClass::Reserved},
+        {"64:ff9b:1::10.0.0.1", AddressClass::Reserved},
+        {"64:ff9b:1:ffff::1", AddressClass::Reserved},
+        {"64:ff9b:2::1", AddressClass::Public},
+        {"2002:c0a8:0101::1", AddressClass::Reserved},
+        {"2002:0808:0808::1", AddressClass::Reserved},
+        {"2001::1", AddressClass::Reserved},
+        {"2001:0:4136:e378:8000:63bf:3fff:fdd2", AddressClass::Reserved},
+        {"2001:1::1", AddressClass::Public},
+        {"fec0::1", AddressClass::Private},
+        {"feff::1", AddressClass::Private},
+        {"100::1", AddressClass::Reserved},
+        {"100::ffff:ffff:ffff:ffff", AddressClass::Reserved},
+        {"100:0:0:1::1", AddressClass::Public},
+        {"2003::1", AddressClass::Public}
     };
     PublicOnlyGuard guard;
     for (const auto& item : cases) {

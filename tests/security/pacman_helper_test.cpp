@@ -49,6 +49,9 @@ TEST(PacmanHelperParser, RejectsUnknownFlagsMalformedOrderAndTargets) {
     parse({"--sync", "--needed", "--", "tree", "--root"}, false);
     parse({"--remove", "--nosave", "--recursive", "--", "extra/tree"}, false);
     parse({"--upgrade", "--", "relative.pkg.tar.zst"}, false);
+    parse({"--upgrade", "--", "/home/u/a\n2026-01-01T00:00:00Z uid=0.pkg.tar.zst"}, false);
+    parse({"--upgrade", "--", "/home/u/a\x1b[2K.pkg.tar.zst"}, false);
+    parse({"--upgrade", "--", "/home/u/a\x7f.pkg.tar.zst"}, false);
     parse({"--auth-check", "extra"}, false);
     std::vector<const char*> too_many{"--upgrade", "--"};
     for (int i = 0; i < 65; ++i) too_many.push_back("/a.pkg.tar.zst");
