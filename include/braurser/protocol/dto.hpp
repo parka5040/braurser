@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -18,9 +19,13 @@ namespace braurser::protocol {
 /// out: true only for well-formed UTF-8.
 bool valid_utf8(std::string_view text);
 
-/// in: value is untrusted JSON, key identifies a field.
+/// in: value is untrusted JSON; key identifies a field, excluded lists projected root-object keys.
 /// err: std::invalid_argument when size, depth or field constraints are violated.
-void validate_wire(const nlohmann::json& value, std::string_view key = {});
+void validate_wire(const nlohmann::json& value, std::string_view key = {},
+                   std::span<const std::string_view> excluded = {});
+
+template <class T>
+struct TypeTag {};
 
 template <class Tag>
 struct WireEnum {
@@ -138,17 +143,16 @@ struct TransactionKindTag {
 };
 using TransactionKind = WireEnum<TransactionKindTag>;
 
+/// in: j is an untrusted wire enum.
+/// err: rejects values outside the enum allowlist without copying strings.
 template <class Tag>
-void from_json(const nlohmann::json& j, WireEnum<Tag>& out) {
+void validate_json(const nlohmann::json& j, TypeTag<WireEnum<Tag>>) {
     if (!j.is_string()) throw std::invalid_argument("invalid enum");
-    const auto text = j.get<std::string>();
+    const auto& text = j.get_ref<const std::string&>();
     auto allowed = Tag::allowed;
     while (!allowed.empty()) {
         const auto end = allowed.find(' ');
-        if (allowed.substr(0, end) == text) {
-            out.value = text;
-            return;
-        }
+        if (allowed.substr(0, end) == text) return;
         if (end == std::string_view::npos) break;
         allowed.remove_prefix(end + 1);
     }
@@ -156,10 +160,15 @@ void from_json(const nlohmann::json& j, WireEnum<Tag>& out) {
 }
 
 template <class Tag>
+void from_json(const nlohmann::json& j, WireEnum<Tag>& out) {
+    validate_json(j, TypeTag<WireEnum<Tag>>{});
+    out.value = j.get_ref<const std::string&>();
+}
+
+template <class Tag>
 void to_json(nlohmann::json& j, const WireEnum<Tag>& value) {
-    WireEnum<Tag> checked;
-    from_json(nlohmann::json(value.value), checked);
     j = value.value;
+    validate_json(j, TypeTag<WireEnum<Tag>>{});
 }
 
 struct Inline;
@@ -168,10 +177,19 @@ struct QuestionChoice;
 
 void from_json(const nlohmann::json&, Inline&);
 void to_json(nlohmann::json&, const Inline&);
+/// in: j is an untrusted Inline payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<Inline>);
 void from_json(const nlohmann::json&, WikiBlock&);
 void to_json(nlohmann::json&, const WikiBlock&);
+/// in: j is an untrusted WikiBlock payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<WikiBlock>);
 void from_json(const nlohmann::json&, QuestionChoice&);
 void to_json(nlohmann::json&, const QuestionChoice&);
+/// in: j is an untrusted QuestionChoice payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<QuestionChoice>);
 
 struct PackageRef {
     SourceKind source{};
@@ -181,6 +199,9 @@ struct PackageRef {
 
 void from_json(const nlohmann::json& j, PackageRef& out);
 void to_json(nlohmann::json& j, const PackageRef& value);
+/// in: j is an untrusted PackageRef payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<PackageRef>);
 
 struct PackageSummary {
     PackageRef package{};
@@ -198,6 +219,9 @@ struct PackageSummary {
 
 void from_json(const nlohmann::json& j, PackageSummary& out);
 void to_json(nlohmann::json& j, const PackageSummary& value);
+/// in: j is an untrusted PackageSummary payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<PackageSummary>);
 
 struct Screenshot {
     std::string url{};
@@ -206,6 +230,9 @@ struct Screenshot {
 
 void from_json(const nlohmann::json& j, Screenshot& out);
 void to_json(nlohmann::json& j, const Screenshot& value);
+/// in: j is an untrusted Screenshot payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<Screenshot>);
 
 struct AppMetadata {
     std::string appstream_id{};
@@ -220,6 +247,9 @@ struct AppMetadata {
 
 void from_json(const nlohmann::json& j, AppMetadata& out);
 void to_json(nlohmann::json& j, const AppMetadata& value);
+/// in: j is an untrusted AppMetadata payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<AppMetadata>);
 
 struct CommunityInfo {
     std::optional<std::string> maintainer{};
@@ -235,6 +265,9 @@ struct CommunityInfo {
 
 void from_json(const nlohmann::json& j, CommunityInfo& out);
 void to_json(nlohmann::json& j, const CommunityInfo& value);
+/// in: j is an untrusted CommunityInfo payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<CommunityInfo>);
 
 struct PackageDetails {
     PackageRef package{};
@@ -248,6 +281,9 @@ struct PackageDetails {
 
 void from_json(const nlohmann::json& j, PackageDetails& out);
 void to_json(nlohmann::json& j, const PackageDetails& value);
+/// in: j is an untrusted PackageDetails payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<PackageDetails>);
 
 struct SearchFilters {
     bool installed{};
@@ -268,6 +304,9 @@ struct SearchFilters {
 
 void from_json(const nlohmann::json& j, SearchFilters& out);
 void to_json(nlohmann::json& j, const SearchFilters& value);
+/// in: j is an untrusted SearchFilters payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<SearchFilters>);
 
 struct CatalogFilters {
     bool installed{};
@@ -286,6 +325,9 @@ struct CatalogFilters {
 
 void from_json(const nlohmann::json& j, CatalogFilters& out);
 void to_json(nlohmann::json& j, const CatalogFilters& value);
+/// in: j is an untrusted CatalogFilters payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<CatalogFilters>);
 
 struct SearchQuery {
     std::string text{};
@@ -297,6 +339,9 @@ struct SearchQuery {
 
 void from_json(const nlohmann::json& j, SearchQuery& out);
 void to_json(nlohmann::json& j, const SearchQuery& value);
+/// in: j is an untrusted SearchQuery payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<SearchQuery>);
 
 struct SearchPage {
     std::vector<PackageSummary> packages{};
@@ -306,6 +351,9 @@ struct SearchPage {
 
 void from_json(const nlohmann::json& j, SearchPage& out);
 void to_json(nlohmann::json& j, const SearchPage& value);
+/// in: j is an untrusted SearchPage payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<SearchPage>);
 
 struct VariantOption {
     PackageRef package{};
@@ -316,6 +364,9 @@ struct VariantOption {
 
 void from_json(const nlohmann::json& j, VariantOption& out);
 void to_json(nlohmann::json& j, const VariantOption& value);
+/// in: j is an untrusted VariantOption payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<VariantOption>);
 
 struct VariantChoices {
     std::vector<VariantOption> options{};
@@ -324,6 +375,9 @@ struct VariantChoices {
 
 void from_json(const nlohmann::json& j, VariantChoices& out);
 void to_json(nlohmann::json& j, const VariantChoices& value);
+/// in: j is an untrusted VariantChoices payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<VariantChoices>);
 
 struct WikiText {
     std::string s{};
@@ -334,6 +388,9 @@ struct WikiText {
 
 void from_json(const nlohmann::json& j, WikiText& out);
 void to_json(nlohmann::json& j, const WikiText& value);
+/// in: j is an untrusted WikiText payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<WikiText>);
 
 struct WikiLink {
     std::string label{};
@@ -342,6 +399,9 @@ struct WikiLink {
 
 void from_json(const nlohmann::json& j, WikiLink& out);
 void to_json(nlohmann::json& j, const WikiLink& value);
+/// in: j is an untrusted WikiLink payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<WikiLink>);
 
 struct WikiHeading {
     std::uint32_t level{};
@@ -350,6 +410,9 @@ struct WikiHeading {
 
 void from_json(const nlohmann::json& j, WikiHeading& out);
 void to_json(nlohmann::json& j, const WikiHeading& value);
+/// in: j is an untrusted WikiHeading payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<WikiHeading>);
 
 struct Inline {
     std::variant<WikiText, WikiLink> value;
@@ -361,6 +424,9 @@ struct WikiParagraph {
 
 void from_json(const nlohmann::json& j, WikiParagraph& out);
 void to_json(nlohmann::json& j, const WikiParagraph& value);
+/// in: j is an untrusted WikiParagraph payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<WikiParagraph>);
 
 struct WikiList {
     bool ordered{};
@@ -369,6 +435,9 @@ struct WikiList {
 
 void from_json(const nlohmann::json& j, WikiList& out);
 void to_json(nlohmann::json& j, const WikiList& value);
+/// in: j is an untrusted WikiList payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<WikiList>);
 
 struct WikiCode {
     std::string text{};
@@ -376,6 +445,9 @@ struct WikiCode {
 
 void from_json(const nlohmann::json& j, WikiCode& out);
 void to_json(nlohmann::json& j, const WikiCode& value);
+/// in: j is an untrusted WikiCode payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<WikiCode>);
 
 struct WikiNote {
     std::vector<Inline> inlines{};
@@ -383,6 +455,9 @@ struct WikiNote {
 
 void from_json(const nlohmann::json& j, WikiNote& out);
 void to_json(nlohmann::json& j, const WikiNote& value);
+/// in: j is an untrusted WikiNote payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<WikiNote>);
 
 struct WikiWarning {
     std::vector<Inline> inlines{};
@@ -390,6 +465,9 @@ struct WikiWarning {
 
 void from_json(const nlohmann::json& j, WikiWarning& out);
 void to_json(nlohmann::json& j, const WikiWarning& value);
+/// in: j is an untrusted WikiWarning payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<WikiWarning>);
 
 struct WikiBlock {
     std::variant<WikiHeading, WikiParagraph, WikiList, WikiCode, WikiNote, WikiWarning> value;
@@ -402,6 +480,9 @@ struct WikiSection {
 
 void from_json(const nlohmann::json& j, WikiSection& out);
 void to_json(nlohmann::json& j, const WikiSection& value);
+/// in: j is an untrusted WikiSection payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<WikiSection>);
 
 struct WikiDocument {
     std::string title{};
@@ -415,6 +496,9 @@ struct WikiDocument {
 
 void from_json(const nlohmann::json& j, WikiDocument& out);
 void to_json(nlohmann::json& j, const WikiDocument& value);
+/// in: j is an untrusted WikiDocument payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<WikiDocument>);
 
 struct NewsItem {
     std::string title{};
@@ -426,6 +510,9 @@ struct NewsItem {
 
 void from_json(const nlohmann::json& j, NewsItem& out);
 void to_json(nlohmann::json& j, const NewsItem& value);
+/// in: j is an untrusted NewsItem payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<NewsItem>);
 
 struct RestartAdviceDTO {
     PackageRef package{};
@@ -436,6 +523,9 @@ struct RestartAdviceDTO {
 
 void from_json(const nlohmann::json& j, RestartAdviceDTO& out);
 void to_json(nlohmann::json& j, const RestartAdviceDTO& value);
+/// in: j is an untrusted RestartAdviceDTO payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<RestartAdviceDTO>);
 
 struct UpdateItem {
     PackageRef package{};
@@ -447,6 +537,9 @@ struct UpdateItem {
 
 void from_json(const nlohmann::json& j, UpdateItem& out);
 void to_json(nlohmann::json& j, const UpdateItem& value);
+/// in: j is an untrusted UpdateItem payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<UpdateItem>);
 
 struct UpdateReport {
     std::string report_id{};
@@ -460,6 +553,9 @@ struct UpdateReport {
 
 void from_json(const nlohmann::json& j, UpdateReport& out);
 void to_json(nlohmann::json& j, const UpdateReport& value);
+/// in: j is an untrusted UpdateReport payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<UpdateReport>);
 
 struct Replacement {
     PackageRef old{};
@@ -468,6 +564,9 @@ struct Replacement {
 
 void from_json(const nlohmann::json& j, Replacement& out);
 void to_json(nlohmann::json& j, const Replacement& value);
+/// in: j is an untrusted Replacement payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<Replacement>);
 
 struct Blocker {
     std::string code{};
@@ -477,6 +576,25 @@ struct Blocker {
 
 void from_json(const nlohmann::json& j, Blocker& out);
 void to_json(nlohmann::json& j, const Blocker& value);
+/// in: j is an untrusted Blocker payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<Blocker>);
+
+struct BuildPin {
+    std::string pkgbase{};
+    std::vector<std::string> pkgnames{};
+    std::string commit{};
+};
+
+/// in: j contains a bounded AUR build pin.
+/// err: rejects invalid package names and object IDs.
+void from_json(const nlohmann::json& j, BuildPin& out);
+/// in: value contains validated build metadata.
+/// out: the canonical build-pin object.
+void to_json(nlohmann::json& j, const BuildPin& value);
+/// in: j is an untrusted BuildPin payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<BuildPin>);
 
 struct TransactionPlan {
     std::string plan_id{};
@@ -493,12 +611,16 @@ struct TransactionPlan {
     std::vector<RestartAdviceDTO> restart{};
     bool requires_build_review{};
     std::vector<PackageRef> build_review_refs{};
+    std::vector<BuildPin> build_pins{};
     std::vector<PackageRef> protected_blockers{};
     std::vector<Blocker> blockers{};
 };
 
 void from_json(const nlohmann::json& j, TransactionPlan& out);
 void to_json(nlohmann::json& j, const TransactionPlan& value);
+/// in: j is an untrusted TransactionPlan payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<TransactionPlan>);
 
 struct Progress {
     JobPhase phase{};
@@ -509,6 +631,9 @@ struct Progress {
 
 void from_json(const nlohmann::json& j, Progress& out);
 void to_json(nlohmann::json& j, const Progress& value);
+/// in: j is an untrusted Progress payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<Progress>);
 
 struct ProviderQuestion {
     std::vector<PackageRef> options{};
@@ -516,6 +641,9 @@ struct ProviderQuestion {
 
 void from_json(const nlohmann::json& j, ProviderQuestion& out);
 void to_json(nlohmann::json& j, const ProviderQuestion& value);
+/// in: j is an untrusted ProviderQuestion payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<ProviderQuestion>);
 
 struct BuildReviewQuestion {
     std::vector<PackageRef> refs{};
@@ -524,6 +652,9 @@ struct BuildReviewQuestion {
 
 void from_json(const nlohmann::json& j, BuildReviewQuestion& out);
 void to_json(nlohmann::json& j, const BuildReviewQuestion& value);
+/// in: j is an untrusted BuildReviewQuestion payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<BuildReviewQuestion>);
 
 struct ConflictQuestion {
     PackageRef a{};
@@ -532,6 +663,9 @@ struct ConflictQuestion {
 
 void from_json(const nlohmann::json& j, ConflictQuestion& out);
 void to_json(nlohmann::json& j, const ConflictQuestion& value);
+/// in: j is an untrusted ConflictQuestion payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<ConflictQuestion>);
 
 struct NewsAckQuestion {
     std::vector<NewsItem> items{};
@@ -539,6 +673,9 @@ struct NewsAckQuestion {
 
 void from_json(const nlohmann::json& j, NewsAckQuestion& out);
 void to_json(nlohmann::json& j, const NewsAckQuestion& value);
+/// in: j is an untrusted NewsAckQuestion payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<NewsAckQuestion>);
 
 struct GitRedirectQuestion {
     std::string from_host{};
@@ -547,6 +684,9 @@ struct GitRedirectQuestion {
 
 void from_json(const nlohmann::json& j, GitRedirectQuestion& out);
 void to_json(nlohmann::json& j, const GitRedirectQuestion& value);
+/// in: j is an untrusted GitRedirectQuestion payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<GitRedirectQuestion>);
 
 struct QuestionChoice {
     std::variant<VariantChoices, ProviderQuestion, BuildReviewQuestion, ConflictQuestion, NewsAckQuestion, GitRedirectQuestion> value;
@@ -561,6 +701,9 @@ struct Question {
 
 void from_json(const nlohmann::json& j, Question& out);
 void to_json(nlohmann::json& j, const Question& value);
+/// in: j is an untrusted Question payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<Question>);
 
 struct Settings {
     UiPreference ui{};
@@ -575,6 +718,9 @@ struct Settings {
 
 void from_json(const nlohmann::json& j, Settings& out);
 void to_json(nlohmann::json& j, const Settings& value);
+/// in: j is an untrusted Settings payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<Settings>);
 
 struct SettingsPatch {
     std::optional<UiPreference> ui{};
@@ -589,6 +735,9 @@ struct SettingsPatch {
 
 void from_json(const nlohmann::json& j, SettingsPatch& out);
 void to_json(nlohmann::json& j, const SettingsPatch& value);
+/// in: j is an untrusted SettingsPatch payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<SettingsPatch>);
 
 struct ManualPreview {
     std::string preview_id{};
@@ -604,6 +753,9 @@ struct ManualPreview {
 
 void from_json(const nlohmann::json& j, ManualPreview& out);
 void to_json(nlohmann::json& j, const ManualPreview& value);
+/// in: j is an untrusted ManualPreview payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<ManualPreview>);
 
 struct ManualReceipt {
     std::string receipt_id{};
@@ -617,6 +769,9 @@ struct ManualReceipt {
 
 void from_json(const nlohmann::json& j, ManualReceipt& out);
 void to_json(nlohmann::json& j, const ManualReceipt& value);
+/// in: j is an untrusted ManualReceipt payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<ManualReceipt>);
 
 struct LauncherEntry {
     std::string desktop_id{};
@@ -628,6 +783,9 @@ struct LauncherEntry {
 
 void from_json(const nlohmann::json& j, LauncherEntry& out);
 void to_json(nlohmann::json& j, const LauncherEntry& value);
+/// in: j is an untrusted LauncherEntry payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<LauncherEntry>);
 
 struct Capabilities {
     HelperPreference helper{};
@@ -640,6 +798,9 @@ struct Capabilities {
 
 void from_json(const nlohmann::json& j, Capabilities& out);
 void to_json(nlohmann::json& j, const Capabilities& value);
+/// in: j is an untrusted Capabilities payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<Capabilities>);
 
 struct SystemStatus {
     Connectivity connectivity{};
@@ -650,6 +811,9 @@ struct SystemStatus {
 
 void from_json(const nlohmann::json& j, SystemStatus& out);
 void to_json(nlohmann::json& j, const SystemStatus& value);
+/// in: j is an untrusted SystemStatus payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<SystemStatus>);
 
 struct HelloParams {
     std::uint32_t apiVersion{};
@@ -657,6 +821,9 @@ struct HelloParams {
 
 void from_json(const nlohmann::json& j, HelloParams& out);
 void to_json(nlohmann::json& j, const HelloParams& value);
+/// in: j is an untrusted HelloParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<HelloParams>);
 
 struct HelloResult {
     std::string serverVersion{};
@@ -668,12 +835,18 @@ struct HelloResult {
 
 void from_json(const nlohmann::json& j, HelloResult& out);
 void to_json(nlohmann::json& j, const HelloResult& value);
+/// in: j is an untrusted HelloResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<HelloResult>);
 
 struct StatusParams {
 };
 
 void from_json(const nlohmann::json& j, StatusParams& out);
 void to_json(nlohmann::json& j, const StatusParams& value);
+/// in: j is an untrusted StatusParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<StatusParams>);
 
 struct CatalogSourceStatus {
     std::string id{};
@@ -685,6 +858,9 @@ struct CatalogSourceStatus {
 
 void from_json(const nlohmann::json& j, CatalogSourceStatus& out);
 void to_json(nlohmann::json& j, const CatalogSourceStatus& value);
+/// in: j is an untrusted CatalogSourceStatus payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<CatalogSourceStatus>);
 
 struct StatusResult {
     Connectivity connectivity{};
@@ -698,6 +874,9 @@ struct StatusResult {
 
 void from_json(const nlohmann::json& j, StatusResult& out);
 void to_json(nlohmann::json& j, const StatusResult& value);
+/// in: j is an untrusted StatusResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<StatusResult>);
 
 struct SearchParams {
     std::string text{};
@@ -710,6 +889,9 @@ struct SearchParams {
 
 void from_json(const nlohmann::json& j, SearchParams& out);
 void to_json(nlohmann::json& j, const SearchParams& value);
+/// in: j is an untrusted SearchParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<SearchParams>);
 
 struct SearchResult {
     std::vector<PackageSummary> packages{};
@@ -720,6 +902,9 @@ struct SearchResult {
 
 void from_json(const nlohmann::json& j, SearchResult& out);
 void to_json(nlohmann::json& j, const SearchResult& value);
+/// in: j is an untrusted SearchResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<SearchResult>);
 
 struct GetParams {
     std::string packageId{};
@@ -727,6 +912,9 @@ struct GetParams {
 
 void from_json(const nlohmann::json& j, GetParams& out);
 void to_json(nlohmann::json& j, const GetParams& value);
+/// in: j is an untrusted GetParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<GetParams>);
 
 struct GetResult {
     PackageDetails details{};
@@ -737,6 +925,9 @@ struct GetResult {
 
 void from_json(const nlohmann::json& j, GetResult& out);
 void to_json(nlohmann::json& j, const GetResult& value);
+/// in: j is an untrusted GetResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<GetResult>);
 
 struct VariantsParams {
     std::string packageId{};
@@ -744,6 +935,9 @@ struct VariantsParams {
 
 void from_json(const nlohmann::json& j, VariantsParams& out);
 void to_json(nlohmann::json& j, const VariantsParams& value);
+/// in: j is an untrusted VariantsParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<VariantsParams>);
 
 struct VariantsResult {
     VariantChoices choices{};
@@ -752,11 +946,17 @@ struct VariantsResult {
 
 void from_json(const nlohmann::json& j, VariantsResult& out);
 void to_json(nlohmann::json& j, const VariantsResult& value);
+/// in: j is an untrusted VariantsResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<VariantsResult>);
 
 struct FacetsParams {};
 
 void from_json(const nlohmann::json& j, FacetsParams& out);
 void to_json(nlohmann::json& j, const FacetsParams& value);
+/// in: j is an untrusted FacetsParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<FacetsParams>);
 
 struct FacetCount {
     std::string name{};
@@ -765,6 +965,9 @@ struct FacetCount {
 
 void from_json(const nlohmann::json& j, FacetCount& out);
 void to_json(nlohmann::json& j, const FacetCount& value);
+/// in: j is an untrusted FacetCount payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<FacetCount>);
 
 struct CategoryCount {
     std::string id{};
@@ -773,6 +976,9 @@ struct CategoryCount {
 
 void from_json(const nlohmann::json& j, CategoryCount& out);
 void to_json(nlohmann::json& j, const CategoryCount& value);
+/// in: j is an untrusted CategoryCount payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<CategoryCount>);
 
 struct FacetsResult {
     std::vector<FacetCount> repos{};
@@ -782,21 +988,35 @@ struct FacetsResult {
 
 void from_json(const nlohmann::json& j, FacetsResult& out);
 void to_json(nlohmann::json& j, const FacetsResult& value);
+/// in: j is an untrusted FacetsResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<FacetsResult>);
 
 struct BuildFilesParams {
     std::string packageId{};
+    std::optional<std::string> commit{};
+    std::optional<std::string> path{};
 };
 
 void from_json(const nlohmann::json& j, BuildFilesParams& out);
 void to_json(nlohmann::json& j, const BuildFilesParams& value);
+/// in: j is an untrusted BuildFilesParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<BuildFilesParams>);
 
 struct BuildFile {
     std::string name{};
     std::string text{};
+    std::string kind{};
+    std::uint64_t size{};
+    std::string sha256{};
 };
 
 void from_json(const nlohmann::json& j, BuildFile& out);
 void to_json(nlohmann::json& j, const BuildFile& value);
+/// in: j is an untrusted BuildFile payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<BuildFile>);
 
 struct BuildFilesResult {
     std::string packageBase{};
@@ -806,6 +1026,9 @@ struct BuildFilesResult {
 
 void from_json(const nlohmann::json& j, BuildFilesResult& out);
 void to_json(nlohmann::json& j, const BuildFilesResult& value);
+/// in: j is an untrusted BuildFilesResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<BuildFilesResult>);
 
 struct RefreshParams {
     std::vector<SourceKind> sources{};
@@ -813,6 +1036,9 @@ struct RefreshParams {
 
 void from_json(const nlohmann::json& j, RefreshParams& out);
 void to_json(nlohmann::json& j, const RefreshParams& value);
+/// in: j is an untrusted RefreshParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<RefreshParams>);
 
 struct JobIdResult {
     std::string jobId{};
@@ -820,6 +1046,9 @@ struct JobIdResult {
 
 void from_json(const nlohmann::json& j, JobIdResult& out);
 void to_json(nlohmann::json& j, const JobIdResult& value);
+/// in: j is an untrusted JobIdResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<JobIdResult>);
 
 struct WikiGetParams {
     std::string packageId{};
@@ -828,6 +1057,9 @@ struct WikiGetParams {
 
 void from_json(const nlohmann::json& j, WikiGetParams& out);
 void to_json(nlohmann::json& j, const WikiGetParams& value);
+/// in: j is an untrusted WikiGetParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<WikiGetParams>);
 
 struct WikiGetResult {
     WikiDocument document{};
@@ -839,6 +1071,9 @@ struct WikiGetResult {
 
 void from_json(const nlohmann::json& j, WikiGetResult& out);
 void to_json(nlohmann::json& j, const WikiGetResult& value);
+/// in: j is an untrusted WikiGetResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<WikiGetResult>);
 
 struct NewsListParams {
     std::optional<std::string> cursor{};
@@ -847,6 +1082,9 @@ struct NewsListParams {
 
 void from_json(const nlohmann::json& j, NewsListParams& out);
 void to_json(nlohmann::json& j, const NewsListParams& value);
+/// in: j is an untrusted NewsListParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<NewsListParams>);
 
 struct NewsListResult {
     std::vector<NewsItem> items{};
@@ -856,6 +1094,9 @@ struct NewsListResult {
 
 void from_json(const nlohmann::json& j, NewsListResult& out);
 void to_json(nlohmann::json& j, const NewsListResult& value);
+/// in: j is an untrusted NewsListResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<NewsListResult>);
 
 struct UpdatesCheckParams {
     bool refresh{};
@@ -863,6 +1104,9 @@ struct UpdatesCheckParams {
 
 void from_json(const nlohmann::json& j, UpdatesCheckParams& out);
 void to_json(nlohmann::json& j, const UpdatesCheckParams& value);
+/// in: j is an untrusted UpdatesCheckParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<UpdatesCheckParams>);
 
 struct UpdatesOptionsParams {
     std::string reportId{};
@@ -870,6 +1114,9 @@ struct UpdatesOptionsParams {
 
 void from_json(const nlohmann::json& j, UpdatesOptionsParams& out);
 void to_json(nlohmann::json& j, const UpdatesOptionsParams& value);
+/// in: j is an untrusted UpdatesOptionsParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<UpdatesOptionsParams>);
 
 struct UpdatesOptionsResult {
     std::string officialAction{};
@@ -879,6 +1126,9 @@ struct UpdatesOptionsResult {
 
 void from_json(const nlohmann::json& j, UpdatesOptionsResult& out);
 void to_json(nlohmann::json& j, const UpdatesOptionsResult& value);
+/// in: j is an untrusted UpdatesOptionsResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<UpdatesOptionsResult>);
 
 struct PlanSelection {
     SelectionKind kind{};
@@ -887,6 +1137,9 @@ struct PlanSelection {
 
 void from_json(const nlohmann::json& j, PlanSelection& out);
 void to_json(nlohmann::json& j, const PlanSelection& value);
+/// in: j is an untrusted PlanSelection payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<PlanSelection>);
 
 struct UpdatesPlanParams {
     std::string reportId{};
@@ -896,6 +1149,9 @@ struct UpdatesPlanParams {
 
 void from_json(const nlohmann::json& j, UpdatesPlanParams& out);
 void to_json(nlohmann::json& j, const UpdatesPlanParams& value);
+/// in: j is an untrusted UpdatesPlanParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<UpdatesPlanParams>);
 
 struct UpdatesPlanResult {
     std::string planId{};
@@ -907,6 +1163,9 @@ struct UpdatesPlanResult {
 
 void from_json(const nlohmann::json& j, UpdatesPlanResult& out);
 void to_json(nlohmann::json& j, const UpdatesPlanResult& value);
+/// in: j is an untrusted UpdatesPlanResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<UpdatesPlanResult>);
 
 struct PlanParams {
     std::string kind{};
@@ -920,6 +1179,9 @@ struct PlanParams {
 
 void from_json(const nlohmann::json& j, PlanParams& out);
 void to_json(nlohmann::json& j, const PlanParams& value);
+/// in: j is an untrusted PlanParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<PlanParams>);
 
 struct InstallParams {
     std::string planId{};
@@ -928,6 +1190,9 @@ struct InstallParams {
 
 void from_json(const nlohmann::json& j, InstallParams& out);
 void to_json(nlohmann::json& j, const InstallParams& value);
+/// in: j is an untrusted InstallParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<InstallParams>);
 
 struct RemoveParams : InstallParams {};
 struct UpgradeSystemParams : InstallParams {};
@@ -935,10 +1200,19 @@ struct UpgradeCommunityParams : InstallParams {};
 
 void from_json(const nlohmann::json& j, RemoveParams& out);
 void to_json(nlohmann::json& j, const RemoveParams& value);
+/// in: j is an untrusted RemoveParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<RemoveParams>);
 void from_json(const nlohmann::json& j, UpgradeSystemParams& out);
 void to_json(nlohmann::json& j, const UpgradeSystemParams& value);
+/// in: j is an untrusted UpgradeSystemParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<UpgradeSystemParams>);
 void from_json(const nlohmann::json& j, UpgradeCommunityParams& out);
 void to_json(nlohmann::json& j, const UpgradeCommunityParams& value);
+/// in: j is an untrusted UpgradeCommunityParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<UpgradeCommunityParams>);
 
 
 void from_json(const nlohmann::json& j, UpgradeCommunityParams& out);
@@ -952,6 +1226,9 @@ struct JobEvent {
 
 void from_json(const nlohmann::json& j, JobEvent& out);
 void to_json(nlohmann::json& j, const JobEvent& value);
+/// in: j is an untrusted JobEvent payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<JobEvent>);
 
 struct JobsGetParams {
     std::string jobId{};
@@ -960,6 +1237,9 @@ struct JobsGetParams {
 
 void from_json(const nlohmann::json& j, JobsGetParams& out);
 void to_json(nlohmann::json& j, const JobsGetParams& value);
+/// in: j is an untrusted JobsGetParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<JobsGetParams>);
 
 struct JobsGetResult {
     JobState state{};
@@ -973,6 +1253,9 @@ struct JobsGetResult {
 
 void from_json(const nlohmann::json& j, JobsGetResult& out);
 void to_json(nlohmann::json& j, const JobsGetResult& value);
+/// in: j is an untrusted JobsGetResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<JobsGetResult>);
 
 struct JobsListParams {
     std::optional<std::string> cursor{};
@@ -981,6 +1264,9 @@ struct JobsListParams {
 
 void from_json(const nlohmann::json& j, JobsListParams& out);
 void to_json(nlohmann::json& j, const JobsListParams& value);
+/// in: j is an untrusted JobsListParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<JobsListParams>);
 
 struct JobSummary {
     std::string jobId{};
@@ -989,6 +1275,9 @@ struct JobSummary {
 
 void from_json(const nlohmann::json& j, JobSummary& out);
 void to_json(nlohmann::json& j, const JobSummary& value);
+/// in: j is an untrusted JobSummary payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<JobSummary>);
 
 struct JobsListResult {
     std::vector<JobSummary> jobs{};
@@ -997,6 +1286,9 @@ struct JobsListResult {
 
 void from_json(const nlohmann::json& j, JobsListResult& out);
 void to_json(nlohmann::json& j, const JobsListResult& value);
+/// in: j is an untrusted JobsListResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<JobsListResult>);
 
 struct JobsCancelParams {
     std::string jobId{};
@@ -1004,6 +1296,9 @@ struct JobsCancelParams {
 
 void from_json(const nlohmann::json& j, JobsCancelParams& out);
 void to_json(nlohmann::json& j, const JobsCancelParams& value);
+/// in: j is an untrusted JobsCancelParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<JobsCancelParams>);
 
 struct JobsCancelResult {
     bool accepted{};
@@ -1012,6 +1307,9 @@ struct JobsCancelResult {
 
 void from_json(const nlohmann::json& j, JobsCancelResult& out);
 void to_json(nlohmann::json& j, const JobsCancelResult& value);
+/// in: j is an untrusted JobsCancelResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<JobsCancelResult>);
 
 struct JobsAnswerParams {
     std::string jobId{};
@@ -1022,6 +1320,9 @@ struct JobsAnswerParams {
 
 void from_json(const nlohmann::json& j, JobsAnswerParams& out);
 void to_json(nlohmann::json& j, const JobsAnswerParams& value);
+/// in: j is an untrusted JobsAnswerParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<JobsAnswerParams>);
 
 struct AcceptedResult {
     bool accepted{};
@@ -1029,6 +1330,9 @@ struct AcceptedResult {
 
 void from_json(const nlohmann::json& j, AcceptedResult& out);
 void to_json(nlohmann::json& j, const AcceptedResult& value);
+/// in: j is an untrusted AcceptedResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<AcceptedResult>);
 
 struct ManualPreviewParams {
     std::string httpsUrl{};
@@ -1038,19 +1342,31 @@ struct ManualPreviewParams {
 
 void from_json(const nlohmann::json& j, ManualPreviewParams& out);
 void to_json(nlohmann::json& j, const ManualPreviewParams& value);
+/// in: j is an untrusted ManualPreviewParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<ManualPreviewParams>);
 
 struct ManualInstallParams : InstallParams {};
 struct ManualUpgradeParams : InstallParams {};
 void from_json(const nlohmann::json& j, ManualInstallParams& out);
 void to_json(nlohmann::json& j, const ManualInstallParams& value);
+/// in: j is an untrusted ManualInstallParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<ManualInstallParams>);
 void from_json(const nlohmann::json& j, ManualUpgradeParams& out);
 void to_json(nlohmann::json& j, const ManualUpgradeParams& value);
+/// in: j is an untrusted ManualUpgradeParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<ManualUpgradeParams>);
 
 struct ManualListParams {
 };
 
 void from_json(const nlohmann::json& j, ManualListParams& out);
 void to_json(nlohmann::json& j, const ManualListParams& value);
+/// in: j is an untrusted ManualListParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<ManualListParams>);
 
 struct ManualListResult {
     std::vector<ManualReceipt> receipts{};
@@ -1058,13 +1374,22 @@ struct ManualListResult {
 
 void from_json(const nlohmann::json& j, ManualListResult& out);
 void to_json(nlohmann::json& j, const ManualListResult& value);
+/// in: j is an untrusted ManualListResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<ManualListResult>);
 
 struct ManualRemoveParams : InstallParams {};
 struct SetupHelperParams : InstallParams {};
 void from_json(const nlohmann::json& j, ManualRemoveParams& out);
 void to_json(nlohmann::json& j, const ManualRemoveParams& value);
+/// in: j is an untrusted ManualRemoveParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<ManualRemoveParams>);
 void from_json(const nlohmann::json& j, SetupHelperParams& out);
 void to_json(nlohmann::json& j, const SetupHelperParams& value);
+/// in: j is an untrusted SetupHelperParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<SetupHelperParams>);
 
 struct JobsDequeueParams {
     std::string jobId{};
@@ -1072,6 +1397,9 @@ struct JobsDequeueParams {
 
 void from_json(const nlohmann::json& j, JobsDequeueParams& out);
 void to_json(nlohmann::json& j, const JobsDequeueParams& value);
+/// in: j is an untrusted JobsDequeueParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<JobsDequeueParams>);
 
 struct JobsDequeueResult {
     bool removed{};
@@ -1079,12 +1407,18 @@ struct JobsDequeueResult {
 
 void from_json(const nlohmann::json& j, JobsDequeueResult& out);
 void to_json(nlohmann::json& j, const JobsDequeueResult& value);
+/// in: j is an untrusted JobsDequeueResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<JobsDequeueResult>);
 
 struct UnmanagedListParams {
 };
 
 void from_json(const nlohmann::json& j, UnmanagedListParams& out);
 void to_json(nlohmann::json& j, const UnmanagedListParams& value);
+/// in: j is an untrusted UnmanagedListParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<UnmanagedListParams>);
 
 struct UnmanagedListResult {
     std::vector<LauncherEntry> entries{};
@@ -1093,12 +1427,18 @@ struct UnmanagedListResult {
 
 void from_json(const nlohmann::json& j, UnmanagedListResult& out);
 void to_json(nlohmann::json& j, const UnmanagedListResult& value);
+/// in: j is an untrusted UnmanagedListResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<UnmanagedListResult>);
 
 struct SettingsGetParams {
 };
 
 void from_json(const nlohmann::json& j, SettingsGetParams& out);
 void to_json(nlohmann::json& j, const SettingsGetParams& value);
+/// in: j is an untrusted SettingsGetParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<SettingsGetParams>);
 
 struct SettingsGetResult {
     UiPreference uiPreference{};
@@ -1109,6 +1449,9 @@ struct SettingsGetResult {
 
 void from_json(const nlohmann::json& j, SettingsGetResult& out);
 void to_json(nlohmann::json& j, const SettingsGetResult& value);
+/// in: j is an untrusted SettingsGetResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<SettingsGetResult>);
 
 struct SettingsSetParams {
     SettingsPatch changedFields{};
@@ -1116,6 +1459,9 @@ struct SettingsSetParams {
 
 void from_json(const nlohmann::json& j, SettingsSetParams& out);
 void to_json(nlohmann::json& j, const SettingsSetParams& value);
+/// in: j is an untrusted SettingsSetParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<SettingsSetParams>);
 
 struct SettingsSetResult {
     Settings settings{};
@@ -1123,23 +1469,38 @@ struct SettingsSetResult {
 
 void from_json(const nlohmann::json& j, SettingsSetResult& out);
 void to_json(nlohmann::json& j, const SettingsSetResult& value);
+/// in: j is an untrusted SettingsSetResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<SettingsSetResult>);
 
 struct ClearCacheParams {};
 void from_json(const nlohmann::json& j, ClearCacheParams& out);
 void to_json(nlohmann::json& j, const ClearCacheParams& value);
+/// in: j is an untrusted ClearCacheParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<ClearCacheParams>);
 
 struct ClearCacheResult {
     std::uint64_t freedBytes{};
 };
 void from_json(const nlohmann::json& j, ClearCacheResult& out);
 void to_json(nlohmann::json& j, const ClearCacheResult& value);
+/// in: j is an untrusted ClearCacheResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<ClearCacheResult>);
 
 struct RestartStateParams {};
 struct RestartAcknowledgeParams {};
 void from_json(const nlohmann::json& j, RestartStateParams& out);
 void to_json(nlohmann::json& j, const RestartStateParams& value);
+/// in: j is an untrusted RestartStateParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<RestartStateParams>);
 void from_json(const nlohmann::json& j, RestartAcknowledgeParams& out);
 void to_json(nlohmann::json& j, const RestartAcknowledgeParams& value);
+/// in: j is an untrusted RestartAcknowledgeParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<RestartAcknowledgeParams>);
 
 struct RestartStateResult {
     RestartLevel level{"none"};
@@ -1148,10 +1509,16 @@ struct RestartStateResult {
 };
 void from_json(const nlohmann::json& j, RestartStateResult& out);
 void to_json(nlohmann::json& j, const RestartStateResult& value);
+/// in: j is an untrusted RestartStateResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<RestartStateResult>);
 
 struct EmptyResult {};
 void from_json(const nlohmann::json& j, EmptyResult& out);
 void to_json(nlohmann::json& j, const EmptyResult& value);
+/// in: j is an untrusted EmptyResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<EmptyResult>);
 
 struct HelperStatus {
     bool installed{};
@@ -1159,10 +1526,16 @@ struct HelperStatus {
 };
 void from_json(const nlohmann::json& j, HelperStatus& out);
 void to_json(nlohmann::json& j, const HelperStatus& value);
+/// in: j is an untrusted HelperStatus payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<HelperStatus>);
 
 struct SetupStatusParams {};
 void from_json(const nlohmann::json& j, SetupStatusParams& out);
 void to_json(nlohmann::json& j, const SetupStatusParams& value);
+/// in: j is an untrusted SetupStatusParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<SetupStatusParams>);
 
 struct SetupStatusResult {
     HelperStatus paru{};
@@ -1173,12 +1546,18 @@ struct SetupStatusResult {
 };
 void from_json(const nlohmann::json& j, SetupStatusResult& out);
 void to_json(nlohmann::json& j, const SetupStatusResult& value);
+/// in: j is an untrusted SetupStatusResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<SetupStatusResult>);
 
 struct NotifierCheckParams {
 };
 
 void from_json(const nlohmann::json& j, NotifierCheckParams& out);
 void to_json(nlohmann::json& j, const NotifierCheckParams& value);
+/// in: j is an untrusted NotifierCheckParams payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<NotifierCheckParams>);
 
 struct NotifierCheckResult {
     std::uint64_t updateCount{};
@@ -1188,6 +1567,9 @@ struct NotifierCheckResult {
 
 void from_json(const nlohmann::json& j, NotifierCheckResult& out);
 void to_json(nlohmann::json& j, const NotifierCheckResult& value);
+/// in: j is an untrusted NotifierCheckResult payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<NotifierCheckResult>);
 
 struct JobProgressNotification {
     std::string jobId{};
@@ -1197,6 +1579,9 @@ struct JobProgressNotification {
 
 void from_json(const nlohmann::json& j, JobProgressNotification& out);
 void to_json(nlohmann::json& j, const JobProgressNotification& value);
+/// in: j is an untrusted JobProgressNotification payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<JobProgressNotification>);
 
 struct JobLogNotification {
     std::string jobId{};
@@ -1206,6 +1591,9 @@ struct JobLogNotification {
 
 void from_json(const nlohmann::json& j, JobLogNotification& out);
 void to_json(nlohmann::json& j, const JobLogNotification& value);
+/// in: j is an untrusted JobLogNotification payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<JobLogNotification>);
 
 struct JobQuestionNotification {
     std::string jobId{};
@@ -1215,6 +1603,9 @@ struct JobQuestionNotification {
 
 void from_json(const nlohmann::json& j, JobQuestionNotification& out);
 void to_json(nlohmann::json& j, const JobQuestionNotification& value);
+/// in: j is an untrusted JobQuestionNotification payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<JobQuestionNotification>);
 
 struct JobAuthStateNotification {
     std::string jobId{};
@@ -1224,6 +1615,9 @@ struct JobAuthStateNotification {
 
 void from_json(const nlohmann::json& j, JobAuthStateNotification& out);
 void to_json(nlohmann::json& j, const JobAuthStateNotification& value);
+/// in: j is an untrusted JobAuthStateNotification payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<JobAuthStateNotification>);
 
 struct JobStateNotification {
     std::string jobId{};
@@ -1233,6 +1627,9 @@ struct JobStateNotification {
 
 void from_json(const nlohmann::json& j, JobStateNotification& out);
 void to_json(nlohmann::json& j, const JobStateNotification& value);
+/// in: j is an untrusted JobStateNotification payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<JobStateNotification>);
 
 struct CatalogChangedNotification {
     std::uint64_t revision{};
@@ -1240,6 +1637,9 @@ struct CatalogChangedNotification {
 
 void from_json(const nlohmann::json& j, CatalogChangedNotification& out);
 void to_json(nlohmann::json& j, const CatalogChangedNotification& value);
+/// in: j is an untrusted CatalogChangedNotification payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<CatalogChangedNotification>);
 
 struct UpdatesAvailableNotification {
     std::string reportId{};
@@ -1248,6 +1648,9 @@ struct UpdatesAvailableNotification {
 
 void from_json(const nlohmann::json& j, UpdatesAvailableNotification& out);
 void to_json(nlohmann::json& j, const UpdatesAvailableNotification& value);
+/// in: j is an untrusted UpdatesAvailableNotification payload.
+/// err: rejects invalid fields and limits without materializing the payload.
+void validate_json(const nlohmann::json& j, TypeTag<UpdatesAvailableNotification>);
 
 }
 

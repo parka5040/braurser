@@ -40,17 +40,16 @@ protocol::PackageRef ref(const catalog::SearchHit& hit) {
     return {{source}, hit.repo, hit.name};
 }
 
-protocol::PackageSummary summary(const catalog::PackageDetails& item) {
-    const auto& hit = item.summary;
+protocol::PackageSummary summary(const catalog::SearchHit& hit) {
     protocol::PackageSummary result{ref(hit), hit.version, hit.description, hit.installed};
     result.installedVersion = hit.installed_version;
-    if (item.installed) result.installedSize = item.installed->size;
-    if (item.repo_record) result.downloadSize = item.repo_record->download_size;
+    result.installedSize = hit.installed_size;
+    result.downloadSize = hit.download_size;
     result.appName = hit.app_name;
     result.iconPath = hit.icon_path;
     if (hit.source == domain::SourceKind::Official) {
-        result.alsoIn = item.also_in;
-        result.shadowed = item.shadowed;
+        result.alsoIn = hit.also_in;
+        result.shadowed = hit.shadowed;
     }
     return result;
 }
@@ -174,6 +173,8 @@ RealServices::RealServices(core::XdgPaths paths, api::Broadcaster& broadcaster, 
       }()), wiki_cache_(paths_.cache, clock_),
       wiki_client_(http_, clock_, &wiki_cache_), connectivity_(nm_, http_, clock_), news_(http_),
       official_(runner_), elevation_(agent_probe_) {
+    updates::TempSyncDb::sweep(paths_.cache);
+    static_cast<void>(manual::prune_pins(paths_.cache, std::chrono::hours(24 * 14), {}));
     settings_ = {{"auto"}, {"auto"}, {"daily"}, true, false, true, false, {"system"}};
     auto config_dir = paths_.config / "braurser";
     if (core::ensure_private_dir(config_dir)) {
@@ -315,11 +316,7 @@ api::ServiceResult<protocol::SearchResult> RealServices::search(const protocol::
     }
     auto page = store_.search(query);
     if (!page) return std::unexpected(failure(page.error().code == "invalid-query" ? protocol::kInvalidParams : protocol::kInternalError));
-    for (const auto& hit : page->hits) {
-        auto detail = store_.package(hit.id);
-        if (!detail || !*detail) return std::unexpected(failure());
-        result.packages.push_back(summary(**detail));
-    }
+    for (const auto& hit : page->hits) result.packages.push_back(summary(hit));
     result.nextCursor = page->next_cursor;
     result.stale = refresh_busy_.load();
     result.catalogState = result.stale ? "refreshing" : "ready";
@@ -343,24 +340,50 @@ api::ServiceResult<protocol::FacetsResult> RealServices::facets(const protocol::
 }
 
 api::ServiceResult<protocol::BuildFilesResult> RealServices::build_files(const protocol::BuildFilesParams& params) {
-    auto item = package(params.packageId);
-    if (!item || !item->community_record) return std::unexpected(failure(protocol::kInvalidParams));
-    const auto name = domain::PackageName::make(item->summary.name);
-    if (!name) return std::unexpected(failure(protocol::kInvalidParams));
-    auto helper = helper_locator_.select(settings_.helper.value, helper_environment(paths_), runner_);
-    if (!helper) return std::unexpected(failure(protocol::kUnsupportedCapability));
-    if (log_) log_->write("info", "helper", "selected", {{"name", (*helper)->name()}});
-    auto spec = (*helper)->build_print_build_file_spec(*name);
-    spec.timeout = std::chrono::seconds(30);
-    spec.max_stdout = 256 * 1024;
-    spec.max_stderr = 64 * 1024;
-    auto output = runner_.run(spec);
-    if (!output) return std::unexpected(failure());
-    auto text = (*helper)->parse_build_file(*output);
-    if (!text || !protocol::valid_utf8(*text)) return std::unexpected(failure(protocol::kUntrustedInput));
+    if (params.path && !params.commit) return std::unexpected(failure(protocol::kInvalidParams));
+    std::size_t slash{};
+    if (!br_split_target(params.packageId.data(), params.packageId.size(), &slash))
+        return std::unexpected(failure(protocol::kInvalidParams));
+    std::string base = params.packageId.substr(slash == params.packageId.size() ? 0 : slash + 1);
+    if (!params.commit) {
+        auto item = package(params.packageId);
+        if (!item || !item->community_record) return std::unexpected(failure(protocol::kInvalidParams));
+        base = item->community_record->package_base;
+    }
+    if (!br_valid_pkgname(base.data(), base.size())) return std::unexpected(failure(protocol::kUntrustedInput));
+    auto tree = params.commit ? manual::read_build_tree(
+        paths_.cache / "braurser/manual" / ("aur-" + base) / "repo.git", *params.commit) :
+        manual::fetch_build_tree(git_http_, base, paths_.cache);
+    if (!tree && params.commit) {
+        auto item = package(params.packageId);
+        if (item && item->community_record &&
+            br_valid_pkgname(item->community_record->package_base.data(), item->community_record->package_base.size())) {
+            base = item->community_record->package_base;
+            tree = manual::read_build_tree(paths_.cache / "braurser/manual" / ("aur-" + base) / "repo.git", *params.commit);
+        }
+    }
+    if (!tree) return std::unexpected(failure(protocol::kUntrustedInput));
     protocol::BuildFilesResult result;
-    result.packageBase = item->community_record->package_base;
-    result.files.push_back({"PKGBUILD", *text});
+    result.packageBase = base;
+    std::size_t bytes = base.size() + 128;
+    for (const auto& file : tree->files) {
+        if (!params.path || file.path == *params.path) bytes += file.path.size() + file.sha256.size() + 96;
+    }
+    if (bytes > 450 * 1024) return std::unexpected(failure(protocol::kUntrustedInput));
+    for (const auto& file : tree->files) {
+        if (params.path && file.path != *params.path) continue;
+        protocol::BuildFile entry{file.path, {}, file.text ? "omitted" : "binary", file.size, file.sha256};
+        if (file.text && file.text->size() <= 450 * 1024 - bytes) {
+            entry.text = *file.text;
+            entry.kind = "text";
+            bytes += entry.text.size();
+        }
+        if (params.path && entry.kind == "omitted") return std::unexpected(failure(protocol::kUntrustedInput));
+        result.files.push_back(std::move(entry));
+    }
+    if (params.path && result.files.size() != 1) return std::unexpected(failure(protocol::kInvalidParams));
+    try { protocol::validate_wire(nlohmann::json(result)); }
+    catch (const std::exception&) { return std::unexpected(failure(protocol::kUntrustedInput)); }
     return result;
 }
 
@@ -373,13 +396,21 @@ std::optional<catalog::PackageDetails> RealServices::package(std::string_view id
     const auto name = repo ? id.substr(slash + 1) : id;
     catalog::SearchQuery query{std::string(name), {}, catalog::SortOrder::Relevance, {}, 200};
     if (repo && !community) query.filters.repos.push_back(std::string(*repo));
-    auto page = store_.search(query);
-    if (!page) return std::nullopt;
-    for (const auto& hit : page->hits) {
-        if (hit.name != name || (community && hit.source != domain::SourceKind::Community) ||
-            (repo && !community && (!hit.repo || *hit.repo != *repo))) continue;
-        auto detail = store_.package(hit.id);
-        if (detail && *detail) return std::move(**detail);
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        auto page = store_.search(query);
+        if (!page) return std::nullopt;
+        bool moved = false;
+        for (const auto& hit : page->hits) {
+            if (hit.name != name || (community && hit.source != domain::SourceKind::Community) ||
+                (repo && !community && (!hit.repo || *hit.repo != *repo))) continue;
+            auto detail = store_.package(hit.id);
+            if (detail && *detail && (*detail)->summary.name == hit.name &&
+                (*detail)->summary.source == hit.source && (*detail)->summary.repo == hit.repo)
+                return std::move(**detail);
+            moved = true;
+            break;
+        }
+        if (!moved) return std::nullopt;
     }
     return std::nullopt;
 }
@@ -494,145 +525,122 @@ bool RealServices::build_snapshot(bool forced) {
         diagnostic("official", "failed", configured.error().code, 0, 0, started);
         return false;
     }
-    std::vector<catalog::RepoPackage> packages;
-    std::map<std::string, protocol::CatalogSourceStatus> sources;
-    for (const auto& repo : configured->names) {
-        const auto since = Clock::now();
-        diagnostic(repo, "start", "ok", 0, 0, since);
-        auto records = sync_.read(configured->db_path, repo);
-        if (!records) {
-            diagnostic(repo, "failed", records.error().code, 0, 0, since);
-            return false;
-        }
-        sources.emplace("repo/" + repo, protocol::CatalogSourceStatus{"repo/" + repo, "ok",
-                        records->rejected ? std::optional<std::string>("invalid-record") : std::nullopt,
-                        records->packages.size(), records->rejected});
-        diagnostic(repo, "finish", "ok", records->packages.size(), records->rejected, since);
-        packages.insert(packages.end(), std::make_move_iterator(records->packages.begin()),
-                        std::make_move_iterator(records->packages.end()));
-    }
-    auto local = local_.read(configured->db_path);
-    if (!local) {
-        diagnostic("installed", "failed", local.error().code, 0, 0, started);
+    cache::SnapshotBuilder builder(paths_.cache);
+    if (auto begun = builder.begin(configured->names); !begun) {
+        diagnostic("snapshot", "failed", begun.error().code, 0, 0, started);
         return false;
     }
-    auto installed = query_.compute(*local, packages);
-    sources.emplace("installed", protocol::CatalogSourceStatus{"installed", "ok", {}, installed.packages.size(), 0});
-    diagnostic("installed", "finish", "ok", installed.packages.size(), 0, started);
-    std::vector<catalog::AurPackage> community;
+    catalog::OfficialIndex official;
+    std::map<std::string, protocol::CatalogSourceStatus> sources;
+    bool storage_failed = false;
+    auto add = [&](const auto& record, protocol::CatalogSourceStatus& source) {
+        if (storage_failed) return false;
+        auto added = builder.add(record);
+        if (added) { ++source.packageCount; return true; }
+        if (added.error().code != "invalid-record") storage_failed = true;
+        source.reasonCode = added.error().code;
+        ++source.skippedCount;
+        return false;
+    };
+    for (const auto& repo : configured->names) {
+        auto& source = sources.emplace("repo/" + repo,
+            protocol::CatalogSourceStatus{"repo/" + repo, "ok", {}, 0, 0}).first->second;
+        auto records = sync_.read(configured->db_path, repo, [&](catalog::RepoPackage&& package) {
+            if (add(package, source)) official.add(package.name, package.version);
+        });
+        if (!records || storage_failed) {
+            diagnostic(repo, "failed", records ? "storage" : records.error().code, source.packageCount, source.skippedCount, started);
+            return false;
+        }
+        source.skippedCount += records->rejected;
+        if (source.skippedCount) source.reasonCode = "invalid-record";
+    }
+    official.finish();
+    auto& community = sources.emplace("community", protocol::CatalogSourceStatus{"community", "unavailable", "dump-unavailable", 0, 0}).first->second;
+    const catalog::AurSink aur_sink = [&](catalog::AurPackage&& package) { add(package, community); };
     bool aur_available = false;
-    std::string aur_reason = "dump-unavailable";
-    std::string aur_status = "unavailable";
-    const auto aur_start = Clock::now();
-    diagnostic("community", "start", "ok", 0, 0, aur_start);
     const auto dump_path = paths_.cache / "braurser/downloads/packages-meta-ext-v1.json.gz";
     const auto dump_age = file_age(dump_path);
+    if (!builder.savepoint()) return false;
+    auto accept_aur = [&](const std::expected<catalog::RecordCounts, catalog::CatalogError>& parsed) {
+        if (storage_failed) return false;
+        if (parsed) {
+            aur_available = true;
+            community.status = "ok";
+            community.skippedCount += parsed->rejected;
+            community.reasonCode = community.skippedCount ? std::optional<std::string>("invalid-record") : std::nullopt;
+            return true;
+        }
+        community.status = parsed.error().code == "aur-http" || parsed.error().code == "aur-status" ? "unavailable" : "failed";
+        community.reasonCode = parsed.error().code;
+        community.packageCount = 0;
+        community.skippedCount = 0;
+        return builder.rollback_to_savepoint().has_value();
+    };
     if (forced || dump_age == std::chrono::system_clock::time_point{} ||
         clock_.now() - dump_age >= std::chrono::hours(24)) {
-        std::expected<std::vector<catalog::AurPackage>, catalog::CatalogError> fetched =
+        std::expected<catalog::RecordCounts, catalog::CatalogError> fetched =
             std::unexpected(catalog::CatalogError{"aur-exception", {}});
-        try { fetched = aur_.fetch(paths_.cache); } catch (const std::exception&) {}
-        if (fetched) { community = std::move(*fetched); aur_available = true; }
-        else {
-            aur_reason = fetched.error().code;
-            if (aur_reason != "aur-http" && aur_reason != "aur-status") aur_status = "failed";
-            diagnostic("community", "failed", aur_reason, 0, 0, aur_start);
-        }
+        try { fetched = aur_.fetch(paths_.cache, aur_sink); } catch (const std::exception&) {}
+        if (!accept_aur(fetched)) return false;
     }
     if (!aur_available && dump_age != std::chrono::system_clock::time_point{}) {
         const auto cached = core::read_bounded(dump_path, 64ULL * 1024 * 1024);
+        std::expected<catalog::RecordCounts, catalog::CatalogError> parsed =
+            std::unexpected(catalog::CatalogError{"aur-cache-read", {}});
         if (cached) {
-            std::expected<std::vector<catalog::AurPackage>, catalog::CatalogError> parsed =
-                std::unexpected(catalog::CatalogError{"aur-parse-exception", {}});
-            try { parsed = catalog::AurDump{}.parse(std::as_bytes(std::span(*cached))); }
-            catch (const std::exception&) {}
-            if (parsed) { community = std::move(*parsed); aur_available = true; }
-            else {
-                aur_status = "failed";
-                aur_reason = parsed.error().code;
-                diagnostic("community", "failed", aur_reason, 0, 0, aur_start);
-            }
-        } else diagnostic("community", "failed", "cache-read", 0, 0, aur_start);
+            try { parsed = catalog::AurDump{}.parse(std::as_bytes(std::span(*cached)), aur_sink); }
+            catch (const std::exception&) { parsed = std::unexpected(catalog::CatalogError{"aur-parse-exception", {}}); }
+        }
+        if (!accept_aur(parsed)) return false;
     }
-    sources.emplace("community", protocol::CatalogSourceStatus{"community", aur_available ? "ok" : aur_status,
-                    aur_available ? std::nullopt : std::optional(aur_reason), community.size(), 0});
-    diagnostic("community", "finish", aur_available ? "ok" : aur_reason, community.size(), 0, aur_start);
-    const auto app_start = Clock::now();
-    diagnostic("apps", "start", "ok", 0, 0, app_start);
-    std::expected<std::vector<catalog::AppMetadata>, catalog::CatalogError> discovered =
-        std::unexpected(catalog::CatalogError{"appstream-exception", {}});
-    try { discovered = appstream_.discover(); } catch (const std::exception&) {}
-    std::vector<catalog::AppMetadata> apps;
-    if (discovered) apps = std::move(*discovered);
-    else diagnostic("apps", "failed", discovered.error().code, 0, 0, app_start);
-    const bool apps_available = discovered && !apps.empty();
-    const auto app_reason = discovered ? "appstream-unavailable" : discovered.error().code;
-    sources.emplace("apps", protocol::CatalogSourceStatus{"apps", apps_available ? "ok" : discovered ? "unavailable" : "failed",
-                    apps_available ? std::nullopt : std::optional<std::string>(app_reason), 0, 0});
-    std::set<std::string> names;
-    for (const auto& record : packages) names.insert(record.name);
-    for (const auto& record : community) names.insert(record.name);
+    if (!builder.release_savepoint()) return false;
+    {
+        auto local = local_.read(configured->db_path);
+        if (!local) return false;
+        auto installed = query_.compute(*local, official);
+        auto& source = sources.emplace("installed", protocol::CatalogSourceStatus{"installed", "ok", {}, 0, 0}).first->second;
+        for (const auto& package : installed.packages) add(package, source);
+        if (storage_failed) return false;
+    }
+    auto& apps = sources.emplace("apps", protocol::CatalogSourceStatus{"apps", "ok", {}, 0, 0}).first->second;
     std::set<std::string> app_names;
-    std::erase_if(apps, [&](const auto& record) {
-        return !names.contains(record.pkgname) || !app_names.insert(record.pkgname).second;
-    });
-    sources.at("apps").packageCount = apps.size();
-    diagnostic("apps", "finish", apps_available ? "ok" : app_reason, apps.size(), 0, app_start);
-    cache::SnapshotBuilder builder(paths_.cache);
-    std::size_t retries = 0;
-    while (true) {
-        if (auto begun = builder.begin(configured->names); !begun) {
-            diagnostic("snapshot", "failed", begun.error().code, 0, retries, started);
-            return false;
-        }
-        bool retry = false;
-        auto add_records = [&](auto& records, auto source_for) {
-            for (auto it = records.begin(); it != records.end(); ++it) {
-                if (auto added = builder.add(*it); !added) {
-                    auto& source = sources.at(source_for(*it));
-                    diagnostic(source.id, "failed", added.error().code, source.packageCount, source.skippedCount, started);
-                    if (added.error().code != "invalid-record")
-                        throw std::runtime_error("catalog storage failure");
-                    source.reasonCode = added.error().code;
-                    --source.packageCount;
-                    ++source.skippedCount;
-                    records.erase(it);
-                    retry = true;
-                    return;
-                }
-            }
-        };
-        add_records(packages, [](const auto& record) { return "repo/" + record.repo; });
-        if (!retry) add_records(community, [](const auto&) { return std::string("community"); });
-        if (!retry) add_records(installed.packages, [](const auto&) { return std::string("installed"); });
-        if (!retry) add_records(apps, [](const auto&) { return std::string("apps"); });
-        if (retry) {
-            builder.abort();
-            if (++retries > 1024) {
-                diagnostic("snapshot", "failed", "rejection-limit", 0, retries, started);
-                return false;
-            }
-            continue;
-        }
-        for (const auto& [id, source] : sources) {
-            catalog::SourceState state{id, source.status, source.reasonCode.value_or(""),
-                                       std::to_string(source.packageCount), std::to_string(source.skippedCount),
-                                       std::chrono::duration_cast<std::chrono::seconds>(clock_.now().time_since_epoch()).count()};
-            if (auto recorded = builder.add(state); !recorded) {
-                diagnostic(id, "failed", recorded.error().code, source.packageCount, source.skippedCount, started);
-                return false;
-            }
-        }
-        if (auto committed = builder.commit(); !committed) {
-            diagnostic("snapshot", "failed", committed.error().code, 0, retries, started);
-            return false;
-        }
-        for (const auto& [id, source] : sources)
-            diagnostic(id, "finish", source.reasonCode.value_or("ok"), source.packageCount,
-                       source.skippedCount, started);
-        diagnostic("snapshot", "finish", "ok", packages.size() + community.size(), retries, started);
-        return true;
+    if (!builder.savepoint()) return false;
+    std::expected<std::size_t, catalog::CatalogError> discovered =
+        std::unexpected(catalog::CatalogError{"appstream-exception", {}});
+    try {
+        discovered = appstream_.discover([&](catalog::AppMetadata&& app) {
+            if (!app_names.contains(app.pkgname) && add(app, apps)) app_names.insert(std::move(app.pkgname));
+        });
+    } catch (const std::exception&) {}
+    if (storage_failed) return false;
+    if (!discovered) {
+        if (!builder.rollback_to_savepoint()) return false;
+        apps.status = "failed";
+        apps.reasonCode = discovered.error().code;
+        apps.packageCount = 0;
+    } else if (apps.packageCount == 0) {
+        apps.status = "unavailable";
+        apps.reasonCode = "appstream-unavailable";
     }
+    if (!builder.release_savepoint()) return false;
+    std::size_t count = 0;
+    std::size_t skipped = 0;
+    for (const auto& [id, source] : sources) {
+        catalog::SourceState state{id, source.status, source.reasonCode.value_or(""),
+            std::to_string(source.packageCount), std::to_string(source.skippedCount),
+            std::chrono::duration_cast<std::chrono::seconds>(clock_.now().time_since_epoch()).count()};
+        if (!builder.add(state)) return false;
+        count += source.packageCount;
+        skipped += source.skippedCount;
+        diagnostic(id, "finish", source.reasonCode.value_or("ok"), source.packageCount, source.skippedCount, started);
+    }
+    if (auto committed = builder.commit(); !committed) {
+        diagnostic("snapshot", "failed", committed.error().code, count, skipped, started);
+        return false;
+    }
+    diagnostic("snapshot", "finish", "ok", count, skipped, started);
+    return true;
 }
 
 elevation::Environment RealServices::elevation_environment() const {
@@ -703,11 +711,10 @@ void RealServices::run_updates(std::string job, bool request_refresh, catalog::R
     std::vector<updates::PackageUpdate> community_updates;
     std::expected<std::vector<updates::PackageUpdate>, updates::UpdateError> checked =
         std::unexpected(updates::UpdateError{updates::UpdateErrorCode::Unavailable, {}});
-    if (request_refresh) {
-        auto temp = updates::TempSyncDb::create(runner_, repos.db_path, paths_.runtime);
-        if (temp) checked = official_.check(temp->path());
-        else if (log_) log_->write("error", "updates", "tempdb_failed", {{"code", std::to_string(static_cast<int>(temp.error().code))}});
-    } else checked = official_.check(repos.db_path);
+    const auto report_id = "report-" + job;
+    auto temp = updates::TempSyncDb::create(runner_, repos.db_path, paths_.cache, report_id, request_refresh);
+    if (temp) checked = official_.check(temp->path());
+    else if (log_) log_->write("error", "updates", "tempdb_failed", {{"code", std::to_string(static_cast<int>(temp.error().code))}});
     if (!checked) {
         { if (log_) log_->write("error", "updates", "check_failed", {{"stage", "official-check"}}); Glib::MainContext::get_default()->invoke([this, job] { updates_busy_ = false; broadcaster_.emit<api::JobStateNotificationEvent>({job, 1, protocol::JobState{"failed"}}); return false; }); }
         return;
@@ -721,17 +728,17 @@ void RealServices::run_updates(std::string job, bool request_refresh, catalog::R
             { if (log_) log_->write("error", "updates", "check_failed", {{"stage", "local-db"}}); Glib::MainContext::get_default()->invoke([this, job] { updates_busy_ = false; broadcaster_.emit<api::JobStateNotificationEvent>({job, 1, protocol::JobState{"failed"}}); return false; }); }
             return;
         }
-        std::vector<catalog::RepoPackage> repository_packages;
+        catalog::OfficialIndex repository_packages;
         for (const auto& repo : repos.names) {
-            auto records = sync_.read(repos.db_path, repo);
+            auto records = sync_.read(repos.db_path, repo, [&](catalog::RepoPackage&& package) {
+                repository_packages.add(package.name, package.version);
+            });
             if (!records) {
                 { if (log_) log_->write("error", "updates", "check_failed", {{"stage", "sync-db"}}); Glib::MainContext::get_default()->invoke([this, job] { updates_busy_ = false; broadcaster_.emit<api::JobStateNotificationEvent>({job, 1, protocol::JobState{"failed"}}); return false; }); }
                 return;
             }
-            repository_packages.insert(repository_packages.end(),
-                std::make_move_iterator(records->packages.begin()),
-                std::make_move_iterator(records->packages.end()));
         }
+        repository_packages.finish();
         auto installed = query_.compute(*local, repository_packages);
         std::set<std::string> foreign(installed.foreign.begin(), installed.foreign.end());
         updates::CommunityUpdateChecker checker(runner_, **helper);
@@ -751,10 +758,11 @@ void RealServices::run_updates(std::string job, bool request_refresh, catalog::R
             advice = advisor.advise(official_updates, *rules);
         }
     }
-    Glib::MainContext::get_default()->invoke([this, job, official = std::move(official_updates),
+    auto retained_db = std::make_shared<updates::TempSyncDb>(std::move(*temp));
+    Glib::MainContext::get_default()->invoke([this, job, report_id, retained_db, official = std::move(official_updates),
                                                 community = std::move(community_updates), advice = std::move(advice)] {
         protocol::UpdateReport next;
-        next.report_id = "report-" + std::to_string(++next_job_);
+        next.report_id = report_id;
         next.checked_at = iso_time(clock_.now());
         next.overall_restart = advice ? restart_level(advice->overall) : protocol::RestartLevel{"unknown"};
         auto restart_for = [&](const protocol::PackageRef& package_ref) {
@@ -776,8 +784,9 @@ void RealServices::run_updates(std::string job, bool request_refresh, catalog::R
             next.community.push_back({package_ref, update.from, update.to, {"community"}, restart_for(package_ref)});
         }
         const std::uint64_t count = next.official.size() + next.community.size() + next.manual.size();
-        const std::string report_id = next.report_id;
         report_ = std::move(next);
+        retained_db->retain();
+        updates::TempSyncDb::sweep(paths_.cache, report_id);
         last_check_ = clock_.now();
         updates_busy_ = false;
         if (count > 0) broadcaster_.emit<api::UpdatesAvailableNotificationEvent>({report_id, count});
@@ -793,7 +802,8 @@ api::ServiceResult<protocol::JobIdResult> RealServices::check_updates(const prot
     if (updates_worker_.joinable()) updates_worker_.join();
     updates_worker_ = std::jthread([this, id, refresh = params.refresh,
                                     repos = *repos_, preference = settings_.helper.value] {
-        try { run_updates(id, refresh, repos, preference); } catch (const std::exception&) {
+        try { run_updates(id, refresh, repos, preference); } catch (const std::exception& error) {
+            if (log_) log_->write("error", "updates", "check_failed", {{"stage", "exception"}, {"what", error.what()}});
             Glib::MainContext::get_default()->invoke([this, id] {
                 updates_busy_ = false;
                 broadcaster_.emit<api::JobStateNotificationEvent>({id, 1, protocol::JobState{"failed"}});

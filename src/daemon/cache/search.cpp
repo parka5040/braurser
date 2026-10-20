@@ -220,6 +220,8 @@ catalog::SearchHit hit_from(Statement& stmt) {
     hit.installed = !stmt.is_null(9);
     hit.installed_version = stmt.text(9);
     hit.upgradable_to = stmt.text(10);
+    if (!stmt.is_null(11)) hit.installed_size = static_cast<std::uint64_t>(stmt.integer(11));
+    if (hit.source == domain::SourceKind::Official) hit.download_size = static_cast<std::uint64_t>(stmt.integer(12));
     return hit;
 }
 
@@ -234,7 +236,7 @@ void shadow_repos(const Database& db, catalog::SearchHit& hit) {
 }
 
 constexpr std::string_view hit_columns =
-    "p.id,p.source_kind,p.repo,p.name,p.version,p.description,a.display_name,a.summary,a.icon_path,i.version,i.upgradable_to";
+    "p.id,p.source_kind,p.repo,p.name,p.version,p.description,a.display_name,a.summary,a.icon_path,i.version,i.upgradable_to,i.size,p.download_size";
 
 }
 

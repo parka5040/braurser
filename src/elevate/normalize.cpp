@@ -46,6 +46,7 @@ Normalized normalize(std::span<const std::string> input) {
         if (item == "-q") { flags.push_back("-q"); continue; }
         std::string_view option = item;
         for (const auto& alias : aliases) if (option == alias.input) { option = alias.output; break; }
+        if (option == "--refresh") return denied("refresh");
         flags.emplace_back(option);
     }
     if (!separator) return denied("separator");
@@ -68,15 +69,9 @@ Normalized normalize(std::span<const std::string> input) {
         return false;
     };
     if (output[0] == "--sync") {
-        if (append("--refresh")) {
-            if (!append("--sysupgrade")) return denied("refresh");
-            if (noconfirm) output.emplace_back("--noconfirm");
-            append("--needed");
-        } else {
-            if (!append("--needed")) return denied("needed");
-            append("--asdeps");
-            if (noconfirm) output.emplace_back("--noconfirm");
-        }
+        if (!append("--needed")) return denied("needed");
+        append("--asdeps");
+        if (noconfirm) output.emplace_back("--noconfirm");
     } else if (output[0] == "--remove") {
         if (!append("--nosave") || !append("--recursive")) return denied("remove");
         if (noconfirm) output.emplace_back("--noconfirm");
@@ -90,11 +85,8 @@ Normalized normalize(std::span<const std::string> input) {
     if (flags.size() != 1) return denied("option");
     if (color) output.emplace_back("--color=never");
     if (progress) output.emplace_back("--noprogressbar");
-    if (!targets.empty() || output[0] != "--sync" ||
-        (output.size() >= 2 && output[1] != "--refresh")) {
-        output.emplace_back("--");
-        output.insert(output.end(), targets.begin(), targets.end());
-    }
+    output.emplace_back("--");
+    output.insert(output.end(), targets.begin(), targets.end());
     std::vector<const char*> raw;
     raw.reserve(output.size());
     for (const auto& arg : output) raw.push_back(arg.c_str());

@@ -87,7 +87,7 @@ bool package_target(std::string_view text) {
 }
 
 void validate_string(std::string_view s, std::string_view key, std::size_t& total) {
-    const std::size_t cap = in(key, {"script_text", "text", "pkgbuild"}) ? 256 * 1024 :
+    const std::size_t cap = key == "text" ? 448 * 1024 : in(key, {"script_text", "pkgbuild"}) ? 256 * 1024 :
                             in(key, {"description", "line"}) ? 16384 : 4096;
     if (s.size() > cap || s.size() > 512 * 1024 - total || !valid_utf8(s)) throw std::invalid_argument("invalid string");
     for (char ch : s) {
@@ -115,7 +115,9 @@ void validate_string(std::string_view s, std::string_view key, std::size_t& tota
     if (in(key, {"fetched_at", "fetchedAt", "published", "checked_at", "installed_at", "scanTime", "expires_at", "out_of_date_since", "first_submitted", "last_modified"}) &&
         !utc_timestamp(s)) throw std::invalid_argument("invalid timestamp");
     if (in(key, {"commit", "newCommit"}) &&
-        (s.size() != 40 || !std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isxdigit(c) != 0; })))
+        ((s.size() != 40 && s.size() != 64) || !std::all_of(s.begin(), s.end(), [](unsigned char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        })))
         throw std::invalid_argument("invalid commit");
     if (in(key, {"scriptPath", "script_path"}) && !safe_path(s)) throw std::invalid_argument("invalid path");
     if (in(key, {"message_key", "reason_key", "attribution_key"}) &&
@@ -127,7 +129,8 @@ void validate_string(std::string_view s, std::string_view key, std::size_t& tota
     if (key == "officialAction" && s != "update-system") throw std::invalid_argument("invalid action");
 }
 
-void inspect(const nlohmann::json& j, std::string_view key, unsigned depth, std::size_t& total, std::size_t& nodes) {
+void inspect(const nlohmann::json& j, std::string_view key, unsigned depth, std::size_t& total, std::size_t& nodes,
+             std::span<const std::string_view> excluded = {}) {
     if ((depth > 32 && j.is_structured()) || ++nodes > 16384)
         throw std::invalid_argument("JSON limit exceeded");
     if (j.is_discarded() || j.is_binary()) throw std::invalid_argument("invalid JSON value");
@@ -137,8 +140,10 @@ void inspect(const nlohmann::json& j, std::string_view key, unsigned depth, std:
         if (j.size() > 256) throw std::invalid_argument("array limit exceeded");
         for (const auto& value : j) inspect(value, key == "external_refs" ? "url" : "", depth + 1, total, nodes);
     } else if (j.is_object()) {
-        if (j.size() > 256) throw std::invalid_argument("object limit exceeded");
+        std::size_t fields = 0;
         for (auto it = j.begin(); it != j.end(); ++it) {
+            if (std::find(excluded.begin(), excluded.end(), it.key()) != excluded.end()) continue;
+            if (++fields > 256) throw std::invalid_argument("object limit exceeded");
             validate_string(it.key(), "", total);
             inspect(it.value(), it.key(), depth + 1, total, nodes);
         }
@@ -170,10 +175,10 @@ bool valid_utf8(std::string_view text) {
     return true;
 }
 
-void validate_wire(const nlohmann::json& value, std::string_view key) {
+void validate_wire(const nlohmann::json& value, std::string_view key, std::span<const std::string_view> excluded) {
     std::size_t total = 0;
     std::size_t nodes = 0;
-    inspect(value, key, 0, total, nodes);
+    inspect(value, key, 0, total, nodes, excluded);
 }
 
 }

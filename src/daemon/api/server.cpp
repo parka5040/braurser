@@ -106,23 +106,33 @@ struct Server::Client {
     Glib::RefPtr<Gio::Socket> socket;
     ConnectionId id;
     protocol::FrameDecoder decoder;
-    std::deque<std::string> output;
+    struct Output {
+        std::shared_ptr<const std::string> frame;
+        std::size_t offset{};
+    };
+    std::deque<Output> output;
     std::size_t queued{};
-    std::size_t sent{};
+    std::size_t buffered{};
     std::size_t pending{};
+    bool closing{};
     sigc::connection input;
     sigc::connection writable;
+    sigc::connection first_request_deadline;
+    sigc::connection frame_deadline;
 };
 
 Server::Server(HandlerRegistry& registry, std::filesystem::path runtime,
-               std::filesystem::path socket_path, const PeerCredentials* peers, DaemonLog* log)
+               std::filesystem::path socket_path, const PeerCredentials* peers, DaemonLog* log,
+               ServerOptions options)
     : registry_(registry), runtime_(std::move(runtime)),
       path_(socket_path.empty() ? runtime_ / "braurser" / "core.sock" : socket_path),
       custom_socket_(!socket_path.empty()),
-      peers_(peers ? peers : &default_peers_), log_(log), loop_(Glib::MainLoop::create()) {}
+      peers_(peers ? peers : &default_peers_), log_(log), loop_(Glib::MainLoop::create()), options_(options) {}
 
 Server::~Server() {
+    lifetime_.reset();
     stop();
+    shutdown_source_.disconnect();
     for (const auto& client : connected()) close_client(client->socket->get_fd());
     if (lock_fd_ >= 0) close(lock_fd_);
 }
@@ -245,6 +255,10 @@ bool Server::accept_ready(Glib::IOCondition condition) {
             client->input = Glib::signal_io().connect(
                 [this, client](Glib::IOCondition flags) { return client_ready(client, flags); },
                 fd, Glib::IOCondition::IO_IN | Glib::IOCondition::IO_HUP | Glib::IOCondition::IO_ERR);
+            client->first_request_deadline = Glib::signal_timeout().connect([this, client] {
+                defer_close(client);
+                return false;
+            }, options_.first_request_timeout_ms);
         } catch (const Glib::Error&) { close(fd); }
     }
 }
@@ -255,31 +269,65 @@ void Server::close_client(int fd) {
     const auto id = it->second->id;
     it->second->input.disconnect();
     it->second->writable.disconnect();
+    it->second->first_request_deadline.disconnect();
+    it->second->frame_deadline.disconnect();
     clients_.erase(it);
     for (const auto& callback : disconnect_callbacks_) callback(id);
     if (stopping_ && clients_.empty()) finish();
 }
 
+void Server::defer_close(const std::shared_ptr<Client>& client) {
+    if (client->closing || !still_connected(client)) return;
+    client->closing = true;
+    client->input.disconnect();
+    client->writable.disconnect();
+    client->first_request_deadline.disconnect();
+    client->frame_deadline.disconnect();
+    client->output.clear();
+    client->queued = 0;
+    client->decoder = protocol::FrameDecoder{};
+    std::weak_ptr<Client> weak = client;
+    std::weak_ptr<int> lifetime = lifetime_;
+    Glib::signal_idle().connect_once([this, weak, lifetime] {
+        if (lifetime.expired()) return;
+        if (auto current = weak.lock(); current && still_connected(current))
+            close_client(current->socket->get_fd());
+    });
+}
+
+void Server::watch_frame_deadline(const std::shared_ptr<Client>& client) {
+    client->frame_deadline.disconnect();
+    client->frame_deadline = Glib::signal_timeout().connect([this, client] {
+        defer_close(client);
+        return false;
+    }, options_.frame_timeout_ms);
+}
+
+void Server::queue_frame(const std::shared_ptr<Client>& client, std::shared_ptr<const std::string> frame) {
+    if (client->closing || !still_connected(client)) return;
+    if (frame->size() > max_queue - client->queued) {
+        defer_close(client);
+        return;
+    }
+    client->queued += frame->size();
+    client->output.push_back({std::move(frame), 0});
+    if (!client->writable.connected()) {
+        client->writable = Glib::signal_io().connect(
+            [this, client](Glib::IOCondition flags) { return client_ready(client, flags); },
+            client->socket->get_fd(), Glib::IOCondition::IO_OUT | Glib::IOCondition::IO_HUP | Glib::IOCondition::IO_ERR);
+    }
+}
+
 void Server::queue(const std::shared_ptr<Client>& client, const protocol::Message& message) {
-    const auto active = clients_.find(client->socket->get_fd());
-    if (active == clients_.end() || active->second != client) return;
+    if (client->closing || !still_connected(client)) return;
     try {
-        auto frame = protocol::encode_frame(protocol::serialize_message(message));
-        if (frame.size() > max_queue - client->queued) {
-            close_client(client->socket->get_fd());
-            return;
-        }
-        client->queued += frame.size();
-        client->output.push_back(std::move(frame));
-        if (!client->writable.connected()) {
-            client->writable = Glib::signal_io().connect(
-                [this, client](Glib::IOCondition flags) { return client_ready(client, flags); },
-                client->socket->get_fd(), Glib::IOCondition::IO_OUT | Glib::IOCondition::IO_HUP | Glib::IOCondition::IO_ERR);
-        }
-    } catch (const std::exception&) { close_client(client->socket->get_fd()); }
+        queue_frame(client, std::make_shared<const std::string>(
+            protocol::encode_frame(protocol::serialize_message(message))));
+    } catch (const std::exception&) { defer_close(client); }
 }
 
 bool Server::client_ready(const std::shared_ptr<Client>& client, Glib::IOCondition condition) {
+    if (client->closing || !still_connected(client)) return false;
     const int fd = client->socket->get_fd();
     if ((condition & (Glib::IOCondition::IO_ERR | Glib::IOCondition::IO_HUP)) != Glib::IOCondition(0)) { close_client(fd); return false; }
     if ((condition & Glib::IOCondition::IO_IN) != Glib::IOCondition(0)) {
@@ -292,27 +340,32 @@ bool Server::client_ready(const std::shared_ptr<Client>& client, Glib::IOConditi
                 if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                 close_client(fd); return false;
             }
+            if (client->buffered == 0) watch_frame_deadline(client);
+            client->buffered += static_cast<std::size_t>(size);
             client->decoder.feed(std::span(buffer.data(), static_cast<std::size_t>(size)));
             while (true) {
                 auto next = client->decoder.next();
                 if (!next) { close_client(fd); return false; }
                 if (!next->has_value()) break;
+                client->buffered -= (**next).size() + 4;
+                client->frame_deadline.disconnect();
+                if (client->buffered != 0) watch_frame_deadline(client);
                 process(client, **next);
-                const auto active = clients_.find(fd);
-                if (active == clients_.end() || active->second != client) return false;
+                if (client->closing || !still_connected(client)) return false;
             }
         }
     }
     if ((condition & Glib::IOCondition::IO_OUT) != Glib::IOCondition(0)) {
         while (!client->output.empty()) {
             auto& frame = client->output.front();
-            const auto count = send(fd, frame.data() + client->sent, frame.size() - client->sent, MSG_NOSIGNAL);
+            const auto count = send(fd, frame.frame->data() + frame.offset,
+                                    frame.frame->size() - frame.offset, MSG_NOSIGNAL);
             if (count < 0 && errno == EINTR) continue;
             if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
             if (count <= 0) { close_client(fd); return false; }
-            client->sent += static_cast<std::size_t>(count);
+            frame.offset += static_cast<std::size_t>(count);
             client->queued -= static_cast<std::size_t>(count);
-            if (client->sent == frame.size()) { client->output.pop_front(); client->sent = 0; }
+            if (frame.offset == frame.frame->size()) client->output.pop_front();
         }
         if (client->output.empty()) {
             client->writable.disconnect();
@@ -324,7 +377,7 @@ bool Server::client_ready(const std::shared_ptr<Client>& client, Glib::IOConditi
 }
 
 void Server::process(const std::shared_ptr<Client>& client, std::string_view frame) {
-    const auto parsed = protocol::parse_message(frame);
+    auto parsed = protocol::parse_message(frame);
     if (!parsed || !std::holds_alternative<protocol::Request>(*parsed)) {
         auto id = request_id(frame);
         if (id) {
@@ -337,13 +390,14 @@ void Server::process(const std::shared_ptr<Client>& client, std::string_view fra
         } else close_client(client->socket->get_fd());
         return;
     }
+    client->first_request_deadline.disconnect();
     if (client->pending >= max_pending) {
         queue(client, protocol::Response{std::get<protocol::Request>(*parsed).id,
             protocol::ErrorObject{protocol::kBusy, "error.generic_title"}});
         return;
     }
     ++client->pending;
-    auto request = std::get<protocol::Request>(*parsed);
+    auto request = std::get<protocol::Request>(std::move(*parsed));
     std::weak_ptr<Client> weak = client;
     registry_.dispatch(request, {client->id, getuid()}, [this, weak, id = std::move(request.id), method = request.method](auto outcome) {
         if (log_ && std::holds_alternative<protocol::ErrorObject>(outcome)) {
@@ -352,18 +406,28 @@ void Server::process(const std::shared_ptr<Client>& client, std::string_view fra
             } catch (const std::exception&) { std::fputs("braurserd: daemon log write failed\n", stderr); }
         }
         auto current = weak.lock();
-        if (!current || current->pending == 0) return;
+        if (!current || current->closing || current->pending == 0) return;
         const auto active = clients_.find(current->socket->get_fd());
         if (active == clients_.end() || active->second != current) return;
         --current->pending;
         queue(current, protocol::Response{id, std::move(outcome)});
-        if (stopping_ && current->pending == 0 && current->output.empty()) close_client(current->socket->get_fd());
+        if (stopping_ && !current->closing && current->pending == 0 && current->output.empty())
+            close_client(current->socket->get_fd());
     });
 }
 
 void Server::broadcast(const protocol::Notification& notification) {
     if (notification.method == JobQuestionNotificationEvent::wire_name) return;
-    for (const auto& client : connected()) queue(client, notification);
+    const auto clients = connected();
+    try {
+        auto frame = std::make_shared<const std::string>(
+            protocol::encode_frame(protocol::serialize_message(notification)));
+        for (const auto& client : clients) {
+            if (!client->closing) queue_frame(client, frame);
+        }
+    } catch (const std::exception&) {
+        for (const auto& client : clients) defer_close(client);
+    }
 }
 
 void Server::emit_to(ConnectionId connection, const protocol::Notification& notification) {

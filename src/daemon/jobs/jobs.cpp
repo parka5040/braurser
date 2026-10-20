@@ -43,6 +43,7 @@ bool same(const Snapshot& a, const Snapshot& b) {
     left.approval_token = right.approval_token = "comparison";
     return a.fingerprint == b.fingerprint && a.targets == b.targets &&
         a.planned_version == b.planned_version && a.helper == b.helper &&
+        a.expected_transaction == b.expected_transaction &&
         nlohmann::json(left) == nlohmann::json(right);
 }
 
@@ -113,22 +114,28 @@ Result<Snapshot> PlanManager::approve(std::string_view id, std::string_view toke
 }
 
 Result<core::ProcessSpec> official_spec(std::string_view kind, const std::vector<std::string>& targets,
-                                         const ElevationOptions& auth) {
+                                         const ElevationOptions& auth, std::string_view transaction) {
     if (auth.method != elevation::Method::Pkexec && auth.method != elevation::Method::SudoAskpass)
         return std::unexpected(failure(protocol::kAuthorizationUnavailable, "auth.unavailable_title"));
     if (auth.ui != "gtk" && auth.ui != "qt") return std::unexpected(failure(protocol::kInvalidParams));
-    if (targets.size() > 512 || (targets.empty() && kind != "update-system"))
+    const bool system = kind == "update-system" || kind == "upgrade-system" || kind == "update-and-install";
+    if (targets.size() > 512 || (targets.empty() && kind != "update-system" && kind != "upgrade-system"))
         return std::unexpected(failure(protocol::kInvalidParams));
+    if (system && (transaction.size() != 64 || !std::ranges::all_of(transaction, [](unsigned char ch) {
+        return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+    }))) return std::unexpected(failure(protocol::kStalePlan));
     std::vector<std::string> args;
     if (kind == "install") args = {"--sync", "--needed", "--noconfirm", "--"};
+    else if (kind == "install-deps") args = {"--sync", "--needed", "--asdeps", "--noconfirm", "--"};
+    else if (kind == "mark-deps") args = {"--database", "--asdeps", "--noconfirm", "--"};
     else if (kind == "update-system" || kind == "upgrade-system") {
         if (!targets.empty()) return std::unexpected(failure(protocol::kInvalidParams));
-        args = {"--sync", "--refresh", "--sysupgrade", "--noconfirm"};
+        args = {"--sync", "--refresh", "--sysupgrade", "--noconfirm", "--braurser-transaction=" + std::string(transaction)};
     } else if (kind == "update-and-install") {
-        args = {"--sync", "--refresh", "--sysupgrade", "--noconfirm", "--needed", "--"};
+        args = {"--sync", "--refresh", "--sysupgrade", "--noconfirm", "--needed", "--braurser-transaction=" + std::string(transaction), "--"};
     } else if (kind == "remove" || kind == "manual-remove") {
         args = {"--remove", "--nosave", "--recursive", "--noconfirm", "--"};
-    } else if (kind == "manual-install" || kind == "manual-upgrade" || kind == "setup-helper") {
+    } else if (kind == "manual-install" || kind == "manual-upgrade" || kind == "setup-helper" || kind == "install-archives") {
         if (targets.size() > 64) return std::unexpected(failure(protocol::kInvalidParams));
         args = {"--upgrade", "--noconfirm", "--"};
     } else return std::unexpected(failure(protocol::kInvalidParams));
@@ -138,7 +145,7 @@ Result<core::ProcessSpec> official_spec(std::string_view kind, const std::vector
                 target.find("..") != std::string::npos || target.find('\0') != std::string::npos)
                 return std::unexpected(failure(protocol::kUntrustedInput));
         } else if (!valid_target(target) ||
-                   (args.front() == "--remove" && target.find('/') != std::string::npos))
+                   ((args.front() == "--remove" || args.front() == "--database") && target.find('/') != std::string::npos))
             return std::unexpected(failure(protocol::kUntrustedInput));
         args.push_back(target);
     }
@@ -183,16 +190,54 @@ void JobRunner::stop() {
     if (manual_worker_.joinable()) manual_worker_.join();
 }
 
+void JobRunner::erase_event(Job& job, std::deque<protocol::JobEvent>::iterator event) {
+    if (event->kind == "job.log") {
+        const auto bytes = event->payload.at("line").get_ref<const std::string&>().size();
+        --job.log_count;
+        job.log_bytes -= bytes;
+        if (job.finished) finished_log_bytes_ -= bytes;
+    }
+    job.events.erase(event);
+}
+
+void JobRunner::trim_logs(Job& job, std::size_t budget) {
+    while (job.log_bytes > budget) {
+        const auto event = std::ranges::find_if(job.events, [](const auto& value) {
+            return value.kind == "job.log";
+        });
+        if (event == job.events.end()) break;
+        erase_event(job, event);
+    }
+}
+
+void JobRunner::trim_finished_logs() {
+    constexpr std::size_t budget = 16 * 1024 * 1024;
+    for (const auto& id : finished_) {
+        if (finished_log_bytes_ <= budget) break;
+        const auto it = jobs_.find(id);
+        if (it == jobs_.end()) continue;
+        auto& job = it->second;
+        const auto excess = finished_log_bytes_ - budget;
+        trim_logs(job, excess >= job.log_bytes ? 0 : job.log_bytes - excess);
+    }
+}
+
 void JobRunner::add_event(Job& job, std::string_view kind, nlohmann::json payload) {
     protocol::JobEvent event{++job.next_sequence, std::string(kind), std::move(payload)};
     job.events.push_back(event);
-    if (kind == "job.log") ++job.log_count;
-    while (job.log_count > 2000 || job.events.size() > 2500) {
-        if (job.events.front().kind == "job.log") --job.log_count;
-        job.events.pop_front();
+    if (kind == "job.log") {
+        ++job.log_count;
+        const auto bytes = event.payload.at("line").get_ref<const std::string&>().size();
+        job.log_bytes += bytes;
+        if (job.finished) finished_log_bytes_ += bytes;
     }
+    while (job.log_count > 2000 || job.events.size() > 2500) erase_event(job, job.events.begin());
+    trim_logs(job, 256 * 1024);
+    trim_finished_logs();
     if (notify_) {
-        try { notify_(job.id, event, job.owner); }
+        const auto id = job.id;
+        const auto owner = job.owner;
+        try { notify_(id, event, owner); }
         catch (const std::exception&) {}
     }
 }
@@ -217,6 +262,7 @@ Result<protocol::JobIdResult> JobRunner::enqueue(std::string_view id, std::strin
         return std::unexpected(failure(protocol::kUnsafeTransaction));
     auto job_id = random_token();
     Job job;
+    job.enqueuing = true;
     job.id = job_id;
     job.owner = owner;
     job.snapshot = std::move(*approved);
@@ -232,10 +278,16 @@ Result<protocol::JobIdResult> JobRunner::enqueue(std::string_view id, std::strin
             ask(job_id, std::move(choice), {"ack"});
         } catch (const std::exception&) {}
         if (!queued.question) {
+            queued.enqueuing = false;
             transition(queued, "failed");
             finish_job(queued);
             return std::unexpected(failure(protocol::kUnsafeTransaction));
         }
+    }
+    queued.enqueuing = false;
+    if (queued.orphaned) {
+        finish_job(queued);
+        return protocol::JobIdResult{job_id};
     }
     pending_.push_back(job_id);
     pump();
@@ -246,8 +298,9 @@ void JobRunner::line(Job& job, std::string_view text) {
     const auto cleaned = safe_line(text);
     if (cleaned.empty()) return;
     add_event(job, "job.log", protocol::JobLogNotification{job.id, job.next_sequence + 1, cleaned});
-    if (cleaned.find(":: Processing package changes") != std::string::npos ||
-        cleaned.find("checking for file conflicts") != std::string::npos) job.commit = true;
+    if (job.snapshot.aur_pins.empty() && job.pipeline.steps.size() <= 1 &&
+        (cleaned.find(":: Processing package changes") != std::string::npos ||
+         cleaned.find("checking for file conflicts") != std::string::npos)) job.commit = true;
     std::string phase;
     if (cleaned.find(":: Running post-transaction hooks") != std::string::npos) phase = "finishing";
     else if (cleaned.find(":: Retrieving packages") != std::string::npos ||
@@ -255,7 +308,8 @@ void JobRunner::line(Job& job, std::string_view text) {
     else if (cleaned.find("==> Making package") != std::string::npos) phase = "building";
     else if (cleaned.find("removing ") != std::string::npos) phase = "removing";
     else if (job.commit) phase = "installing";
-    if (classify_ && job.snapshot.helper != "auto") {
+    if (cleaned.find("unknown public key") != std::string::npos) job.missing_key = true;
+    if (classify_ && (job.snapshot.helper != "auto" || !job.snapshot.aur_pins.empty())) {
         try {
             if (const auto event = classify_(cleaned)) {
                 switch (*event) {
@@ -291,16 +345,38 @@ void JobRunner::complete(Job& job, const core::ProcessResult& result) {
         job.id, job.next_sequence + 1, {"failed"}});
     const bool exited_clean = result.exit_code == 0 && !result.signaled && !result.timed_out &&
                               !result.out_truncated && !result.err_truncated && !job.interrupted &&
-                              !job.unexpected_prompt && !auth_failed;
+                              !job.unexpected_prompt && !job.missing_key && !auth_failed;
     bool success = exited_clean;
-    if (success) {
+    const bool multi_step = !job.snapshot.aur_pins.empty() || job.pipeline.steps.size() > 1;
+    if (exited_clean && job.privileged) job.mutated = true;
+    if (multi_step) job.commit = false;
+    bool between_steps = false;
+    if (success && job.step + 1 < job.pipeline.steps.size()) {
+        ++job.step;
+        process_.reset();
+        if (start_step(job)) return;
+        between_steps = true;
+        success = false;
+    } else if (success) {
         try {
             success = (!verify_ || verify_(job.snapshot)) && (!success_ || success_(job.snapshot));
         } catch (const std::exception&) { success = false; }
     }
-    const bool uncertain_cancel = job.interrupted && (job.commit || result.exit_code == 0 ||
-        result.out_truncated || result.err_truncated || result.timed_out);
-    transition(job, job.unexpected_prompt || uncertain_cancel ? "needs-attention" :
+    const auto& kind = job.snapshot.plan.kind.value;
+    const bool stale = result.exit_code == 75 && !result.signaled &&
+        (kind == "update-system" || kind == "upgrade-system" || kind == "update-and-install");
+    if (stale) {
+        job.error = failure(protocol::kStalePlan, "job.updates_changed");
+        line(job, "Updates changed since you reviewed them. Check for updates and review again.");
+    }
+    if (job.missing_key) {
+        job.error = failure(protocol::kUnsafeTransaction, "job.unknown_public_key");
+        line(job, "This package's sources are signed with a key you haven't imported");
+    }
+    const bool uncertain_cancel = job.interrupted && (job.mutated || job.commit ||
+        (!multi_step && ((result.exit_code == 0 && !between_steps) ||
+                        result.out_truncated || result.err_truncated || result.timed_out)));
+    transition(job, stale || job.unexpected_prompt || uncertain_cancel ? "needs-attention" :
                     job.interrupted ? "cancelled" : success ? "succeeded" : "failed");
     finish_job(job);
     active_.clear();
@@ -309,108 +385,166 @@ void JobRunner::complete(Job& job, const core::ProcessResult& result) {
 }
 
 void JobRunner::finish_job(Job& job) {
-    finished_.push_back(job.id);
+    if (!job.finished) {
+        job.finished = true;
+        if (job.pipeline.finish) {
+            auto cleaned = [&]() -> Result<void> {
+                try { return job.pipeline.finish(job.state == "succeeded"); }
+                catch (const std::exception&) { return std::unexpected(failure(protocol::kUntrustedInput)); }
+            }();
+            if (!cleaned) {
+                if (!job.error) job.error = cleaned.error();
+                if (job.state == "succeeded") transition(job, "needs-attention");
+            }
+        }
+        finished_log_bytes_ += job.log_bytes;
+        finished_.push_back(job.id);
+    }
+    trim_logs(job, 256 * 1024);
+    trim_finished_logs();
     while (finished_.size() > 50) {
-        jobs_.erase(finished_.front());
-        finished_.pop_front();
+        const auto oldest = std::ranges::find_if(finished_, [&](const auto& id) {
+            const auto it = jobs_.find(id);
+            return id != job.id && id != active_ &&
+                std::ranges::find(pending_, id) == pending_.end() &&
+                (it == jobs_.end() || !it->second.enqueuing);
+        });
+        if (oldest == finished_.end()) break;
+        const auto it = jobs_.find(*oldest);
+        if (it != jobs_.end()) {
+            finished_log_bytes_ -= it->second.log_bytes;
+            jobs_.erase(it);
+        }
+        finished_.erase(oldest);
     }
     persist();
 }
 
 void JobRunner::pump() {
-    if (stopping_ || !active_.empty()) return;
-    while (!pending_.empty()) {
-        const auto id = pending_.front();
-        auto& job = jobs_.at(id);
-        if (job.question) {
-            if (now_() < job.question_expires) return;
+    if (pumping_) {
+        pump_again_ = true;
+        return;
+    }
+    pumping_ = true;
+    struct Reset {
+        bool& pumping;
+        ~Reset() { pumping = false; }
+    } reset{pumping_};
+    do {
+        pump_again_ = false;
+        if (stopping_ || !active_.empty()) return;
+        while (!pending_.empty()) {
+            if (stopping_ || !active_.empty()) return;
+            const auto id = pending_.front();
+            auto& job = jobs_.at(id);
+            if (job.question) {
+                if (now_() < job.question_expires) return;
+                pending_.pop_front();
+                job.question.reset();
+                job.choices.clear();
+                transition(job, "cancelled");
+                finish_job(job);
+                continue;
+            }
             pending_.pop_front();
-            job.question.reset();
-            job.choices.clear();
-            transition(job, "cancelled");
-            finish_job(job);
-            continue;
-        }
-        pending_.pop_front();
-        if (job.snapshot.plan.requires_build_review && !job.reviewed) {
-            transition(job, "failed");
-            finish_job(job);
-            continue;
-        }
-        if (!plans_.unchanged(job.snapshot, job.selection)) {
-            transition(job, "needs-attention");
-            finish_job(job);
-            continue;
-        }
-        if ((job.snapshot.plan.kind.value.starts_with("manual-") && job.selection.scope) ||
-            job.snapshot.plan.kind.value == "setup-helper") {
-            if (!manual_installer_) {
+            if (job.snapshot.plan.requires_build_review && !job.reviewed) {
                 transition(job, "failed");
                 finish_job(job);
                 continue;
             }
-            if (manual_worker_.joinable()) manual_worker_.join();
-            active_ = id;
-            job.commit = true;
-            transition(job, "running");
-            try {
-                manual_worker_ = std::jthread([this, installer = manual_installer_, snapshot = job.snapshot,
-                                                id, lifetime = std::weak_ptr<int>(lifetime_)] {
-                    core::ProcessResult result;
-                    try { result.exit_code = installer->run(snapshot, id) ? 0 : 1; }
-                    catch (const std::exception&) { result.exit_code = 1; }
-                    Glib::MainContext::get_default()->invoke([this, id, result, lifetime] {
-                        if (lifetime.expired()) return false;
-                        if (auto it = jobs_.find(id); it != jobs_.end() && active_ == id)
-                            complete(it->second, result);
-                        return false;
+            if (!plans_.unchanged(job.snapshot, job.selection)) {
+                transition(job, "needs-attention");
+                finish_job(job);
+                continue;
+            }
+            if ((job.snapshot.plan.kind.value.starts_with("manual-") && job.selection.scope) ||
+                job.snapshot.plan.kind.value == "setup-helper") {
+                if (!manual_installer_) {
+                    transition(job, "failed");
+                    finish_job(job);
+                    continue;
+                }
+                if (manual_worker_.joinable()) manual_worker_.join();
+                active_ = id;
+                job.commit = true;
+                transition(job, "running");
+                try {
+                    manual_worker_ = std::jthread([this, installer = manual_installer_, snapshot = job.snapshot,
+                                                    id, lifetime = std::weak_ptr<int>(lifetime_)] {
+                        core::ProcessResult result;
+                        try { result.exit_code = installer->run(snapshot, id) ? 0 : 1; }
+                        catch (const std::exception&) { result.exit_code = 1; }
+                        Glib::MainContext::get_default()->invoke([this, id, result, lifetime] {
+                            if (lifetime.expired()) return false;
+                            if (auto it = jobs_.find(id); it != jobs_.end() && active_ == id)
+                                complete(it->second, result);
+                            return false;
+                        });
                     });
-                });
-            } catch (const std::exception&) {
-                active_.clear();
+                } catch (const std::exception&) {
+                    active_.clear();
+                    transition(job, "failed");
+                    finish_job(job);
+                    continue;
+                }
+                return;
+            }
+            auto pipeline = [&]() -> Result<Pipeline> {
+                try {
+                    if (build_spec_) return build_spec_(job.snapshot, id, elevation_);
+                    return Pipeline{{[snapshot = job.snapshot, auth = elevation_] {
+                        return official_spec(snapshot.plan.kind.value, snapshot.targets, auth, snapshot.expected_transaction);
+                    }}};
+                } catch (const std::exception&) {
+                    return std::unexpected(failure(protocol::kUntrustedInput));
+                }
+            }();
+            if (!pipeline || pipeline->steps.empty() || pipeline->steps.size() > 64) {
                 transition(job, "failed");
+                finish_job(job);
+                continue;
+            }
+            job.pipeline = std::move(*pipeline);
+            active_ = id;
+            transition(job, "running");
+            if (!start_step(job)) {
+                process_.reset();
+                active_.clear();
+                transition(job, job.interrupted ? "cancelled" : "failed");
                 finish_job(job);
                 continue;
             }
             return;
         }
-        auto spec = [&]() -> Result<core::ProcessSpec> {
-            try {
-                return build_spec_ ? build_spec_(job.snapshot, id, elevation_) :
-                    official_spec(job.snapshot.plan.kind.value, job.snapshot.targets, elevation_);
-            } catch (const std::exception&) {
-                return std::unexpected(failure(protocol::kUntrustedInput));
-            }
-        }();
+    } while (pump_again_);
+}
+
+bool JobRunner::start_step(Job& job) {
+    if (stopping_ || job.interrupted || job.step >= job.pipeline.steps.size()) return false;
+    try {
+        auto spec = job.pipeline.steps[job.step]();
         if (!spec) {
-            transition(job, "failed");
-            finish_job(job);
-            continue;
+            job.error = spec.error();
+            return false;
         }
-        std::unique_ptr<StreamingProcess> process;
-        try { process = factory_(); }
-        catch (const std::exception&) {}
-        if (!process) {
-            transition(job, "failed");
-            finish_job(job);
-            continue;
-        }
+        if (job.interrupted || stopping_) return false;
+        auto process = factory_();
+        if (!process) return false;
+        job.auth_marker.clear();
         for (const auto& [key, value] : spec->env)
             if (key == "BRAURSER_JOB_DIR") job.auth_marker = std::filesystem::path(value) / "auth-failed";
-        active_ = id;
+        const auto id = job.id;
+        const bool privileged = (spec->executable == "/usr/bin/pkexec" || spec->executable == "/usr/bin/sudo") &&
+            std::ranges::any_of(spec->args, [](const auto& argument) {
+                return std::filesystem::path(argument).filename() == "braurser-pacman-helper";
+            });
         process_ = std::move(process);
-        transition(job, "running");
-        if (!process_->start(*spec,
+        job.privileged = privileged;
+        if (!job.snapshot.aur_pins.empty() || job.pipeline.steps.size() > 1) job.commit = privileged;
+        return process_->start(*spec,
             [this, id](std::string_view text) { if (auto it = jobs_.find(id); it != jobs_.end()) line(it->second, text); },
-            [this, id](const core::ProcessResult& result) { if (auto it = jobs_.find(id); it != jobs_.end()) complete(it->second, result); })) {
-            process_.reset();
-            active_.clear();
-            transition(job, "failed");
-            finish_job(job);
-            continue;
-        }
-        return;
-    }
+            [this, id](const core::ProcessResult& result) { if (auto it = jobs_.find(id); it != jobs_.end()) complete(it->second, result); });
+    } catch (const std::exception&) { return false; }
 }
 
 Result<protocol::JobsCancelResult> JobRunner::cancel(std::string_view id, api::ConnectionId owner) {
@@ -449,6 +583,8 @@ Result<protocol::JobsGetResult> JobRunner::get(const protocol::JobsGetParams& pa
     result.plan = it->second.snapshot.plan;
     result.plan->approval_token = "redacted";
     result.progress = it->second.progress;
+    if (it->second.error) result.error = nlohmann::json{{"code", it->second.error->code},
+        {"message_key", it->second.error->message_key}, {"args", it->second.error->args}};
     std::uint64_t after{};
     if (params.eventsCursor) {
         const auto& text = *params.eventsCursor;
@@ -493,8 +629,13 @@ void JobRunner::ask(std::string_view id, protocol::QuestionChoice choice, std::v
             std::chrono::system_clock::now() + std::chrono::minutes(10))), std::move(choice)};
     job.choices = std::move(choices);
     job.question_expires = now_() + std::chrono::minutes(10);
+    const auto job_id = job.id;
     transition(job, "needs-attention");
-    add_event(job, "job.question", protocol::JobQuestionNotification{job.id, job.next_sequence + 1, *job.question});
+    const auto current = jobs_.find(job_id);
+    if (current == jobs_.end() || current->second.orphaned || !current->second.question) return;
+    auto& questioned = current->second;
+    add_event(questioned, "job.question", protocol::JobQuestionNotification{
+        questioned.id, questioned.next_sequence + 1, *questioned.question});
 }
 
 Result<protocol::AcceptedResult> JobRunner::answer(const protocol::JobsAnswerParams& params, api::ConnectionId owner) {
@@ -509,17 +650,25 @@ Result<protocol::AcceptedResult> JobRunner::answer(const protocol::JobsAnswerPar
     if (std::holds_alternative<protocol::BuildReviewQuestion>(job.question->choice.value)) job.reviewed = true;
     job.question.reset();
     job.choices.clear();
+    const auto job_id = job.id;
     transition(job, "queued");
+    it = jobs_.find(job_id);
+    if (it == jobs_.end() || it->second.orphaned || it->second.finished)
+        return std::unexpected(failure(protocol::kExpiredQuestion));
     pump();
     return protocol::AcceptedResult{true};
 }
 
 void JobRunner::disconnect(api::ConnectionId owner) {
-    for (auto& [id, job] : jobs_) {
-        if (job.owner != owner || !job.question || job.orphaned) continue;
-        job.orphaned = true;
+    std::vector<std::string> ids;
+    for (const auto& [id, job] : jobs_)
+        if (job.owner == owner && job.question && !job.orphaned) ids.push_back(id);
+    for (const auto& id : ids) {
+        const auto it = jobs_.find(id);
+        if (it == jobs_.end() || it->second.orphaned) continue;
+        it->second.orphaned = true;
         std::erase(pending_, id);
-        finish_job(job);
+        finish_job(it->second);
     }
     pump();
 }

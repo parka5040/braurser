@@ -202,6 +202,24 @@ TEST(QtKitDocument, BoundsLinksAndCodeCopy) {
     EXPECT_EQ(view.plain_text(), "<b>literal & code</b>");
 }
 
+TEST(QtKitDocument, ManyBlocksUseOneBrowserAndPreserveBlockFormatting) {
+    std::vector<kit::DocumentBlock> blocks(256);
+    for (auto& block : blocks) { block.kind = kit::BlockKind::Paragraph; block.runs = {{"literal <b>text</b>", false, false, false, {}}}; }
+    blocks.front() = {kit::BlockKind::Heading, 2, "Heading", {}, {}};
+    blocks[1] = {kit::BlockKind::List, 1, {}, {}, {{{"First", false, false, false, {}}}, {{"Second", false, false, false, {}}}}};
+    blocks[2] = {kit::BlockKind::Code, 1, "sample code", {}, {}};
+    kit::DocumentView view(blocks, "Copy code");
+    const auto browsers = view.findChildren<QTextBrowser*>();
+    ASSERT_EQ(browsers.size(), 1);
+    EXPECT_EQ(browsers.front()->document()->begin().blockFormat().headingLevel(), 2);
+    EXPECT_GT(browsers.front()->heightForWidth(480), 4000);
+    EXPECT_EQ(view.plain_text().count("literal <b>text</b>"), 253);
+    EXPECT_TRUE(view.plain_text().contains("First\nSecond"));
+    EXPECT_TRUE(view.plain_text().contains("sample code"));
+    EXPECT_EQ(view.findChildren<QPushButton*>().size(), 1);
+    EXPECT_FALSE(browsers.front()->document()->resource(QTextDocument::ImageResource, QUrl("https://example.org/image.png")).isValid());
+}
+
 TEST(QtKitPassword, ClearRemovesTextUndoAndRevealWithoutEmittingSecret) {
     kit::PasswordField password("Password for alex", "Caps Lock is on.");
     EXPECT_EQ(password.entry().echoMode(), QLineEdit::Password);
@@ -250,7 +268,8 @@ TEST(QtKitNavigation, SelectAndActivateAreExclusiveAndAccessible) {
 TEST(QtKitCode, AcceptsLargeReviewTextAndShowsHiddenFormatting) {
     const std::string large(200 * 1024, 'x');
     EXPECT_EQ(kit::safe_code(large), QString::fromStdString(large));
-    EXPECT_THROW(kit::safe_code(std::string(262145, 'x')), std::length_error);
+    EXPECT_EQ(kit::safe_code(std::string(448 * 1024, 'y')).size(), 448 * 1024);
+    EXPECT_THROW(kit::safe_code(std::string(448 * 1024 + 1, 'x')), std::length_error);
     EXPECT_EQ(kit::safe_code("a\u202Eb\u2066c\u2069d\u200Be\uFEFFf\u061Cg"),
               QString::fromUtf8("a\uFFFDb\uFFFDc\uFFFDd\uFFFDe\uFFFDf\uFFFDg"));
     EXPECT_EQ(kit::safe_code(std::string("x\0y\x1b", 4)), QString::fromUtf8("x\uFFFDy\uFFFD"));

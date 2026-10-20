@@ -1,10 +1,11 @@
 #include <braurser/daemon/updates/updates.hpp>
-#include <braurser/daemon/core/files.hpp>
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
 #include <charconv>
-#include <climits>
-#include <cstdlib>
+#include <cstdint>
+#include <fcntl.h>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -12,7 +13,42 @@
 
 namespace braurser::daemon::updates {
 namespace {
+class Fd {
+public:
+    explicit Fd(int value) : value_(value) {}
+    ~Fd() { if (value_ >= 0) close(value_); }
+    Fd(const Fd&) = delete;
+    Fd& operator=(const Fd&) = delete;
+    Fd(Fd&& other) noexcept : value_(std::exchange(other.value_, -1)) {}
+    Fd& operator=(Fd&& other) noexcept {
+        if (this != &other) { if (value_ >= 0) close(value_); value_ = std::exchange(other.value_, -1); }
+        return *this;
+    }
+    int get() const { return value_; }
+private:
+    int value_;
+};
 struct Identity { uid_t uid{}; int parent{}; };
+struct ProcessStat {
+    int parent{};
+    int session{};
+    int tty{};
+    std::uint64_t start{};
+    friend bool operator==(const ProcessStat&, const ProcessStat&) = default;
+};
+std::optional<std::string> read_at(int dir, const char* name, std::size_t limit) {
+    const Fd fd(openat(dir, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK));
+    if (fd.get() < 0) return {};
+    std::string result;
+    std::array<char, 8192> buffer{};
+    while (true) {
+        const auto amount = read(fd.get(), buffer.data(), buffer.size());
+        if (amount < 0 && errno == EINTR) continue;
+        if (amount < 0 || static_cast<std::size_t>(amount) > limit - result.size()) return {};
+        if (amount == 0) return result;
+        result.append(buffer.data(), static_cast<std::size_t>(amount));
+    }
+}
 std::optional<int> number(std::string_view value) {
     int result = 0;
     const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), result);
@@ -50,14 +86,25 @@ bool has_session_id(std::string_view env) {
     }
     return false;
 }
-std::optional<std::pair<int, int>> stat_session(std::string_view stat) {
+std::optional<ProcessStat> process_stat(std::string_view stat) {
     const auto end = stat.rfind(") ");
     if (end == stat.npos || end + 2 >= stat.size()) return {};
     std::istringstream fields(std::string(stat.substr(end + 2)));
     char state{};
-    int ppid{}, pgrp{}, session{}, tty{};
-    if (!(fields >> state >> ppid >> pgrp >> session >> tty)) return {};
-    return std::pair{session, tty};
+    int group{};
+    ProcessStat result;
+    if (!(fields >> state >> result.parent >> group >> result.session >> result.tty)) return {};
+    std::string ignored;
+    for (unsigned field = 8; field < 22; ++field) if (!(fields >> ignored)) return {};
+    std::string start;
+    if (!(fields >> start)) return {};
+    const auto [last, error] = std::from_chars(start.data(), start.data() + start.size(), result.start);
+    if (error != std::errc{} || last != start.data() + start.size() || result.parent < 0) return {};
+    return result;
+}
+std::optional<ProcessStat> stat_at(int dir) {
+    const auto text = read_at(dir, "stat", 4096);
+    return text ? process_stat(*text) : std::nullopt;
 }
 std::string normalize(std::string_view path) {
     if (path.ends_with(" (deleted)")) path.remove_suffix(10);
@@ -89,6 +136,32 @@ std::set<std::string> mapped_files(std::string_view maps) {
     }
     return result;
 }
+std::optional<bool> is_service(int dir, int pid, const ProcessStat& initial,
+    const std::filesystem::path& root) {
+    int cursor = pid;
+    Fd current(fcntl(dir, F_DUPFD_CLOEXEC, 0));
+    if (current.get() < 0) return {};
+    std::set<int> visited;
+    for (unsigned depth = 0; depth < 64; ++depth) {
+        if (!visited.insert(cursor).second) return {};
+        const auto before = stat_at(current.get());
+        const auto status = read_at(current.get(), "status", 64 * 1024);
+        const auto owner = status ? identity(*status) : std::nullopt;
+        const auto env = read_at(current.get(), "environ", 64 * 1024);
+        const auto after = stat_at(current.get());
+        if (!before || !owner || !env || !after || *before != *after ||
+            owner->parent != before->parent || (cursor == pid && *before != initial)) return {};
+        if ((before->session == cursor && before->tty != 0) || has_session_id(*env)) return false;
+        if (cursor == 1 || before->parent == 1) return true;
+        if (before->parent <= 0) return {};
+        cursor = before->parent;
+        Fd ancestor(open((root / std::to_string(cursor)).c_str(),
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+        if (ancestor.get() < 0) return {};
+        current = std::move(ancestor);
+    }
+    return {};
+}
 }
 RunningConsumerScanner::RunningConsumerScanner(std::filesystem::path proc_root) : proc_root_(std::move(proc_root)) {}
 ConsumerScan RunningConsumerScanner::scan() const {
@@ -98,23 +171,33 @@ ConsumerScan RunningConsumerScanner::scan() const {
     std::filesystem::directory_iterator entries(proc_root_, ec);
     if (ec) { report.coverage_complete = false; ++report.unreadable_processes; return report; }
     std::size_t count = 0;
+    std::size_t associations = 0;
     for (const auto end = std::filesystem::directory_iterator{}; entries != end; entries.increment(ec)) {
         if (ec) break;
         const auto pid = number(entries->path().filename().string());
         if (!pid || *pid == 0) continue;
-        if (++count > 100000) { ++report.unreadable_processes; report.coverage_complete = false; break; }
-        const auto dir = proc_root_ / std::to_string(*pid);
-        auto status = core::read_bounded(dir / "status", 64 * 1024);
-        if (!status) { ++report.unreadable_processes; continue; }
-        auto owner = identity(*status);
-        if (!owner) { ++report.unreadable_processes; continue; }
-        if (owner->uid != getuid()) continue;
-        auto comm = core::read_bounded(dir / "comm", 256);
-        auto maps = core::read_bounded(dir / "maps", 4 * 1024 * 1024);
-        std::error_code link_error;
-        auto exe = std::filesystem::read_symlink(dir / "exe", link_error);
-        if (!comm || !maps || link_error || comm->empty() || comm->size() > 256 ||
-            !comm->ends_with('\n') || normalize(exe.string()).empty()) {
+        if (++count > 100000) { ++report.unreadable_processes; break; }
+        const Fd dir(open((proc_root_ / std::to_string(*pid)).c_str(),
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+        const auto before = stat_at(dir.get());
+        auto status = read_at(dir.get(), "status", 64 * 1024);
+        auto owner = status ? identity(*status) : std::nullopt;
+        if (dir.get() < 0 || !before || !owner || before->parent != owner->parent) {
+            ++report.unreadable_processes;
+            continue;
+        }
+        if (owner->uid != getuid()) {
+            const auto after = stat_at(dir.get());
+            if (!after || *before != *after) ++report.unreadable_processes;
+            continue;
+        }
+        auto comm = read_at(dir.get(), "comm", 256);
+        auto maps = read_at(dir.get(), "maps", 4 * 1024 * 1024);
+        std::array<char, 4097> link{};
+        const auto length = readlinkat(dir.get(), "exe", link.data(), link.size());
+        const auto exe = length > 0 && length < static_cast<ssize_t>(link.size()) ?
+            normalize(std::string_view(link.data(), static_cast<std::size_t>(length))) : std::string{};
+        if (!comm || !maps || comm->empty() || !comm->ends_with('\n') || exe.empty()) {
             ++report.unreadable_processes;
             continue;
         }
@@ -125,40 +208,21 @@ ConsumerScan RunningConsumerScanner::scan() const {
             ++report.unreadable_processes;
             continue;
         }
-        bool session_app = false;
-        bool reached_init = false;
-        bool parent_unreadable = false;
-        int cursor = *pid;
-        int parent = owner->parent;
-        std::set<int> visited;
-        for (unsigned depth = 0; depth < 64; ++depth) {
-            if (cursor == 1) { reached_init = true; break; }
-            if (parent <= 0 || !visited.insert(cursor).second) { parent_unreadable = true; break; }
-            const auto parent_dir = proc_root_ / std::to_string(cursor);
-            auto stat = core::read_bounded(parent_dir / "stat", 4096);
-            auto env = core::read_bounded(parent_dir / "environ", 64 * 1024);
-            if (!stat || !env) { parent_unreadable = true; break; }
-            auto session = stat_session(*stat);
-            if (!session) { parent_unreadable = true; break; }
-            if ((session->first == cursor && session->second != 0) || has_session_id(*env)) {
-                session_app = true;
-                break;
-            }
-            if (parent == 1) { reached_init = true; break; }
-            cursor = parent;
-            auto ancestor = core::read_bounded(proc_root_ / std::to_string(cursor) / "status", 64 * 1024);
-            if (!ancestor) { parent_unreadable = true; break; }
-            auto parsed = identity(*ancestor);
-            if (!parsed) { parent_unreadable = true; break; }
-            parent = parsed->parent;
+        const auto service = is_service(dir.get(), *pid, *before, proc_root_);
+        const auto after = stat_at(dir.get());
+        if (!service || !after || *before != *after) {
+            ++report.unreadable_processes;
+            continue;
         }
-        if (!reached_init && !session_app) parent_unreadable = true;
-        if (parent_unreadable) ++report.unreadable_processes;
-        const bool service = reached_init && !session_app && !parent_unreadable;
-        RunningConsumer consumer{*pid, *comm, service};
         auto paths = mapped_files(*maps);
-        paths.insert(normalize(exe.string()));
-        for (const auto& path : paths) if (!path.empty()) report.files[path].insert(consumer);
+        paths.insert(exe);
+        bool exhausted = false;
+        for (const auto& path : paths) {
+            if (associations >= kMaxConsumerAssociations) { exhausted = true; break; }
+            ++associations;
+            report.files[path].service |= *service;
+        }
+        if (exhausted) { ++report.unreadable_processes; break; }
     }
     if (ec) ++report.unreadable_processes;
     report.coverage_complete = report.unreadable_processes == 0;

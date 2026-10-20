@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
+#include <vector>
 
 namespace braurser::daemon::core {
 
@@ -41,6 +42,20 @@ std::expected<void, FileError> atomic_write(const std::filesystem::path& path,
 /// err: symlinks are rejected unless explicitly permitted.
 std::expected<std::string, FileError> read_bounded(const std::filesystem::path& path,
                                                      std::size_t max_bytes, bool follow_symlinks = false);
+
+struct FileEntry {
+    std::filesystem::path name;
+    struct stat info{};
+};
+
+/// in: root is an absolute directory; max_entries bounds regular file results.
+/// out: lists regular files with no symbolic directory traversal.
+std::expected<std::vector<FileEntry>, FileError> list_regular_files(
+    const std::filesystem::path& root, std::size_t max_entries);
+
+/// in: path names an existing regular file without symbolic components.
+/// out: updates its modification time to mark a cache access.
+std::expected<void, FileError> touch_file(const std::filesystem::path& path);
 
 /// in: sub lies strictly beneath root without parent traversal.
 /// out: removes the sub-tree without following symlinks.

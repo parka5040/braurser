@@ -65,7 +65,7 @@ RestartReport RestartAdvisor::advise(const std::vector<PackageUpdate>& updates,
             const auto it = consumers.files.find(path);
             if (it == consumers.files.end()) continue;
             change.has_running_consumer = true;
-            change.consumer_is_service |= std::ranges::any_of(it->second, &RunningConsumer::service);
+            change.consumer_is_service |= it->second.service;
         }
         report.packages.push_back(domain::classify(change, rules));
     }

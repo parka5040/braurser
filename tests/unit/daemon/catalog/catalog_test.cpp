@@ -91,7 +91,8 @@ public:
     std::vector<core::ProcessSpec> specs;
     std::expected<core::ProcessResult, core::ProcessError> run(const core::ProcessSpec& spec) override {
         specs.push_back(spec);
-        std::ofstream file(spec.args.at(1), std::ios::binary);
+        EXPECT_EQ(core::read_bounded(spec.args.at(5), 2 * 1024 * 1024).value_or(""), "JXL");
+        std::ofstream file(spec.args.back(), std::ios::binary);
         file.write(png_bytes.data(), static_cast<std::streamsize>(png_bytes.size()));
         core::ProcessResult result;
         result.exit_code = 0;
@@ -182,6 +183,60 @@ TEST(CatalogSource, SyncArchivesGeneratedInAllSupportedFormats) {
     EXPECT_FALSE(SyncDbReader{}.read_bytes(std::as_bytes(std::span(invalid)), "custom"));
 }
 
+TEST(CatalogSource, SyncSinkCountsAndPerKeyValueBound) {
+    std::string desc = "%NAME%\nvalid\n\n%VERSION%\n1\n\n%PROVIDES%\n";
+    for (int i = 0; i < 20000; ++i) desc += "a\n";
+    auto parsed = parse_repo_desc(desc, "core");
+    ASSERT_TRUE(parsed);
+    EXPECT_EQ(parsed->provides.size(), 20000);
+    desc += "\n%PROVIDES%\nb\n";
+    EXPECT_FALSE(parse_repo_desc(desc, "core"));
+    auto bytes = archive_bytes(ARCHIVE_FILTER_GZIP, desc);
+    std::size_t emitted = 0;
+    auto rejected = SyncDbReader{}.read_bytes(std::as_bytes(std::span(bytes)), "core", [&](RepoPackage&&) { ++emitted; });
+    ASSERT_TRUE(rejected);
+    EXPECT_EQ(rejected->packages, 0);
+    EXPECT_EQ(rejected->rejected, 1);
+    EXPECT_EQ(emitted, 0);
+    bytes = archive_bytes(ARCHIVE_FILTER_GZIP);
+    auto valid = SyncDbReader{}.read_bytes(std::as_bytes(std::span(bytes)), "core", [&](RepoPackage&& package) {
+        EXPECT_EQ(package.name, "fixture-app");
+        ++emitted;
+    });
+    ASSERT_TRUE(valid);
+    EXPECT_EQ(valid->packages, 1);
+    EXPECT_EQ(emitted, 1);
+}
+
+TEST(CatalogSource, AurSinkEmitsBeforeFailureAndRejectsOversizedRecords) {
+    const std::string good = R"({"Name":"streamed","Version":"1","PackageBase":"streamed"})";
+    std::size_t emitted = 0;
+    auto zipped = gzip("[" + good + ",{broken]");
+    EXPECT_FALSE(AurDump{}.parse(std::as_bytes(std::span(zipped)), [&](AurPackage&& package) {
+        EXPECT_EQ(package.name, "streamed");
+        ++emitted;
+    }));
+    EXPECT_EQ(emitted, 1);
+    std::string many = "[" + good.substr(0, good.size() - 1) + R"(,"Unknown":[)";
+    for (int i = 0; i < 20001; ++i) many += i == 0 ? "0" : ",0";
+    many += "]}]";
+    zipped = gzip(many);
+    EXPECT_FALSE(AurDump{}.parse(std::as_bytes(std::span(zipped)), [](AurPackage&&) {}));
+    std::string large = "[" + good.substr(0, good.size() - 1) + R"(,"Unknown":[)";
+    for (int i = 0; i < 17; ++i) {
+        if (i) large += ',';
+        large += '"'; large += std::string(65536, 'x'); large += '"';
+    }
+    large += "]}]";
+    zipped = gzip(large);
+    EXPECT_FALSE(AurDump{}.parse(std::as_bytes(std::span(zipped)), [](AurPackage&&) {}));
+    zipped = gzip("[" + good + R"(,{"Name":"bad/name","Version":"1"})" + "]");
+    auto counted = AurDump{}.parse(std::as_bytes(std::span(zipped)), [](AurPackage&&) {});
+    ASSERT_TRUE(counted);
+    EXPECT_EQ(counted->packages, 1);
+    EXPECT_EQ(counted->rejected, 1);
+}
+
 TEST(CatalogSource, AurSaxStreamingAndRpcBudget) {
     auto zipped = gzip(fixture("aur.json"));
     auto packages = AurDump{}.parse(std::as_bytes(std::span(zipped)));
@@ -242,6 +297,32 @@ TEST(CatalogSource, AppStreamRejectsEntitiesAndReadsMetadata) {
         EXPECT_EQ(metadata->front().description_paragraphs, (std::vector<std::string>{"First paragraph.", "• First bullet"}));
         ASSERT_EQ(metadata->front().screenshots.size(), 1);
     }
+}
+
+TEST(CatalogSource, AppStreamSelectsOneDescriptionLanguageAndBoundsComponents) {
+    TempDir temp;
+    const char* saved = std::getenv("LANG");
+    const std::optional<std::string> previous = saved ? std::optional<std::string>(saved) : std::nullopt;
+    ASSERT_EQ(setenv("LANG", "fr_FR.UTF-8", 1), 0);
+    const auto output = temp.path / "languages.xml.gz";
+    const std::string component = R"(<component type="desktop-application"><id>org.example.app</id><pkgname>example</pkgname><description><p xml:lang="de">Discard</p><p xml:lang="fr_FR">Fallback</p><p>Default <em>text</em></p><p xml:lang="fr_FR">Discard later</p><ul><li>Bullet</li></ul></description></component>)";
+    auto compressed = gzip("<components>" + component + component + "</components>");
+    ASSERT_TRUE(core::atomic_write(output, compressed));
+    std::size_t emitted = 0;
+    auto read = AppStreamReader{}.read_records(output, [&](AppStreamRecord&& record) {
+        EXPECT_EQ(record.metadata.description_paragraphs, (std::vector<std::string>{"Default text", "• Bullet"}));
+        ++emitted;
+    }, 1);
+    EXPECT_FALSE(read);
+    EXPECT_EQ(emitted, 1);
+    compressed = gzip(R"(<components><component type="desktop-application"><id>x</id><pkgname>example</pkgname><description xml:lang="fr"><p/><p>Fallback</p><p xml:lang="de">Discard</p></description></component></components>)");
+    ASSERT_TRUE(core::atomic_write(output, compressed));
+    auto fallback = AppStreamReader{}.read(output);
+    if (previous) setenv("LANG", previous->c_str(), 1);
+    else unsetenv("LANG");
+    ASSERT_TRUE(fallback);
+    ASSERT_EQ(fallback->size(), 1);
+    EXPECT_EQ(fallback->front().description_paragraphs, (std::vector<std::string>{"Fallback"}));
 }
 
 TEST(CatalogSource, DesktopEntriesAreStrictAndLocalized) {
@@ -307,9 +388,13 @@ TEST(CatalogSource, IconCacheValidatesPngAndRejectsSymlink) {
     auto decoded = IconConverter(decoder).convert(jxl, temp.path);
     ASSERT_TRUE(decoded) << decoded.error().code;
     ASSERT_EQ(decoder.specs.size(), 1);
-    EXPECT_EQ(decoder.specs[0].executable, "/usr/bin/djxl");
+    EXPECT_EQ(decoder.specs[0].executable, "/usr/bin/prlimit");
     EXPECT_TRUE(decoder.specs[0].env.empty());
-    EXPECT_EQ(decoder.specs[0].args.front(), jxl);
+    ASSERT_EQ(decoder.specs[0].args.size(), 7U);
+    EXPECT_EQ((std::vector<std::string>(decoder.specs[0].args.begin(), decoder.specs[0].args.begin() + 5)),
+              (std::vector<std::string>{"--as=536870912", "--fsize=16777216", "--cpu=10", "--", "/usr/bin/djxl"}));
+    EXPECT_NE(decoder.specs[0].args[5], jxl);
+    EXPECT_FALSE(std::filesystem::exists(std::filesystem::path(decoder.specs[0].args[5]).parent_path()));
     image[18] = 2;
     const auto invalid = temp.path / "too-large.png";
     { std::ofstream file(invalid, std::ios::binary); file.write(image.data(), static_cast<std::streamsize>(image.size())); }

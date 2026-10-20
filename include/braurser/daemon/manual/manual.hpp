@@ -3,6 +3,7 @@
 
 #include <braurser/daemon/core/process.hpp>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -34,8 +35,44 @@ struct GitUrl {
 std::expected<GitUrl, ManualError> validate_git_url(std::string_view url);
 
 struct GitReply {
+    class Body {
+    public:
+        static constexpr std::size_t kMaxBytes = 512ULL * 1024 * 1024;
+        static constexpr std::size_t kReadChunk = 64 * 1024;
+        /// out: an empty response without an open descriptor.
+        Body() = default;
+        /// out: closes the anonymous spool descriptor.
+        ~Body();
+        Body(const Body&) = delete;
+        Body& operator=(const Body&) = delete;
+        /// out: transfers ownership of the spool descriptor.
+        Body(Body&& other) noexcept;
+        /// out: closes the previous descriptor and transfers ownership.
+        Body& operator=(Body&& other) noexcept;
+        /// in: cache_root is an absolute XDG cache root; max_bytes may lower the response cap.
+        /// out: an anonymous close-on-exec spool under braurser/manual/spool.
+        /// err: rejects unsafe directories and file creation failures.
+        static std::expected<Body, ManualError> create(
+            const std::filesystem::path& cache_root, std::size_t max_bytes = kMaxBytes);
+        /// in: bytes are the next response chunk.
+        /// out: appends bytes without retaining them in memory.
+        /// err: closes the spool on size-limit or write failure.
+        std::expected<void, ManualError> append(std::string_view bytes);
+        /// in: offset is within the response and buffer is writable.
+        /// out: reads at most kReadChunk bytes; returns zero at EOF or for an empty buffer.
+        /// err: rejects invalid offsets and truncated or unreadable spools.
+        std::expected<std::size_t, ManualError> read(std::span<char> buffer, std::size_t offset) const;
+        /// out: the number of spooled bytes.
+        std::size_t size() const { return size_; }
+        /// out: the borrowed descriptor, or -1 for an empty response.
+        int native_handle() const { return fd_; }
+    private:
+        int fd_{-1};
+        std::size_t size_{};
+        std::size_t limit_{kMaxBytes};
+    };
     long status{};
-    std::string body;
+    Body body;
     std::string location;
 };
 
@@ -46,21 +83,38 @@ public:
     /// out: bounded single-response transfer, without following redirects.
     virtual std::expected<GitReply, ManualError> request(
         std::string_view url, std::string_view body, bool post) = 0;
+    /// in: max_bytes is the remaining aggregate response budget.
+    /// out: a single response within both the per-response and aggregate caps.
+    /// err: rejects responses exceeding either cap.
+    virtual std::expected<GitReply, ManualError> request_bounded(
+        std::string_view url, std::string_view body, bool post, std::size_t max_bytes);
 };
 
 class CurlGitHttp final : public GitHttp {
 public:
+    /// in: cache_root is an absolute XDG cache root, or empty for the environment default.
+    /// out: configures anonymous response spools beneath the manual cache.
+    explicit CurlGitHttp(std::filesystem::path cache_root = {}) : cache_root_(std::move(cache_root)) {}
+    /// in: url is HTTPS and body is bounded smart-HTTP request data.
+    /// out: a bounded anonymous response spool without following redirects.
     std::expected<GitReply, ManualError> request(
         std::string_view url, std::string_view body, bool post) override;
+    /// in: max_bytes is the remaining aggregate response budget.
+    /// out: streams into an anonymous spool bounded by both response caps.
+    /// err: rejects unsafe connections, oversized transfers and spool failures.
+    std::expected<GitReply, ManualError> request_bounded(
+        std::string_view url, std::string_view body, bool post, std::size_t max_bytes) override;
+private:
+    std::filesystem::path cache_root_;
 };
 
 class GuardedGitTransport {
 public:
     explicit GuardedGitTransport(GitHttp& http) : http_(http) {}
     /// in: url is a validated smart-HTTP git repository.
-    /// out: the upload-pack advertisement or response.
+    /// out: an anonymous reader for the upload-pack advertisement or response.
     /// err: returns RedirectRequired when a different validated host redirects.
-    std::expected<std::string, ManualError> exchange(
+    std::expected<GitReply::Body, ManualError> exchange(
         std::string_view url, std::string_view payload = {});
 private:
     GitHttp& http_;
@@ -104,6 +158,39 @@ std::expected<BuildRepository, ManualError> fetch_build_repository(
     GitHttp& http, std::string_view url, const std::filesystem::path& cache_root,
     std::string_view id);
 
+struct BuildFile {
+    std::string path;
+    unsigned mode{};
+    std::uint64_t size{};
+    std::string sha256;
+    std::optional<std::string> text;
+};
+
+struct BuildTree {
+    std::string commit;
+    std::string tree;
+    std::string srcinfo;
+    std::vector<BuildFile> files;
+};
+
+/// in: pkgbase is an AUR package base and cache_root is an absolute private cache.
+/// out: fetches guarded HEAD and retains a bounded complete build-tree pin.
+std::expected<BuildTree, ManualError> fetch_build_tree(
+    GitHttp& http, std::string_view pkgbase, const std::filesystem::path& cache_root);
+
+/// in: bare is a local repository and commit is a full lowercase object ID.
+/// out: reads every bounded build file without network access and retains the commit.
+/// err: build-text-too-large rejects UTF-8 text exceeding 448 KiB.
+std::expected<BuildTree, ManualError> read_build_tree(
+    const std::filesystem::path& bare, std::string_view commit);
+
+/// in: cache_root is absolute; max_age bounds pin age; keep contains live commit IDs.
+/// out: expires old pins and evicts least-recently-used AUR repos above 256 MiB, preserving keep.
+/// err: rejects unsafe cache paths and failed filesystem operations.
+std::expected<void, ManualError> prune_pins(
+    const std::filesystem::path& cache_root, std::chrono::seconds max_age,
+    std::span<const std::string> keep);
+
 /// in: repo is an existing bare repository and revision is a branch, tag or HEAD.
 /// out: a bounded review preview; multiple entry points require explicit selection.
 std::expected<Preview, ManualError> preview_repository(
@@ -130,6 +217,9 @@ std::expected<UpdateCheck, ManualError> check_update(
     std::optional<EntryKind> selected = std::nullopt);
 
 enum class Scope { User, System };
+
+inline constexpr std::size_t kMaxReceiptFiles = 4096;
+inline constexpr std::size_t kMaxReceiptBytes = 512 * 1024;
 
 struct StagedFile {
     std::string path;
@@ -173,6 +263,11 @@ struct Receipt {
     std::vector<std::string> launcher_ids;
     std::string pkgname;
 };
+
+/// in: receipt contains the complete planned installation metadata, files and backups.
+/// out: succeeds only when the serialized receipt fits removal-planning limits.
+/// err: receipt-limit rejects oversized counts or serialized bytes.
+std::expected<void, ManualError> validate_receipt_limits(const Receipt& receipt);
 
 /// in: paths are private absolute roots and receipt identifies an approved stage.
 /// out: copies files into the user prefix and saves an atomic private receipt.
@@ -255,6 +350,7 @@ public:
         const std::set<std::filesystem::path>& owned) const;
     /// in: state is the absolute XDG state root and runner invokes pacman-conf.
     /// out: scans XDG launchers excluding pacman file lists and local receipts.
+    /// err: launcher-coverage-incomplete means the combined ownership-entry budget was exhausted.
     std::expected<std::vector<LauncherEntry>, ManualError> scan_system(
         core::ProcessRunner& runner, const std::filesystem::path& state) const;
 };

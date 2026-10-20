@@ -3,7 +3,10 @@
   "files": [
     {
       "name": "PKGBUILD",
-      "text": "pkgname=sample\n"
+      "text": "pkgname=sample\n",
+      "kind": "text",
+      "size": 15,
+      "sha256": "f2b18ef7dcbe6eeb1b1ef6916ab69ec075effa0e30061de1130537d87511c208"
     }
   ],
   "truncated": false

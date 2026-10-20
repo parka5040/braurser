@@ -77,11 +77,21 @@ trap cleanup EXIT
 work=$(mktemp -d)
 
 check_parents() {
-    local path=$1 parent
+    local path=$1 parent owner mode
     parent=${path%/*}
-    while [[ -n $parent && $parent != / ]]; do
-        [[ ! -L $parent ]] || die "A folder in this path is a link: $parent"
+    [[ -n $parent ]] || parent=/
+    while [[ -n $parent ]]; do
+        if privileged test -L "$parent"; then die "A folder in this path is a link: $parent"; fi
+        if privileged test -e "$parent"; then
+            owner=$(privileged stat -c %u -- "$parent") || die "Could not check a folder in this path: $parent"
+            mode=$(privileged stat -c %a -- "$parent") || die "Could not check a folder in this path: $parent"
+            [[ $owner == 0 ]] || die "A folder in this path is not root-owned: $parent"
+            [[ $mode =~ ^[0-7]{3,4}$ ]] || die "Could not check a folder in this path: $parent"
+            (((8#$mode & 8#22) == 0)) || die "A folder in this path is writable by others: $parent"
+        fi
+        [[ $parent != / ]] || break
         parent=${parent%/*}
+        [[ -n $parent ]] || parent=/
     done
 }
 

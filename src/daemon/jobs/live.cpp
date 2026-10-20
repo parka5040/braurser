@@ -2,6 +2,9 @@
 #include <braurser/daemon/core/text.hpp>
 #include <braurser/domain/protection.hpp>
 #include <braurser/domain/vercmp.hpp>
+#include <braurser/daemon/jobs/aur.hpp>
+#include <braurser/daemon/cache/store.hpp>
+#include <sys/utsname.h>
 #include <braurser/validate/validate.hpp>
 #include <algorithm>
 #include <charconv>
@@ -17,13 +20,6 @@
 namespace braurser::daemon::jobs {
 namespace {
 Error failure(int code) { return {code, "error.generic_title"}; }
-
-std::string dependency_name(std::string_view value) {
-    const auto end = value.find_first_of("<>=: ");
-    const auto name = value.substr(0, end);
-    if (!br_valid_pkgname(name.data(), name.size())) return {};
-    return std::string(name);
-}
 
 std::vector<std::string> words(std::string_view line) {
     std::istringstream stream{std::string(line)};
@@ -73,6 +69,71 @@ bool parse_print(std::string_view output, Snapshot& snapshot, std::string_view k
     return seen.size() <= 512;
 }
 
+Result<void> bind_transaction(Snapshot& snapshot, const protocol::UpdateReport& report,
+                              const std::filesystem::path& cache, core::ProcessRunner& runner) {
+    if (report.report_id.empty() || report.report_id.size() > 128 || !cache.is_absolute() ||
+        !std::ranges::all_of(report.report_id, [](unsigned char ch) {
+            return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                (ch >= '0' && ch <= '9') || ch == '_' || ch == '-';
+        })) return std::unexpected(failure(protocol::kStalePlan));
+    const auto directory = cache / "braurser/syncdb-check" / report.report_id;
+    struct stat info{};
+    if (lstat(directory.c_str(), &info) != 0 || !S_ISDIR(info.st_mode))
+        return std::unexpected(failure(protocol::kStalePlan));
+    core::ProcessSpec spec;
+    spec.executable = "/usr/bin/pacman";
+    spec.args = {"--sync", "--sysupgrade", "--print", "--print-format", "%r/%n %v",
+                 "--dbpath", directory.string()};
+    if (snapshot.plan.kind.value == "update-and-install") {
+        spec.args.insert(spec.args.end(), {"--needed", "--"});
+        spec.args.insert(spec.args.end(), snapshot.targets.begin(), snapshot.targets.end());
+    }
+    spec.env = {{"LC_ALL", "C"}, {"PATH", "/usr/bin"}};
+    spec.timeout = std::chrono::seconds(60);
+    spec.max_stdout = 4 * 1024 * 1024;
+    spec.max_stderr = 64 * 1024;
+    auto preview = runner.run(spec);
+    if (!preview || preview->exit_code != 0 || preview->signaled || preview->timed_out ||
+        preview->out_truncated || preview->err_truncated || preview->out.size() > spec.max_stdout)
+        return std::unexpected(failure(protocol::kUntrustedInput));
+    if (snapshot.plan.upgrades.size() > 256 || snapshot.plan.installs.size() > 256 ||
+        snapshot.plan.restart.size() > 256) return std::unexpected(failure(protocol::kUntrustedInput));
+    std::set<std::string> seen;
+    for (std::string_view remaining = preview->out; !remaining.empty();) {
+        const auto end = remaining.find('\n');
+        const auto line = remaining.substr(0, end);
+        const auto space = line.find(' ');
+        const auto slash = line.find('/');
+        if (line.size() > 512 || space == line.npos || slash == line.npos || slash >= space)
+            return std::unexpected(failure(protocol::kUntrustedInput));
+        const auto repo = line.substr(0, slash);
+        const auto name = line.substr(slash + 1, space - slash - 1);
+        const auto version = line.substr(space + 1);
+        if (!br_valid_repo_name(repo.data(), repo.size()) || !br_valid_pkgname(name.data(), name.size()) ||
+            version.empty() || version.size() > 128 ||
+            !std::ranges::all_of(version, [](unsigned char ch) {
+                return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                    (ch >= '0' && ch <= '9') || ch == '.' || ch == ':' || ch == '-' ||
+                    ch == '_' || ch == '+' || ch == '~';
+            }) || !seen.insert(std::string(name)).second)
+            return std::unexpected(failure(protocol::kUntrustedInput));
+        if (std::ranges::none_of(snapshot.plan.upgrades, [&](const auto& item) { return item.name == name; }) &&
+            std::ranges::none_of(snapshot.plan.installs, [&](const auto& item) { return item.name == name; })) {
+            snapshot.plan.installs.push_back({{"official"}, std::string(repo), std::string(name)});
+            if (snapshot.plan.installs.size() > 256) return std::unexpected(failure(protocol::kUntrustedInput));
+        }
+        if (end == remaining.npos) break;
+        remaining.remove_prefix(end + 1);
+    }
+    gchar* hash = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
+        reinterpret_cast<const guchar*>(preview->out.data()), preview->out.size());
+    snapshot.expected_transaction = hash;
+    g_free(hash);
+    snapshot.fingerprint += '\n';
+    snapshot.fingerprint += snapshot.expected_transaction;
+    return {};
+}
+
 std::optional<std::vector<std::string>> protected_names(
     const catalog::PacmanConfig& config, const catalog::LocalDbReader& reader,
     const std::filesystem::path& db_path, const std::vector<protocol::PackageRef>& removals,
@@ -100,18 +161,6 @@ std::optional<std::vector<std::string>> protected_names(
     return domain::protected_removals(names, *hold, kernels);
 }
 
-std::optional<helpers::HelperEnvironment> read_environment() {
-    passwd user{};
-    passwd* result{};
-    std::array<char, 16384> buffer{};
-    if (getpwuid_r(getuid(), &user, buffer.data(), buffer.size(), &result) != 0 ||
-        !result || !result->pw_name || !result->pw_dir) return std::nullopt;
-    helpers::HelperEnvironment environment;
-    environment.home = result->pw_dir;
-    environment.user = result->pw_name;
-    environment.runtime_dir = std::filesystem::path("/run/user") / std::to_string(getuid());
-    return environment;
-}
 }
 
 Result<Snapshot> user_removal_snapshot(const std::filesystem::path& state, std::string_view id) {
@@ -129,7 +178,7 @@ Result<Snapshot> user_removal_snapshot(const std::filesystem::path& state, std::
     struct stat info{};
     if (lstat(file.c_str(), &info) != 0 || !S_ISREG(info.st_mode) ||
         info.st_uid != getuid() || (info.st_mode & 0777) != 0600) return invalid();
-    auto bytes = core::read_bounded(file, 512 * 1024);
+    auto bytes = core::read_bounded(file, manual::kMaxReceiptBytes);
     if (!bytes) return invalid();
     auto data = nlohmann::json::parse(*bytes, nullptr, false);
     if (!data.is_object()) return invalid();
@@ -161,9 +210,9 @@ Result<Snapshot> user_removal_snapshot(const std::filesystem::path& state, std::
         const auto& files = data.at("files");
         const auto& backups = data.at("backups");
         const auto& launchers = data.at("launcher_ids");
-        if (!files.is_array() || files.empty() || files.size() > 4096 ||
-            !backups.is_array() || backups.size() > 4096 ||
-            !launchers.is_array() || launchers.size() > 4096) return invalid();
+        if (!files.is_array() || files.empty() || files.size() > manual::kMaxReceiptFiles ||
+            !backups.is_array() || backups.size() > manual::kMaxReceiptFiles ||
+            !launchers.is_array() || launchers.size() > manual::kMaxReceiptFiles) return invalid();
         for (const auto& item : files) {
             manual::StagedFile entry{item.at("path").get<std::string>(),
                                      item.at("sha256").get<std::string>(), item.at("mode").get<unsigned>()};
@@ -329,7 +378,9 @@ Result<Snapshot> LivePlanSource::snapshot(const protocol::PlanParams& selection)
             result.plan.upgrades.push_back(item.package);
             result.plan.restart.push_back(item.restart);
         }
-        result.fingerprint = nlohmann::json(*report).dump();
+        auto bound = bind_transaction(result, *report, cache_, runner_);
+        if (!bound) return std::unexpected(bound.error());
+        result.fingerprint = nlohmann::json(*report).dump() + result.fingerprint;
     } else if (kind == "install" || kind == "remove" || kind == "update-community" ||
                kind == "upgrade-community") {
         if (!selection.packageId || selection.packageId->size() > 256) return std::unexpected(failure(protocol::kInvalidParams));
@@ -361,61 +412,88 @@ Result<Snapshot> LivePlanSource::snapshot(const protocol::PlanParams& selection)
         result.planned_version = detail->details.version;
         if (community && kind != "remove") {
             result.plan.kind = {kind == "install" ? "install" : "update-community"};
-            auto preference = selection.helper ? selection.helper->value : "auto";
-            auto helper = locator_.locate(preference);
-            if (!helper) return std::unexpected(failure(protocol::kUnsupportedCapability));
-            result.helper = helper->filename().string();
-            result.plan.requires_build_review = true;
-            result.plan.build_review_refs.push_back(detail->details.package);
-            if (result.plan.kind.value == "update-community")
-                result.plan.upgrades.push_back(detail->details.package);
-            else result.plan.installs.push_back(detail->details.package);
-            for (const auto& dependency : detail->details.dependencies) {
-                auto dep = dependency_name(dependency);
-                if (dep.empty()) return std::unexpected(failure(protocol::kUntrustedInput));
-                if (std::ranges::any_of(*local, [&](const auto& item) { return item.package.name == dep; })) continue;
-                auto target = services_.get(protocol::GetParams{dep});
-                if (!target) return std::unexpected(failure(protocol::kUntrustedInput));
-                result.fingerprint += nlohmann::json(*target).dump();
-                if (target->details.package.source.value == "official") result.plan.installs.push_back(target->details.package);
-                else if (target->details.package.source.value == "community") {
-                    result.plan.installs.push_back(target->details.package);
-                    result.plan.build_review_refs.push_back(target->details.package);
-                } else return std::unexpected(failure(protocol::kUntrustedInput));
-                if (result.plan.installs.size() > 256) return std::unexpected(failure(protocol::kUntrustedInput));
-            }
-            if (result.plan.build_review_refs.size() > 8) return std::unexpected(failure(protocol::kUntrustedInput));
-            auto environment = read_environment();
-            if (!environment) return std::unexpected(failure(protocol::kUnsupportedCapability));
-            std::unique_ptr<helpers::AURHelper> adapter;
-            if (result.helper == "paru") adapter = std::make_unique<helpers::ParuHelper>(*environment, runner_, *helper);
-            else if (result.helper == "yay") adapter = std::make_unique<helpers::YayHelper>(*environment, runner_, *helper);
-            else return std::unexpected(failure(protocol::kUnsupportedCapability));
-            for (const auto& reference : result.plan.build_review_refs) {
-                auto package = domain::PackageName::make(reference.name);
-                if (!package) return std::unexpected(failure(protocol::kUntrustedInput));
-                auto spec = adapter->build_print_build_file_spec(*package);
-                auto output = runner_.run(spec);
-                if (!output) return std::unexpected(failure(protocol::kUntrustedInput));
-                auto text = adapter->parse_build_file(*output);
-                if (!text || !protocol::valid_utf8(*text)) return std::unexpected(failure(protocol::kUntrustedInput));
-                gchar* hash = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
-                    reinterpret_cast<const guchar*>(text->data()), text->size());
-                result.fingerprint += hash;
-                g_free(hash);
-            }
+            if (access("/usr/bin/makepkg", X_OK) != 0 || access("/usr/bin/bwrap", X_OK) != 0 ||
+                access("/usr/bin/bsdtar", X_OK) != 0 || !cache_.is_absolute())
+                return std::unexpected(failure(protocol::kUnsupportedCapability));
+            utsname machine{};
+            if (uname(&machine) != 0) return std::unexpected(failure(protocol::kUnsupportedCapability));
+            cache::Store store(cache_);
+            std::optional<std::vector<catalog::RepoPackage>> official_packages;
+            auto resolved = resolve_aur(result, name, machine.machine, *local,
+                [&](std::string_view package) { return services_.get(protocol::GetParams{std::string(package)}); },
+                [&](std::string_view package) -> std::optional<std::string> {
+                    catalog::SearchQuery query{std::string(package), {}, catalog::SortOrder::Relevance, {}, 200};
+                    query.filters.aur_only = true;
+                    for (int attempt = 0; attempt < 3; ++attempt) {
+                        auto page = store.search(query);
+                        if (!page) return std::nullopt;
+                        bool moved = false;
+                        for (const auto& hit : page->hits) {
+                            if (hit.name != package || hit.source != domain::SourceKind::Community) continue;
+                            auto record = store.package(hit.id);
+                            if (record && *record && (*record)->community_record &&
+                                (*record)->summary.name == hit.name && (*record)->summary.source == hit.source)
+                                return (*record)->community_record->package_base;
+                            moved = true;
+                            break;
+                        }
+                        if (!moved) return std::nullopt;
+                    }
+                    return std::nullopt;
+                },
+                [&](std::string_view base) -> Result<manual::BuildTree> {
+                    auto fetched = manual::fetch_build_tree(git_http_, base, cache_);
+                    if (!fetched) return std::unexpected(Error{protocol::kUntrustedInput, fetched.error().code == "build-text-too-large" ? "detail.build_too_large" : "error.generic_title"});
+                    return std::move(*fetched);
+                },
+                [&](const Dependency& dependency) -> std::optional<catalog::RepoPackage> {
+                    if (!official_packages) {
+                        official_packages.emplace();
+                        for (const auto& repo : repositories->names) {
+                            static_cast<void>(catalog::SyncDbReader{}.read(repositories->db_path, repo,
+                                [&](catalog::RepoPackage&& package) {
+                                    catalog::RepoPackage slim;
+                                    slim.repo = std::move(package.repo);
+                                    slim.name = std::move(package.name);
+                                    slim.version = std::move(package.version);
+                                    slim.provides = std::move(package.provides);
+                                    official_packages->push_back(std::move(slim));
+                                }));
+                        }
+                    }
+                    for (const auto& package : *official_packages) {
+                        if (package.name == dependency.name && satisfies_version(package.version, dependency)) return package;
+                        for (const auto& value : package.provides) {
+                            const auto provided = parse_dependency(value);
+                            if (provided && provided->name == dependency.name &&
+                                (dependency.comparison.empty() ||
+                                 (provided->comparison == "=" && satisfies_version(provided->version, dependency)))) return package;
+                        }
+                    }
+                    return std::nullopt;
+                }, report && !report->official.empty());
+            if (!resolved) return std::unexpected(resolved.error());
+            auto transaction = plan_aur_official(result, runner_);
+            if (!transaction) return std::unexpected(transaction.error());
         } else {
             if (!community && detail->details.package.source.value != "official")
                 return std::unexpected(failure(protocol::kInvalidParams));
             if (kind == "install") {
                 result.targets = {id};
                 if (report && !report->official.empty()) {
+                    const auto& package = detail->details.package;
+                    if (!package.repo || !br_valid_repo_name(package.repo->data(), package.repo->size()) ||
+                        !br_valid_pkgname(package.name.data(), package.name.size()) || package.name != name)
+                        return std::unexpected(failure(protocol::kUntrustedInput));
+                    result.targets = {*package.repo + "/" + package.name};
                     result.plan.kind = {"update-and-install"};
-                    result.fingerprint += nlohmann::json(*report).dump();
                     for (const auto& update : report->official) {
                         result.plan.upgrades.push_back(update.package);
                         result.plan.restart.push_back(update.restart);
                     }
+                    auto bound = bind_transaction(result, *report, cache_, runner_);
+                    if (!bound) return std::unexpected(bound.error());
+                    result.fingerprint += nlohmann::json(*report).dump();
                 }
             }
             if (kind == "remove") result.targets = {name};
@@ -427,11 +505,13 @@ Result<Snapshot> LivePlanSource::snapshot(const protocol::PlanParams& selection)
             spec.timeout = std::chrono::seconds(30);
             spec.max_stdout = 4 * 1024 * 1024;
             spec.max_stderr = 64 * 1024;
-            auto preview = runner_.run(spec);
-            if (!preview || preview->exit_code != 0 || preview->out_truncated || preview->err_truncated ||
-                !parse_print(preview->out, result, kind, *local))
-                return std::unexpected(failure(protocol::kUnsafeTransaction));
-            result.fingerprint += preview->out;
+            if (result.plan.kind.value != "update-and-install") {
+                auto preview = runner_.run(spec);
+                if (!preview || preview->exit_code != 0 || preview->out_truncated || preview->err_truncated ||
+                    !parse_print(preview->out, result, kind, *local))
+                    return std::unexpected(failure(protocol::kUnsafeTransaction));
+                result.fingerprint += preview->out;
+            }
             if (kind == "remove") {
                 auto guarded = protected_names(config_, local_, repositories->db_path, result.plan.removals, *local);
                 if (!guarded) return std::unexpected(failure(protocol::kBusy));

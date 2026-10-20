@@ -4,6 +4,9 @@
 #include <giomm/init.h>
 #include <glibmm/main.h>
 #include <atomic>
+#include <charconv>
+#include <csignal>
+#include <glib.h>
 #include <fstream>
 #include <memory>
 #include <unistd.h>
@@ -85,6 +88,14 @@ protected:
         state, ElevationOptions{elevation::Method::Pkexec, "/usr/local/libexec/braurser"},
         JobRunner::BuildSpec{}, JobRunner::Verify{}, JobRunner::Classify{}, [this] { return now; });
     }
+    void pipeline(JobRunner::BuildSpec build, JobRunner::Verify verify = {}) {
+        runner = std::make_unique<JobRunner>(plans, [this] {
+            auto process = std::make_shared<ProcessState>();
+            processes.push_back(process);
+            return std::make_unique<FakeProcess>(process);
+        }, JobRunner::Notify{}, state, ElevationOptions{elevation::Method::Pkexec, "/usr/local/libexec/braurser"},
+        std::move(build), std::move(verify));
+    }
     void TearDown() override {
         runner.reset();
         std::error_code error;
@@ -108,12 +119,16 @@ TEST(JobsSpec, CanonicalOfficialTransactionsForBothElevationMethods) {
     struct Case { std::string kind; std::vector<std::string> targets; std::vector<std::string> args; };
     for (const auto& value : std::vector<Case>{
         {"install", {"extra/tree"}, {"--sync", "--needed", "--noconfirm", "--", "extra/tree"}},
-        {"update-system", {}, {"--sync", "--refresh", "--sysupgrade", "--noconfirm"}},
-        {"update-and-install", {"tree"}, {"--sync", "--refresh", "--sysupgrade", "--noconfirm", "--needed", "--", "tree"}},
+        {"update-system", {}, {"--sync", "--refresh", "--sysupgrade", "--noconfirm", "--braurser-transaction=" + std::string(64, 'a')}},
+        {"update-and-install", {"tree"}, {"--sync", "--refresh", "--sysupgrade", "--noconfirm", "--needed", "--braurser-transaction=" + std::string(64, 'a'), "--", "tree"}},
+        {"install-deps", {"tree"}, {"--sync", "--needed", "--asdeps", "--noconfirm", "--", "tree"}},
+        {"mark-deps", {"tree"}, {"--database", "--asdeps", "--noconfirm", "--", "tree"}},
+        {"install-archives", {"/home/user/.cache/braurser/build/manual/job/packages/tree-1-1-any.pkg.tar.zst"},
+            {"--upgrade", "--noconfirm", "--", "/home/user/.cache/braurser/build/manual/job/packages/tree-1-1-any.pkg.tar.zst"}},
         {"remove", {"tree"}, {"--remove", "--nosave", "--recursive", "--noconfirm", "--", "tree"}},
         {"manual-install", {"/home/user/.cache/braurser/build/manual/job/pkg/pkg-1.pkg.tar.zst"},
             {"--upgrade", "--noconfirm", "--", "/home/user/.cache/braurser/build/manual/job/pkg/pkg-1.pkg.tar.zst"}}}) {
-        auto spec = official_spec(value.kind, value.targets, auth);
+        auto spec = official_spec(value.kind, value.targets, auth, std::string(64, 'a'));
         ASSERT_TRUE(spec.has_value()) << value.kind;
         EXPECT_EQ(spec->executable, "/usr/bin/pkexec");
         std::vector<std::string> expected{helper};
@@ -121,7 +136,7 @@ TEST(JobsSpec, CanonicalOfficialTransactionsForBothElevationMethods) {
         EXPECT_EQ(spec->args, expected);
         auth.method = elevation::Method::SudoAskpass;
         auth.ui = "qt";
-        spec = official_spec(value.kind, value.targets, auth);
+        spec = official_spec(value.kind, value.targets, auth, std::string(64, 'a'));
         ASSERT_TRUE(spec.has_value());
         expected.insert(expected.begin(), {"-A", "--"});
         EXPECT_EQ(spec->executable, "/usr/bin/sudo");
@@ -139,8 +154,214 @@ TEST(JobsSpec, CanonicalOfficialTransactionsForBothElevationMethods) {
     EXPECT_EQ(official_spec("install", {"tree"}, auth).error().code,
               protocol::kAuthorizationUnavailable);
     auth.method = elevation::Method::Pkexec;
-    EXPECT_EQ(official_spec("update-system", {"tree"}, auth).error().code,
+    EXPECT_EQ(official_spec("update-system", {"tree"}, auth, std::string(64, 'a')).error().code,
               protocol::kInvalidParams);
+}
+
+TEST(JobsSpec, SystemTransactionsRequireExactReviewedDigest) {
+    const ElevationOptions auth{elevation::Method::Pkexec, "/usr/local/libexec/braurser"};
+    for (const auto* kind : {"update-system", "upgrade-system", "update-and-install"}) {
+        const auto targets = std::string_view(kind) == "update-and-install" ? std::vector<std::string>{"tree"} : std::vector<std::string>{};
+        for (const auto& digest : {std::string{}, std::string(63, 'a'), std::string(64, 'A'), std::string(64, 'g')})
+            EXPECT_EQ(official_spec(kind, targets, auth, digest).error().code, protocol::kStalePlan);
+        EXPECT_TRUE(official_spec(kind, targets, auth, std::string(64, 'a')));
+    }
+}
+
+TEST_F(JobsFixture, PipelineStartsLazilyAndVerifiesOnlyAfterLastSuccess) {
+    int produced = 0;
+    int verified = 0;
+    pipeline([&](const Snapshot&, std::string_view, const ElevationOptions&) -> Result<JobRunner::Pipeline> {
+        JobRunner::Pipeline value;
+        for (int index = 0; index < 3; ++index) value.steps.push_back([&, index]() -> Result<core::ProcessSpec> {
+            ++produced;
+            core::ProcessSpec spec;
+            spec.executable = "/usr/bin/makepkg";
+            spec.args = {std::to_string(index)};
+            return spec;
+        });
+        return value;
+    }, [&](const Snapshot&) { ++verified; return true; });
+    const auto id = enqueue(plan());
+    ASSERT_EQ(produced, 1);
+    processes[0]->finish(0);
+    ASSERT_EQ(processes.size(), 2U);
+    EXPECT_EQ(verified, 0);
+    EXPECT_EQ(processes[1]->spec.args, std::vector<std::string>{"1"});
+    processes[1]->finish(0);
+    ASSERT_EQ(processes.size(), 3U);
+    processes[2]->finish(0);
+    EXPECT_EQ(produced, 3);
+    EXPECT_EQ(verified, 1);
+    EXPECT_EQ(runner->get({id}, 11)->state.value, "succeeded");
+}
+
+TEST_F(JobsFixture, PipelineStopsAtFailedMiddleStep) {
+    pipeline([](const Snapshot&, std::string_view, const ElevationOptions&) -> Result<JobRunner::Pipeline> {
+        JobRunner::Step step = []() -> Result<core::ProcessSpec> { core::ProcessSpec spec; spec.executable = "/usr/bin/makepkg"; return spec; };
+        return JobRunner::Pipeline{{step, step, step}};
+    });
+    const auto id = enqueue(plan());
+    processes[0]->finish(0);
+    processes[1]->finish(1);
+    EXPECT_EQ(processes.size(), 2U);
+    EXPECT_EQ(runner->get({id}, 11)->state.value, "failed");
+}
+
+TEST_F(JobsFixture, PipelineDoesNotAdvanceOnSignalsTimeoutsOrTruncation) {
+    pipeline([](const Snapshot&, std::string_view, const ElevationOptions&) -> Result<JobRunner::Pipeline> {
+        JobRunner::Step step = []() -> Result<core::ProcessSpec> { core::ProcessSpec spec; spec.executable = "/usr/bin/makepkg"; return spec; };
+        return JobRunner::Pipeline{{step, step}};
+    });
+    for (unsigned flag = 0; flag < 4; ++flag) {
+        const auto id = enqueue(plan());
+        ASSERT_EQ(processes.size(), static_cast<std::size_t>(flag + 1));
+        core::ProcessResult result;
+        result.exit_code = 0;
+        result.signaled = flag == 0;
+        result.timed_out = flag == 1;
+        result.out_truncated = flag == 2;
+        result.err_truncated = flag == 3;
+        processes.back()->done(result);
+        EXPECT_EQ(runner->get({id}, 11)->state.value, "failed");
+        EXPECT_EQ(processes.size(), static_cast<std::size_t>(flag + 1));
+    }
+}
+
+TEST_F(JobsFixture, PipelineCancellationBetweenStepsDoesNotStartRootHelper) {
+    std::string id;
+    pipeline([&](const Snapshot&, std::string_view, const ElevationOptions& auth) -> Result<JobRunner::Pipeline> {
+        return JobRunner::Pipeline{{[]() -> Result<core::ProcessSpec> {
+            core::ProcessSpec spec; spec.executable = "/usr/bin/makepkg"; return spec;
+        }, [&, auth]() -> Result<core::ProcessSpec> {
+            EXPECT_TRUE(runner->cancel(id, 11)->accepted);
+            return official_spec("install-deps", {"tree"}, auth);
+        }}};
+    });
+    id = enqueue(plan());
+    processes[0]->finish(0);
+    EXPECT_EQ(processes.size(), 1U);
+    EXPECT_EQ(runner->get({id}, 11)->state.value, "cancelled");
+}
+
+TEST_F(JobsFixture, PipelineRefusesCancellationOnceRootStepStarts) {
+    pipeline([](const Snapshot&, std::string_view, const ElevationOptions& auth) -> Result<JobRunner::Pipeline> {
+        return JobRunner::Pipeline{{[]() -> Result<core::ProcessSpec> {
+            core::ProcessSpec spec; spec.executable = "/usr/bin/makepkg"; return spec;
+        }, [auth] { return official_spec("install-deps", {"tree"}, auth); }}};
+    });
+    const auto id = enqueue(plan());
+    processes[0]->finish(0);
+    ASSERT_EQ(processes.size(), 2U);
+    EXPECT_FALSE(runner->cancel(id, 11)->accepted);
+    processes[1]->finish(0);
+    EXPECT_EQ(runner->get({id}, 11)->state.value, "succeeded");
+}
+
+TEST_F(JobsFixture, PipelineCommitGuardRearmsForLaterRootStep) {
+    pipeline([](const Snapshot&, std::string_view, const ElevationOptions& auth) -> Result<JobRunner::Pipeline> {
+        return JobRunner::Pipeline{{[auth] { return official_spec("install-deps", {"tree"}, auth); },
+            []() -> Result<core::ProcessSpec> {
+                core::ProcessSpec spec; spec.executable = "/usr/bin/makepkg"; return spec;
+            }, [auth] { return official_spec("mark-deps", {"tree"}, auth); }}};
+    });
+    const auto id = enqueue(plan());
+    EXPECT_FALSE(runner->cancel(id, 11)->accepted);
+    processes[0]->finish(0);
+    processes[1]->finish(0);
+    ASSERT_EQ(processes.size(), 3U);
+    EXPECT_FALSE(runner->cancel(id, 11)->accepted);
+    EXPECT_EQ(processes[2]->interruptions, 0);
+    processes[2]->finish(0);
+    EXPECT_EQ(runner->get({id}, 11)->state.value, "succeeded");
+}
+
+TEST_F(JobsFixture, PipelineCancellationDuringBuildAfterRootSuccessNeedsAttention) {
+    pipeline([](const Snapshot&, std::string_view, const ElevationOptions& auth) -> Result<JobRunner::Pipeline> {
+        return JobRunner::Pipeline{{[auth] { return official_spec("install-deps", {"tree"}, auth); },
+            []() -> Result<core::ProcessSpec> {
+                core::ProcessSpec spec; spec.executable = "/usr/bin/makepkg"; return spec;
+            }, [auth] { return official_spec("install-deps", {"nano"}, auth); }}};
+    });
+    const auto id = enqueue(plan());
+    EXPECT_FALSE(runner->cancel(id, 11)->accepted);
+    EXPECT_EQ(processes[0]->interruptions, 0);
+    processes[0]->finish(0);
+    ASSERT_EQ(processes.size(), 2U);
+    EXPECT_TRUE(runner->cancel(id, 11)->accepted);
+    EXPECT_EQ(processes[1]->interruptions, 1);
+    processes[1]->finish(130);
+    EXPECT_EQ(processes.size(), 2U);
+    EXPECT_EQ(runner->get({id}, 11)->state.value, "needs-attention");
+}
+
+TEST_F(JobsFixture, PipelineCancellationDuringFirstBuildStaysCancelled) {
+    pipeline([](const Snapshot&, std::string_view, const ElevationOptions& auth) -> Result<JobRunner::Pipeline> {
+        return JobRunner::Pipeline{{[]() -> Result<core::ProcessSpec> {
+                core::ProcessSpec spec; spec.executable = "/usr/bin/makepkg"; return spec;
+            }, [auth] { return official_spec("install-deps", {"tree"}, auth); }}};
+    });
+    for (const auto code : {130, 0}) {
+        const auto id = enqueue(plan());
+        auto process = processes.back();
+        process->line(":: Processing package changes...");
+        process->line("checking for file conflicts...");
+        EXPECT_TRUE(runner->cancel(id, 11)->accepted);
+        EXPECT_EQ(process->interruptions, 1);
+        process->finish(code);
+        EXPECT_EQ(runner->get({id}, 11)->state.value, "cancelled");
+    }
+    EXPECT_EQ(processes.size(), 2U);
+}
+
+TEST_F(JobsFixture, PipelineCancellationBetweenStepsAfterRootSuccessNeedsAttention) {
+    std::string id;
+    pipeline([&](const Snapshot&, std::string_view, const ElevationOptions& auth) -> Result<JobRunner::Pipeline> {
+        return JobRunner::Pipeline{{[auth] { return official_spec("install-deps", {"tree"}, auth); },
+            [&]() -> Result<core::ProcessSpec> {
+                EXPECT_TRUE(runner->cancel(id, 11)->accepted);
+                core::ProcessSpec spec; spec.executable = "/usr/bin/makepkg"; return spec;
+            }}};
+    });
+    id = enqueue(plan());
+    processes[0]->finish(0);
+    EXPECT_EQ(processes.size(), 1U);
+    EXPECT_EQ(runner->get({id}, 11)->state.value, "needs-attention");
+}
+
+TEST_F(JobsFixture, ChangedRootTransactionRequiresNewReview) {
+    source.kind = "update-system";
+    pipeline([](const Snapshot&, std::string_view, const ElevationOptions& auth) -> Result<JobRunner::Pipeline> {
+        return JobRunner::Pipeline{{[auth] { return official_spec("update-system", {}, auth, std::string(64, 'a')); }}};
+    });
+    const auto id = enqueue(plan());
+    processes[0]->finish(75);
+    const auto job = runner->get({id}, 11);
+    ASSERT_TRUE(job);
+    EXPECT_EQ(job->state.value, "needs-attention");
+    ASSERT_TRUE(job->error);
+    EXPECT_EQ(job->error->at("message_key"), "job.updates_changed");
+}
+
+TEST_F(JobsFixture, MissingSourceSigningKeyHasDedicatedFailure) {
+    pipeline([](const Snapshot&, std::string_view, const ElevationOptions&) -> Result<JobRunner::Pipeline> {
+        JobRunner::Pipeline value;
+        value.steps.emplace_back([]() -> Result<core::ProcessSpec> {
+            core::ProcessSpec spec; spec.executable = "/usr/bin/makepkg"; return spec;
+        });
+        return value;
+    });
+    const auto id = enqueue(plan());
+    processes[0]->line("==> ERROR: unknown public key 0123456789ABCDEF");
+    processes[0]->finish(1);
+    const auto job = runner->get({id}, 11);
+    ASSERT_TRUE(job);
+    EXPECT_EQ(job->state.value, "failed");
+    ASSERT_TRUE(job->error);
+    EXPECT_EQ(job->error->at("message_key"), "job.unknown_public_key");
+    EXPECT_TRUE(std::ranges::any_of(job->events, [](const auto& event) {
+        return event.kind == "job.log" && event.payload.dump().find("haven't imported") != std::string::npos;
+    }));
 }
 
 TEST(PlanApproval, ConnectionBindingSingleUseExpiryAndFreshness) {
@@ -488,6 +709,128 @@ TEST_F(JobsFixture, ExpiredReviewIsCancelledAndReleasesQueue) {
     EXPECT_EQ(runner->get({third}, 11)->state.value, "running");
 }
 
+TEST_F(JobsFixture, ReentrantDisconnectDuringStaleHeadStartsOnlyOneFollowingJob) {
+    std::string stale;
+    bool disconnected = false;
+    runner = std::make_unique<JobRunner>(plans, [this] {
+        auto process = std::make_shared<ProcessState>();
+        processes.push_back(process);
+        return std::make_unique<FakeProcess>(process);
+    }, [&](std::string_view id, const protocol::JobEvent& event, api::ConnectionId owner) {
+        if (id == stale && event.kind == "job.state" && runner->get({stale}, owner)->state.value == "needs-attention") {
+            disconnected = true;
+            runner->disconnect(owner);
+        }
+    }, state, ElevationOptions{elevation::Method::Pkexec, "/usr/local/libexec/braurser"});
+    enqueue(plan("active"));
+    stale = enqueue(plan("stale"));
+    source.fingerprint = "changed";
+    const auto first_ready = enqueue(plan("first-ready"));
+    const auto second_ready = enqueue(plan("second-ready"));
+    processes.front()->finish(0);
+    ASSERT_TRUE(disconnected);
+    ASSERT_EQ(processes.size(), 2U);
+    EXPECT_EQ(runner->get({stale}, 11)->state.value, "needs-attention");
+    EXPECT_EQ(runner->get({first_ready}, 11)->state.value, "running");
+    EXPECT_EQ(runner->get({second_ready}, 11)->state.value, "queued");
+    processes.back()->finish(0);
+    ASSERT_EQ(processes.size(), 3U);
+    EXPECT_EQ(runner->get({second_ready}, 11)->state.value, "running");
+}
+
+TEST_F(JobsFixture, ReentrantDisconnectDuringExpiryStartsOnlyOneFollowingJob) {
+    std::string expired;
+    bool disconnected = false;
+    runner = std::make_unique<JobRunner>(plans, [this] {
+        auto process = std::make_shared<ProcessState>();
+        processes.push_back(process);
+        return std::make_unique<FakeProcess>(process);
+    }, [&](std::string_view id, const protocol::JobEvent& event, api::ConnectionId owner) {
+        if (id == expired && event.kind == "job.state" && runner->get({expired}, owner)->state.value == "cancelled") {
+            disconnected = true;
+            runner->disconnect(owner);
+        }
+    }, state, ElevationOptions{elevation::Method::Pkexec, "/usr/local/libexec/braurser"},
+        JobRunner::BuildSpec{}, JobRunner::Verify{}, JobRunner::Classify{}, [this] { return now; });
+    enqueue(plan("active"));
+    source.review = {"review"};
+    expired = enqueue(plan("review"));
+    const auto first_ready = enqueue(plan("first-ready"));
+    const auto second_ready = enqueue(plan("second-ready"));
+    now += std::chrono::minutes(10);
+    processes.front()->finish(0);
+    ASSERT_TRUE(disconnected);
+    ASSERT_EQ(processes.size(), 2U);
+    EXPECT_EQ(runner->get({first_ready}, 11)->state.value, "running");
+    EXPECT_EQ(runner->get({second_ready}, 11)->state.value, "queued");
+    processes.back()->finish(0);
+    ASSERT_EQ(processes.size(), 3U);
+    EXPECT_EQ(runner->get({second_ready}, 11)->state.value, "running");
+}
+
+TEST_F(JobsFixture, PipelineFinishRunsOnceAfterSuccessAndFailure) {
+    std::vector<bool> outcomes;
+    pipeline([&](const Snapshot&, std::string_view, const ElevationOptions&) -> Result<JobRunner::Pipeline> {
+        JobRunner::Pipeline value;
+        value.steps.emplace_back([]() -> Result<core::ProcessSpec> {
+            core::ProcessSpec spec;
+            spec.executable = "/usr/bin/true";
+            return spec;
+        });
+        value.finish = [&](bool success) -> Result<void> { outcomes.push_back(success); return {}; };
+        return value;
+    });
+    enqueue(plan("success"));
+    processes.back()->finish(0);
+    enqueue(plan("failure"));
+    processes.back()->finish(1);
+    EXPECT_EQ(outcomes, (std::vector<bool>{true, false}));
+}
+
+TEST_F(JobsFixture, FailedWorkspaceFinalizationNeedsAttentionAndReleasesQueue) {
+    pipeline([](const Snapshot&, std::string_view, const ElevationOptions&) -> Result<JobRunner::Pipeline> {
+        JobRunner::Pipeline value;
+        value.steps.emplace_back([]() -> Result<core::ProcessSpec> {
+            core::ProcessSpec spec;
+            spec.executable = "/usr/bin/true";
+            return spec;
+        });
+        value.finish = [](bool) -> Result<void> {
+            return std::unexpected(Error{protocol::kUnsafeTransaction, "job.build_cleanup"});
+        };
+        return value;
+    });
+    const auto first = enqueue(plan("first"));
+    const auto second = enqueue(plan("second"));
+    processes.front()->finish(0);
+    const auto result = runner->get({first}, 11);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->state.value, "needs-attention");
+    ASSERT_TRUE(result->error);
+    EXPECT_EQ(result->error->at("message_key"), "job.build_cleanup");
+    EXPECT_EQ(runner->get({second}, 11)->state.value, "running");
+}
+
+TEST_F(JobsFixture, FailedStepGeneratorKeepsItsSpecificErrorAndFinishesWorkspace) {
+    bool finished = false;
+    pipeline([&](const Snapshot&, std::string_view, const ElevationOptions&) -> Result<JobRunner::Pipeline> {
+        JobRunner::Pipeline value;
+        value.steps.emplace_back([]() -> Result<core::ProcessSpec> {
+            return std::unexpected(Error{protocol::kUntrustedInput, "job.build_mismatch"});
+        });
+        value.finish = [&](bool success) -> Result<void> { EXPECT_FALSE(success); finished = true; return {}; };
+        return value;
+    });
+    const auto id = enqueue(plan());
+    EXPECT_TRUE(finished);
+    EXPECT_TRUE(processes.empty());
+    const auto result = runner->get({id}, 11);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->state.value, "failed");
+    ASSERT_TRUE(result->error);
+    EXPECT_EQ(result->error->at("message_key"), "job.build_mismatch");
+}
+
 TEST_F(JobsFixture, StopStartsNoFurtherJobsAndRefusesNewOnes) {
     const auto first = enqueue(plan("tree"));
     const auto second = enqueue(plan("nano"));
@@ -529,10 +872,12 @@ TEST_F(JobsFixture, CommunityMarkerVersionAndUnexpectedPromptFailClosed) {
         return std::make_unique<FakeProcess>(process);
     }, JobRunner::Notify{}, state,
     ElevationOptions{elevation::Method::Pkexec, "/usr/local/libexec/braurser"},
-    [this](const Snapshot&, std::string_view, const ElevationOptions& auth) -> Result<core::ProcessSpec> {
-        auto spec = official_spec("install", {"tree"}, auth);
-        if (spec) spec->env.emplace_back("BRAURSER_JOB_DIR", (state / "job").string());
-        return spec;
+    [this](const Snapshot&, std::string_view, const ElevationOptions& auth) -> Result<JobRunner::Pipeline> {
+        return JobRunner::Pipeline{{[this, auth] {
+            auto spec = official_spec("install", {"tree"}, auth);
+            if (spec) spec->env.emplace_back("BRAURSER_JOB_DIR", (state / "job").string());
+            return spec;
+        }}};
     }, [&installed](const Snapshot&) { return installed; },
     [&helper](std::string_view line) { return helper.classify_line(line); });
     ASSERT_TRUE(core::ensure_private_dir(state / "job"));
@@ -719,6 +1064,343 @@ TEST(JobsFixtures, RecordedConsolePhasesAndPromptClassification) {
     EXPECT_EQ(safe_line("Authorization: Bearer private-key"), "[REDACTED]");
     EXPECT_EQ(safe_line("https://user:password@example.org/archive"),
               "https://[REDACTED]@example.org/archive");
+}
+
+TEST_F(JobsFixture, ReentrantDisconnectCanEvictTheJobBeingAsked) {
+    bool disconnect_on_question = false;
+    runner = std::make_unique<JobRunner>(plans, [this] {
+        auto process = std::make_shared<ProcessState>();
+        processes.push_back(process);
+        return std::make_unique<FakeProcess>(process);
+    }, [&](std::string_view id, const protocol::JobEvent& event, api::ConnectionId owner) {
+        notifications.push_back(event);
+        if (disconnect_on_question && event.kind == "job.state" &&
+            runner->get({std::string(id)}, owner)->state.value == "needs-attention") {
+            disconnect_on_question = false;
+            runner->disconnect(owner);
+            runner->disconnect(owner);
+        }
+    }, state, ElevationOptions{elevation::Method::Pkexec, "/usr/local/libexec/braurser"});
+    const auto active = enqueue(plan("active"));
+    std::vector<std::string> queued;
+    for (int index = 0; index < 81; ++index) queued.push_back(enqueue(plan("pkg" + std::to_string(index))));
+    std::ranges::sort(queued);
+    for (std::size_t index = 1; index < queued.size(); ++index)
+        runner->ask(queued[index], protocol::QuestionChoice{protocol::BuildReviewQuestion{}}, {"ack"});
+    disconnect_on_question = true;
+    runner->ask(queued.front(), protocol::QuestionChoice{protocol::BuildReviewQuestion{}}, {"ack"});
+    EXPECT_FALSE(disconnect_on_question);
+    EXPECT_FALSE(runner->get({queued.front()}, 11));
+    EXPECT_EQ(runner->list({.limit = 100}, 11)->jobs.size(), 51);
+    processes.front()->finish(0);
+    EXPECT_EQ(runner->get({active}, 11)->state.value, "succeeded");
+    const auto next = enqueue(plan("next"));
+    EXPECT_EQ(runner->get({next}, 11)->state.value, "running");
+}
+
+TEST_F(JobsFixture, ReentrantDisconnectDuringEnqueueDoesNotRequeueAnOrphan) {
+    bool disconnect_on_question = false;
+    runner = std::make_unique<JobRunner>(plans, [this] {
+        auto process = std::make_shared<ProcessState>();
+        processes.push_back(process);
+        return std::make_unique<FakeProcess>(process);
+    }, [&](std::string_view id, const protocol::JobEvent& event, api::ConnectionId owner) {
+        if (disconnect_on_question && event.kind == "job.state" &&
+            runner->get({std::string(id)}, owner)->state.value == "needs-attention") {
+            disconnect_on_question = false;
+            runner->disconnect(owner);
+        }
+    }, state, ElevationOptions{elevation::Method::Pkexec, "/usr/local/libexec/braurser"});
+    const auto active = enqueue(plan("active"));
+    for (int index = 0; index < 80; ++index) {
+        const auto name = "pkg" + std::to_string(index);
+        source.review.push_back(name);
+        enqueue(plan(name));
+    }
+    source.review.push_back("last");
+    disconnect_on_question = true;
+    const auto orphan = enqueue(plan("last"));
+    ASSERT_FALSE(disconnect_on_question);
+    EXPECT_EQ(runner->get({orphan}, 11)->state.value, "needs-attention");
+    EXPECT_EQ(runner->list({.limit = 100}, 11)->jobs.size(), 51);
+    processes.front()->finish(0);
+    EXPECT_EQ(runner->get({active}, 11)->state.value, "succeeded");
+    const auto next = enqueue(plan("next"));
+    EXPECT_EQ(runner->get({next}, 11)->state.value, "running");
+}
+
+TEST_F(JobsFixture, RetainedLogsRespectByteBudgetAndKeepSequenceNumbers) {
+    const auto id = enqueue(plan());
+    for (int index = 0; index < 2100; ++index)
+        processes.front()->line(std::to_string(index) + ":" + std::string(4092, 'x'));
+    processes.front()->finish(0);
+    auto result = runner->get({id}, 11);
+    ASSERT_TRUE(result);
+    std::size_t bytes = 0;
+    std::size_t count = 0;
+    std::uint64_t previous = 0;
+    std::string last;
+    for (const auto& event : result->events) {
+        EXPECT_GT(event.sequence, previous);
+        previous = event.sequence;
+        if (event.kind != "job.log") continue;
+        last = event.payload.get<protocol::JobLogNotification>().line;
+        bytes += last.size();
+        ++count;
+    }
+    EXPECT_LE(bytes, 256 * 1024);
+    EXPECT_GT(bytes, 252 * 1024);
+    EXPECT_EQ(count, 64);
+    EXPECT_TRUE(last.starts_with("2099:"));
+    EXPECT_EQ(previous, 2103);
+    EXPECT_FALSE(result->nextCursor);
+    EXPECT_EQ(result->state.value, "succeeded");
+}
+
+TEST_F(JobsFixture, FinishedLogsStayWithinAggregateBudgetAndEvictOldSummaries) {
+    std::vector<std::string> ids;
+    const std::string line(4096, 'x');
+    for (int index = 0; index < 55; ++index) {
+        ids.push_back(enqueue(plan("pkg" + std::to_string(index))));
+        for (int entry = 0; entry < 70; ++entry) processes.back()->line(line);
+        processes.back()->finish(0);
+    }
+    std::size_t total_bytes = 0;
+    for (std::size_t index = 0; index < ids.size(); ++index) {
+        const auto job = runner->get({ids[index]}, 11);
+        if (index < 5) {
+            EXPECT_FALSE(job);
+            continue;
+        }
+        ASSERT_TRUE(job);
+        std::size_t bytes = 0;
+        for (const auto& event : job->events)
+            if (event.kind == "job.log") bytes += event.payload.get<protocol::JobLogNotification>().line.size();
+        EXPECT_LE(bytes, 256 * 1024);
+        total_bytes += bytes;
+    }
+    EXPECT_LE(total_bytes, 16 * 1024 * 1024);
+    EXPECT_EQ(runner->list({.limit = 100}, 11)->jobs.size(), 50);
+}
+
+class LivePlanServices final : public api::Services {
+public:
+    api::ServiceResult<protocol::HelloResult> hello(const protocol::HelloParams&) override { return {}; }
+    api::ServiceResult<protocol::StatusResult> status(const protocol::StatusParams&) override { return {}; }
+    api::ServiceResult<protocol::SearchResult> search(const protocol::SearchParams&) override { return {}; }
+    api::ServiceResult<protocol::GetResult> get(const protocol::GetParams&) override {
+        protocol::GetResult result;
+        result.details.package = {{"official"}, "extra", "target"};
+        result.details.version = "1-1";
+        result.source = {"official"};
+        return result;
+    }
+    api::ServiceResult<protocol::VariantsResult> variants(const protocol::VariantsParams&) override { return {}; }
+    api::ServiceResult<protocol::JobIdResult> refresh(const protocol::RefreshParams&) override { return {}; }
+    api::ServiceResult<protocol::WikiGetResult> wiki(const protocol::WikiGetParams&) override { return {}; }
+    api::ServiceResult<protocol::NewsListResult> news(const protocol::NewsListParams&) override { return {}; }
+    api::ServiceResult<protocol::JobIdResult> check_updates(const protocol::UpdatesCheckParams&) override { return {}; }
+    api::ServiceResult<protocol::UpdatesOptionsResult> update_options(const protocol::UpdatesOptionsParams&) override { return {}; }
+    api::ServiceResult<protocol::JobIdResult> preview(const protocol::ManualPreviewParams&) override { return {}; }
+    api::ServiceResult<protocol::ManualListResult> manual_list(const protocol::ManualListParams&) override { return {}; }
+    api::ServiceResult<protocol::UnmanagedListResult> unmanaged(const protocol::UnmanagedListParams&) override { return {}; }
+    api::ServiceResult<protocol::SettingsGetResult> settings_get(const protocol::SettingsGetParams&) override { return {}; }
+    api::ServiceResult<protocol::SettingsSetResult> settings_set(const protocol::SettingsSetParams&) override { return {}; }
+    api::ServiceResult<protocol::NotifierCheckResult> notifier_check(const protocol::NotifierCheckParams&) override { return {}; }
+};
+
+class LivePlanProcess final : public core::ProcessRunner {
+public:
+    std::filesystem::path database;
+    core::ProcessResult preview;
+    std::vector<core::ProcessSpec> specs;
+    std::expected<core::ProcessResult, core::ProcessError> run(const core::ProcessSpec& spec) override {
+        specs.push_back(spec);
+        if (spec.executable == "/usr/bin/pacman") return preview;
+        core::ProcessResult result;
+        result.exit_code = 0;
+        if (spec.args == std::vector<std::string>{"--repo-list"}) result.out = "core\nextra\n";
+        else if (spec.args == std::vector<std::string>{"DBPath"}) result.out = database.string() + '\n';
+        else return std::unexpected(core::ProcessError{1, "unexpected process"});
+        return result;
+    }
+};
+
+class JobsLivePlan : public ::testing::Test {
+protected:
+    std::filesystem::path root = std::filesystem::temp_directory_path() /
+        ("braurser-live-plan-test-" + std::to_string(getpid()) + "-" +
+         std::to_string(reinterpret_cast<std::uintptr_t>(this)));
+    LivePlanServices services;
+    LivePlanProcess process;
+    protocol::UpdateReport report;
+    std::unique_ptr<LivePlanSource> source;
+    void SetUp() override {
+        process.database = root / "db";
+        ASSERT_TRUE(core::ensure_private_dir(process.database / "local"));
+        report.report_id = "report_1-checked";
+        report.checked_at = "2026-10-19T12:00:00Z";
+        protocol::UpdateItem update;
+        update.package = {{"official"}, "core", "existing"};
+        update.from_version = "1-1";
+        update.to_version = "2-1";
+        update.source = {"official"};
+        update.restart.package = update.package;
+        update.restart.level = {"none"};
+        update.restart.reason_key = "restart.reason.none";
+        report.overall_restart = {"none"};
+        report.official.push_back(update);
+        ASSERT_TRUE(core::ensure_private_dir(root / "braurser/syncdb-check" / report.report_id));
+        process.preview.exit_code = 0;
+        process.preview.out = "core/existing 2-1\nextra/new-dependency 1:3.0~rc1-2\n";
+        source = std::make_unique<LivePlanSource>(services, process, [this] { return report; }, root, root);
+    }
+    void TearDown() override {
+        std::error_code error;
+        std::filesystem::remove_all(root, error);
+    }
+};
+
+TEST_F(JobsLivePlan, UpdateDigestBindsExactOutputAndListsNewInstalls) {
+    const auto snapshot = source->snapshot({.kind = "update-system"});
+    ASSERT_TRUE(snapshot);
+    gchar* hash = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
+        reinterpret_cast<const guchar*>(process.preview.out.data()), process.preview.out.size());
+    EXPECT_EQ(snapshot->expected_transaction, hash);
+    g_free(hash);
+    EXPECT_NE(snapshot->fingerprint.find(snapshot->expected_transaction), std::string::npos);
+    ASSERT_EQ(snapshot->plan.installs.size(), 1);
+    EXPECT_EQ(snapshot->plan.installs.front().name, "new-dependency");
+    EXPECT_EQ(snapshot->plan.installs.front().repo, "extra");
+    EXPECT_EQ(snapshot->plan.installs.front().source.value, "official");
+    ASSERT_EQ(snapshot->plan.upgrades.size(), 1);
+    EXPECT_EQ(snapshot->plan.upgrades.front().name, "existing");
+    const auto& spec = process.specs.back();
+    EXPECT_EQ(spec.executable, "/usr/bin/pacman");
+    EXPECT_EQ(spec.args, (std::vector<std::string>{"--sync", "--sysupgrade", "--print", "--print-format",
+        "%r/%n %v", "--dbpath", (root / "braurser/syncdb-check" / report.report_id).string()}));
+    EXPECT_EQ(spec.env, (std::vector<std::pair<std::string, std::string>>{{"LC_ALL", "C"}, {"PATH", "/usr/bin"}}));
+    EXPECT_EQ(spec.timeout, std::chrono::seconds(60));
+    EXPECT_EQ(spec.max_stdout, 4 * 1024 * 1024);
+    process.preview.out.pop_back();
+    const auto changed = source->snapshot({.kind = "upgrade-system"});
+    ASSERT_TRUE(changed);
+    EXPECT_EQ(changed->plan.kind.value, "update-system");
+    EXPECT_NE(snapshot->expected_transaction, changed->expected_transaction);
+    EXPECT_NE(snapshot->fingerprint, changed->fingerprint);
+}
+
+TEST_F(JobsLivePlan, MissingSymlinkedAndInvalidReportDirectoriesAreStale) {
+    report.report_id = "missing";
+    EXPECT_EQ(source->snapshot({.kind = "update-system"}).error().code, protocol::kStalePlan);
+    std::filesystem::create_directory_symlink(root / "db", root / "braurser/syncdb-check/linked");
+    report.report_id = "linked";
+    EXPECT_EQ(source->snapshot({.kind = "update-system"}).error().code, protocol::kStalePlan);
+    for (const auto& id : {"../db", "", "a/b", "bad.id"}) {
+        report.report_id = id;
+        EXPECT_EQ(source->snapshot({.kind = "update-system"}).error().code, protocol::kStalePlan);
+    }
+    EXPECT_EQ(process.specs.size(), 12);
+}
+
+TEST_F(JobsLivePlan, MalformedPrintOutputIsUntrusted) {
+    for (const auto& output : std::vector<std::string>{
+        "existing 2-1\n", "core/existing\n", "core/existing 2-1 extra\n", "core/existing 2-1\r\n",
+        "core/existing 2-1\n\n", "core/existing 2-1\nextra/existing 3-1\n", "../existing 2-1\n",
+        "core/-bad 2-1\n", "core/existing \n", std::string("core/existing 2\0-1\n", 19)}) {
+        process.preview.out = output;
+        const auto snapshot = source->snapshot({.kind = "update-system"});
+        ASSERT_FALSE(snapshot) << output;
+        EXPECT_EQ(snapshot.error().code, protocol::kUntrustedInput);
+    }
+}
+
+TEST_F(JobsLivePlan, TruncatedFailedOrTimedOutPrintIsUntrusted) {
+    process.preview.out_truncated = true;
+    EXPECT_EQ(source->snapshot({.kind = "update-system"}).error().code, protocol::kUntrustedInput);
+    process.preview.out_truncated = false;
+    process.preview.err_truncated = true;
+    EXPECT_EQ(source->snapshot({.kind = "update-system"}).error().code, protocol::kUntrustedInput);
+    process.preview.err_truncated = false;
+    process.preview.timed_out = true;
+    EXPECT_EQ(source->snapshot({.kind = "update-system"}).error().code, protocol::kUntrustedInput);
+    process.preview.timed_out = false;
+    process.preview.exit_code = 1;
+    EXPECT_EQ(source->snapshot({.kind = "update-system"}).error().code, protocol::kUntrustedInput);
+}
+
+TEST_F(JobsLivePlan, UpdateAndInstallPrintUsesTheReportDbAndQualifiedTarget) {
+    process.preview.out += "extra/target 1-1\n";
+    const auto snapshot = source->snapshot({.kind = "install", .packageId = "target"});
+    ASSERT_TRUE(snapshot);
+    EXPECT_EQ(snapshot->plan.kind.value, "update-and-install");
+    EXPECT_EQ(snapshot->targets, (std::vector<std::string>{"extra/target"}));
+    EXPECT_EQ(snapshot->plan.installs.size(), 2);
+    EXPECT_EQ(snapshot->expected_transaction.size(), 64);
+    EXPECT_EQ(process.specs.size(), 3);
+    EXPECT_EQ(process.specs.back().args, (std::vector<std::string>{"--sync", "--sysupgrade", "--print",
+        "--print-format", "%r/%n %v", "--dbpath", (root / "braurser/syncdb-check" / report.report_id).string(),
+        "--needed", "--", "extra/target"}));
+}
+
+TEST_F(JobsLivePlan, PrintedInstallsCannotExceedProtocolArrayLimit) {
+    process.preview.out.clear();
+    for (int index = 0; index < 257; ++index)
+        process.preview.out += "extra/pkg" + std::to_string(index) + " 1-1\n";
+    const auto snapshot = source->snapshot({.kind = "update-system"});
+    ASSERT_FALSE(snapshot);
+    EXPECT_EQ(snapshot.error().code, protocol::kUntrustedInput);
+}
+
+void check_escaped_pipe(bool timeout) {
+    if (!std::filesystem::exists("/usr/bin/python3")) GTEST_SKIP() << "python3 unavailable";
+    Gio::init();
+    GioStreamingProcess process;
+    core::ProcessSpec spec;
+    spec.executable = "/usr/bin/python3";
+    spec.args = {"-c", "import os,signal,time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "pid=os.fork()\n"
+        "if pid == 0:\n"
+        " os.setsid()\n"
+        " time.sleep(30)\n"
+        " os._exit(0)\n"
+        "print(pid, flush=True)\n" + std::string(timeout ? "time.sleep(30)\n" : "os._exit(0)\n")};
+    spec.env = {{"LC_ALL", "C"}};
+    spec.timeout = timeout ? std::chrono::milliseconds(100) : std::chrono::seconds(60);
+    auto loop = Glib::MainLoop::create();
+    std::optional<core::ProcessResult> result;
+    int descendant = 0;
+    int completions = 0;
+    const auto started = std::chrono::steady_clock::now();
+    ASSERT_TRUE(process.start(spec, [&](std::string_view line) {
+        const auto parsed = std::from_chars(line.data(), line.data() + line.size(), descendant);
+        EXPECT_EQ(parsed.ec, std::errc{});
+    }, [&](const core::ProcessResult& exit) {
+        ++completions;
+        result = exit;
+        loop->quit();
+    }));
+    auto watchdog = Glib::signal_timeout().connect([&] { loop->quit(); return false; }, timeout ? 6000 : 15000);
+    loop->run();
+    watchdog.disconnect();
+    if (descendant > 1) ::kill(descendant, SIGKILL);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(completions, 1);
+    EXPECT_GT(descendant, 1);
+    EXPECT_TRUE(result->out_truncated);
+    EXPECT_TRUE(result->err_truncated);
+    EXPECT_EQ(result->timed_out, timeout);
+    EXPECT_LT(std::chrono::steady_clock::now() - started, timeout ? std::chrono::seconds(6) : std::chrono::seconds(15));
+    if (!timeout) { EXPECT_EQ(result->exit_code, 0); }
+}
+
+TEST(JobsStream, ReapedChildCannotLeaveDescendantPipesOpenForever) {
+    check_escaped_pipe(false);
+}
+
+TEST(JobsStream, TimeoutClosesDescendantPipesAfterKillingTheGroup) {
+    check_escaped_pipe(true);
 }
 
 }

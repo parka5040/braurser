@@ -12,6 +12,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits>
+#include <memory>
 #include <string>
 #include <sys/types.h>
 #include <unistd.h>
@@ -34,6 +35,7 @@ public:
         return *this;
     }
     int get() const { return value_; }
+    int release() { return std::exchange(value_, -1); }
     explicit operator bool() const { return value_ >= 0; }
 
 private:
@@ -87,8 +89,11 @@ std::expected<void, FileError> remove_entry(int parent, const std::string& name,
     }
     Fd child(openat(parent, name.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
     if (!child) return std::unexpected(failure(errno, "cannot open subdirectory"));
-    DIR* directory = fdopendir(dup(child.get()));
+    Fd duplicate(dup(child.get()));
+    if (!duplicate) return std::unexpected(failure(errno, "cannot duplicate subdirectory"));
+    DIR* directory = fdopendir(duplicate.get());
     if (!directory) return std::unexpected(failure(errno, "cannot iterate subdirectory"));
+    duplicate.release();
     while (true) {
         errno = 0;
         dirent* item = readdir(directory);
@@ -248,6 +253,47 @@ std::expected<std::string, FileError> read_bounded(const std::filesystem::path& 
         }
         result.append(buffer.data(), static_cast<std::size_t>(count));
     }
+}
+
+std::expected<std::vector<FileEntry>, FileError> list_regular_files(
+    const std::filesystem::path& root, std::size_t max_entries) {
+    auto fd = walk_directory(root);
+    if (!fd) return std::unexpected(fd.error());
+    Fd duplicate(dup(fd->get()));
+    if (!duplicate) return std::unexpected(failure(errno, "cannot duplicate directory"));
+    DIR* raw = fdopendir(duplicate.get());
+    if (!raw) return std::unexpected(failure(errno, "cannot iterate directory"));
+    duplicate.release();
+    auto directory = std::unique_ptr<DIR, void(*)(DIR*)>(raw, [](DIR* value) { closedir(value); });
+    std::vector<FileEntry> result;
+    while (true) {
+        errno = 0;
+        const auto* item = readdir(directory.get());
+        if (!item) {
+            if (errno != 0) return std::unexpected(failure(errno, "cannot iterate directory"));
+            return result;
+        }
+        const std::string name(item->d_name);
+        if (name == "." || name == "..") continue;
+        struct stat info{};
+        if (fstatat(fd->get(), name.c_str(), &info, AT_SYMLINK_NOFOLLOW) != 0)
+            return std::unexpected(failure(errno, "cannot inspect cache entry"));
+        if (!S_ISREG(info.st_mode)) continue;
+        if (result.size() >= max_entries) return std::unexpected(failure(EFBIG, "directory entry limit exceeded"));
+        result.push_back({name, info});
+    }
+}
+
+std::expected<void, FileError> touch_file(const std::filesystem::path& path) {
+    auto parent = parent_directory(path);
+    if (!parent) return std::unexpected(parent.error());
+    Fd file(openat(parent->get(), path.filename().c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
+    if (!file) return std::unexpected(failure(errno, "cannot open cache entry"));
+    struct stat info{};
+    if (fstat(file.get(), &info) != 0 || !S_ISREG(info.st_mode))
+        return std::unexpected(failure(EINVAL, "cache entry is not a regular file"));
+    if (futimens(file.get(), nullptr) != 0) return std::unexpected(failure(errno, "cannot touch cache entry"));
+    return {};
 }
 
 std::expected<void, FileError> remove_tree_confined(const std::filesystem::path& root,

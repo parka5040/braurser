@@ -73,11 +73,22 @@ private:
     bool failed_{};
 };
 
-using Values = std::unordered_map<std::string, std::vector<std::string>>;
+constexpr std::array<std::string_view, 23> keys{
+    "Name", "PackageBase", "Version", "Description", "URL", "Maintainer", "Submitter",
+    "NumVotes", "Popularity", "OutOfDate", "FirstSubmitted", "LastModified", "License",
+    "Keywords", "Groups", "Depends", "MakeDepends", "CheckDepends", "OptDepends", "Provides",
+    "Conflicts", "Replaces", "CoMaintainers"
+};
+using Values = std::array<std::vector<std::string>, 23>;
 
-std::string field(const Values& values, const char* key) {
-    auto it = values.find(key);
-    return it != values.end() && !it->second.empty() ? it->second.front() : "";
+std::size_t slot(std::string_view key) {
+    const auto found = std::ranges::find(keys, key);
+    return static_cast<std::size_t>(found - keys.begin());
+}
+
+std::string_view field(const Values& values, std::string_view key) {
+    const auto index = slot(key);
+    return index < values.size() && !values[index].empty() ? std::string_view(values[index].front()) : std::string_view{};
 }
 
 template<class T>
@@ -88,9 +99,9 @@ T integer(const Values& values, const char* key) {
     return ec == std::errc{} && end == value.data() + value.size() ? number : T{};
 }
 
-std::vector<std::string> list(const Values& values, const char* key) {
-    auto it = values.find(key);
-    return it == values.end() ? std::vector<std::string>{} : it->second;
+std::vector<std::string> list(const Values& values, std::string_view key) {
+    const auto index = slot(key);
+    return index < values.size() ? values[index] : std::vector<std::string>{};
 }
 
 std::optional<AurPackage> make_package(const Values& values) {
@@ -101,8 +112,8 @@ std::optional<AurPackage> make_package(const Values& values) {
     if (!br_valid_pkgname(result.name.data(), result.name.size()) || result.version.empty()) return std::nullopt;
     result.description = field(values, "Description");
     result.url = field(values, "URL");
-    if (values.contains("Maintainer") && !field(values, "Maintainer").empty()) result.maintainer = field(values, "Maintainer");
-    if (values.contains("Submitter") && !field(values, "Submitter").empty()) result.submitter = field(values, "Submitter");
+    if (!field(values, "Maintainer").empty()) result.maintainer = field(values, "Maintainer");
+    if (!field(values, "Submitter").empty()) result.submitter = field(values, "Submitter");
     result.votes = integer<std::uint32_t>(values, "NumVotes");
     const auto popularity = field(values, "Popularity");
     if (!popularity.empty()) {
@@ -110,7 +121,7 @@ std::optional<AurPackage> make_package(const Values& values) {
         auto [end, ec] = std::from_chars(popularity.data(), popularity.data() + popularity.size(), parsed);
         if (ec == std::errc{} && end == popularity.data() + popularity.size() && std::isfinite(parsed)) result.popularity = parsed;
     }
-    if (values.contains("OutOfDate") && !field(values, "OutOfDate").empty()) result.out_of_date = integer<std::int64_t>(values, "OutOfDate");
+    if (!field(values, "OutOfDate").empty()) result.out_of_date = integer<std::int64_t>(values, "OutOfDate");
     result.first_submitted = integer<std::int64_t>(values, "FirstSubmitted");
     result.last_modified = integer<std::int64_t>(values, "LastModified");
     result.licenses = list(values, "License");
@@ -129,10 +140,11 @@ std::optional<AurPackage> make_package(const Values& values) {
 
 class AurSax final : public nlohmann::json_sax<nlohmann::json> {
 public:
-    std::vector<AurPackage> packages;
+    explicit AurSax(const AurSink& sink) : sink_(sink) {}
+    RecordCounts counts;
     bool okay{true};
-    bool null() override { return depth_ == 2 || depth_ == 3; }
-    bool boolean(bool) override { return depth_ == 2 || depth_ == 3; }
+    bool null() override { return put({}); }
+    bool boolean(bool) override { return put({}); }
     bool number_integer(number_integer_t value) override { return put(std::to_string(value)); }
     bool number_unsigned(number_unsigned_t value) override { return put(std::to_string(value)); }
     bool number_float(number_float_t, const string_t& value) override { return put(value); }
@@ -141,18 +153,22 @@ public:
     bool start_object(std::size_t) override {
         ++depth_;
         if (depth_ != 2) { okay = false; return false; }
-        values_.clear();
+        for (auto& values : values_) values.clear();
+        value_count_ = 0;
+        value_bytes_ = 0;
+        key_ = values_.size();
         return true;
     }
     bool key(string_t& value) override {
         if (value.size() > 65536) { okay = false; return false; }
-        key_ = value;
+        key_ = slot(value);
         return true;
     }
     bool end_object() override {
         if (depth_ != 2) { okay = false; return false; }
         if (++records_ > 300000) { okay = false; return false; }
-        if (auto package = make_package(values_)) packages.push_back(std::move(*package));
+        if (auto package = make_package(values_)) { sink_(std::move(*package)); ++counts.packages; }
+        else ++counts.rejected;
         --depth_;
         return true;
     }
@@ -178,8 +194,13 @@ public:
     bool finished() const { return depth_ == 0 && root_started_ && okay; }
 private:
     bool put(const std::string& value) {
-        if (value.size() > 65536) { okay = false; return false; }
-        if (depth_ == 2 || depth_ == 3) values_[key_].push_back(value);
+        if (value.size() > 65536 || ++value_count_ > 20000 || value.size() > 1024 * 1024 - value_bytes_) {
+            okay = false; return false;
+        }
+        value_bytes_ += value.size();
+        if (depth_ == 2 || depth_ == 3) {
+            if (key_ < values_.size()) values_[key_].push_back(value);
+        }
         else { okay = false; return false; }
         return true;
     }
@@ -187,12 +208,17 @@ private:
     std::size_t records_{};
     bool root_started_{};
     Values values_;
-    std::string key_;
+    std::size_t key_{};
+    std::size_t value_count_{};
+    std::size_t value_bytes_{};
+    const AurSink& sink_;
 };
 
 std::optional<Values> from_json(const nlohmann::json& item) {
     if (!item.is_object()) return std::nullopt;
     Values values;
+    std::size_t count = 0;
+    std::size_t bytes = 0;
     for (auto it = item.begin(); it != item.end(); ++it) {
         if (it.key().size() > 65536) return std::nullopt;
         auto collect = [&](const nlohmann::json& value) -> bool {
@@ -200,8 +226,10 @@ std::optional<Values> from_json(const nlohmann::json& item) {
             if (value.is_string()) str = value.get<std::string>();
             else if (value.is_number()) str = value.dump();
             else return value.is_null();
-            if (str.size() > 65536) return false;
-            values[it.key()].push_back(std::move(str));
+            if (str.size() > 65536 || ++count > 20000 || str.size() > 1024 * 1024 - bytes) return false;
+            bytes += str.size();
+            const auto index = slot(it.key());
+            if (index < values.size()) values[index].push_back(std::move(str));
             return true;
         };
         if (it->is_array()) {
@@ -226,17 +254,17 @@ std::string escape(std::string_view text) {
 
 }
 
-std::expected<std::vector<AurPackage>, CatalogError> AurDump::parse(std::span<const std::byte> bytes) const {
+std::expected<RecordCounts, CatalogError> AurDump::parse(std::span<const std::byte> bytes, const AurSink& sink) const {
     if (bytes.empty() || bytes.size() > 64ULL * 1024 * 1024) return std::unexpected(failure("aur-size"));
     InflateBuffer buffer(bytes);
     std::istream stream(&buffer);
-    AurSax sax;
+    AurSax sax(sink);
     const bool parsed = nlohmann::json::sax_parse(stream, &sax);
     if (!parsed || !sax.finished() || !buffer.good()) return std::unexpected(failure("aur-json"));
-    return std::move(sax.packages);
+    return sax.counts;
 }
 
-std::expected<std::vector<AurPackage>, CatalogError> AurDumpFetcher::fetch(const std::filesystem::path& cache_root) const {
+std::expected<RecordCounts, CatalogError> AurDumpFetcher::fetch(const std::filesystem::path& cache_root, const AurSink& sink) const {
     if (!cache_root.is_absolute()) return std::unexpected(failure("aur-cache-path"));
     const auto directory = cache_root / "braurser" / "downloads";
     auto created = core::ensure_private_dir(cache_root / "braurser");
@@ -262,10 +290,10 @@ std::expected<std::vector<AurPackage>, CatalogError> AurDumpFetcher::fetch(const
     if (response->not_modified) {
         auto old = core::read_bounded(path, 64ULL * 1024 * 1024);
         if (!old) return std::unexpected(failure("aur-cache-read"));
-        return AurDump{}.parse(std::as_bytes(std::span(*old)));
+        return AurDump{}.parse(std::as_bytes(std::span(*old)), sink);
     }
     if (response->status != 200) return std::unexpected(failure("aur-status"));
-    auto parsed = AurDump{}.parse(std::as_bytes(std::span(response->body)));
+    auto parsed = AurDump{}.parse(std::as_bytes(std::span(response->body)), sink);
     if (!parsed) return std::unexpected(parsed.error());
     auto written = core::atomic_write(path, response->body);
     if (!written) return std::unexpected(failure("aur-cache-write"));
@@ -273,6 +301,20 @@ std::expected<std::vector<AurPackage>, CatalogError> AurDumpFetcher::fetch(const
     written = core::atomic_write(meta, state.dump());
     if (!written) return std::unexpected(failure("aur-meta-write"));
     return parsed;
+}
+
+std::expected<std::vector<AurPackage>, CatalogError> AurDump::parse(std::span<const std::byte> bytes) const {
+    std::vector<AurPackage> result;
+    auto counts = parse(bytes, [&](AurPackage&& package) { result.push_back(std::move(package)); });
+    if (!counts) return std::unexpected(counts.error());
+    return result;
+}
+
+std::expected<std::vector<AurPackage>, CatalogError> AurDumpFetcher::fetch(const std::filesystem::path& cache_root) const {
+    std::vector<AurPackage> result;
+    auto counts = fetch(cache_root, [&](AurPackage&& package) { result.push_back(std::move(package)); });
+    if (!counts) return std::unexpected(counts.error());
+    return result;
 }
 
 AurRpcClient::AurRpcClient(core::HttpClient& http, std::size_t daily_budget)

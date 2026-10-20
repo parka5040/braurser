@@ -24,6 +24,7 @@ struct HttpRequest {
     int max_redirects{0};
     std::string user_agent{"braurser/0.1"};
     const ConnectGuard* guard{nullptr};
+    bool allow_private_addresses{false};
 };
 
 struct HttpResponse {
@@ -44,8 +45,8 @@ struct HttpError {
 class HttpClient {
 public:
     virtual ~HttpClient() = default;
-    /// in: request permits only explicit HTTPS hosts and bounded responses.
-    /// out: returns the response after validating every redirect.
+    /// in: request permits explicit HTTPS hosts and bounded responses; private targets require an explicit guard or opt-out.
+    /// out: returns the response after validating every redirect and guarding resolved addresses.
     /// err: returns a validation or transport error.
     virtual std::expected<HttpResponse, HttpError> get(const HttpRequest& request) = 0;
 };

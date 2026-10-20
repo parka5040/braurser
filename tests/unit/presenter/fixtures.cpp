@@ -90,7 +90,7 @@ Reply<nlohmann::json> FakeServer::response(std::string_view method, const nlohma
     }
     if (method == "system.status") { return nlohmann::json(protocol::StatusResult{{offline ? "offline" : "online"}, 60, {}, {"sudo-askpass"}, "ready", 60, {{"community", "ok", {}, 2, 0}}}); }
     if (method == "catalog.facets") { return nlohmann::json(protocol::FacetsResult{{{"extra", 1}}, {{"graphics", 3}}, {{"Graphics", 3}}}); }
-    if (method == "catalog.buildFiles") { return nlohmann::json(protocol::BuildFilesResult{"drawing-bin", {{"PKGBUILD", "pkgname=drawing-bin\npkgver=2.0\n"}}, false}); }
+    if (method == "catalog.buildFiles") { return nlohmann::json(protocol::BuildFilesResult{"drawing-bin", {{"PKGBUILD", "pkgname=drawing-bin\npkgver=2.0\n", "text", 31, std::string(64, 'a')}}, false}); }
     if (method == "restart.state") { return nlohmann::json(restart_); }
     if (method == "restart.acknowledge") { restart_ = {}; return nlohmann::json(protocol::EmptyResult{}); }
     if (method == "setup.status") { return nlohmann::json(protocol::SetupStatusResult{{true, "2.1"}, {false, {}}, {"paru"}, {"sudo-askpass"}, {}}); }

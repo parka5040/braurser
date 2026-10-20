@@ -8,7 +8,7 @@ namespace braurser::gtk::kit {
 namespace {
 constexpr std::size_t text_limit = 65536;
 constexpr std::size_t document_limit = 1048576;
-constexpr std::size_t code_limit = 262144;
+constexpr std::size_t code_limit = 448 * 1024;
 
 bool hidden_format(gunichar character) {
     return character == 0x061C || (character >= 0x200B && character <= 0x200F) ||

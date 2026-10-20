@@ -7,10 +7,12 @@
 
 namespace braurser::protocol {
 
+/// in: value is an untrusted DTO payload.
+/// out: true only when the shared DTO rules accept it without materializing it.
 template <class T>
 bool accepts(const nlohmann::json& value) {
     try {
-        static_cast<void>(value.get<T>());
+        validate_json(value, TypeTag<T>{});
         return true;
     } catch (const nlohmann::json::exception&) {
         return false;

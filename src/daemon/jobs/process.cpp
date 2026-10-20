@@ -72,6 +72,7 @@ struct GioStreamingProcess::State {
     std::array<sigc::connection, 2> watches;
     sigc::connection timeout;
     sigc::connection grace;
+    sigc::connection drain;
     core::ProcessResult result;
     pid_t group{};
     bool started{};
@@ -100,12 +101,27 @@ struct GioStreamingProcess::State {
             }
         }
     }
+    void truncate_output() {
+        for (std::size_t index = 0; index < closed.size(); ++index) {
+            watches[index].disconnect();
+            if (!closed[index]) {
+                if (index == 0) result.out_truncated = true;
+                else result.err_truncated = true;
+                flush(index);
+                closed[index] = true;
+            }
+        }
+        close_pipes();
+        finish();
+    }
     void finish() {
         if (finished || !exited || !closed[0] || !closed[1]) return;
         finished = true;
         group = 0;
         timeout.disconnect();
         grace.disconnect();
+        drain.disconnect();
+        for (auto& watch : watches) watch.disconnect();
         close_pipes();
         auto callback = std::move(done);
         if (callback) callback(result);
@@ -120,7 +136,8 @@ struct GioStreamingProcess::State {
                     if (index == 0) result.out_truncated = true;
                     else result.err_truncated = true;
                     kill_group();
-                    return true;
+                    truncate_output();
+                    return false;
                 }
                 received[index] += length;
                 feed(index, std::string_view(buffer.data(), length));
@@ -146,7 +163,9 @@ GioStreamingProcess::~GioStreamingProcess() {
     for (auto& watch : state_->watches) watch.disconnect();
     state_->timeout.disconnect();
     state_->grace.disconnect();
+    state_->drain.disconnect();
     state_->close_pipes();
+    state_->finished = true;
 }
 
 bool GioStreamingProcess::start(const core::ProcessSpec& spec, Line line, Done done) {
@@ -189,6 +208,12 @@ bool GioStreamingProcess::start(const core::ProcessSpec& spec, Line line, Done d
         }
         g_spawn_close_pid(child);
         state->finish();
+        if (!state->finished) {
+            state->drain = Glib::signal_timeout().connect([state] {
+                state->truncate_output();
+                return false;
+            }, 10000);
+        }
     }, pid);
     try {
         for (std::size_t index = 0; index < 2; ++index) {
@@ -209,6 +234,7 @@ bool GioStreamingProcess::start(const core::ProcessSpec& spec, Line line, Done d
             state->signal(SIGTERM);
             state->grace = Glib::signal_timeout().connect([state] {
                 state->kill_group();
+                state->truncate_output();
                 return false;
             }, 2000);
             return false;

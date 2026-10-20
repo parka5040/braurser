@@ -89,7 +89,8 @@ extern "C" int br_parse_request(int argc, const char* const* argv, br_request* o
     if (!count || !parts[0]) return 0;
     const char* op = parts[0];
     int i = 1;
-    int upgrade_needs_targets = 0;
+    out->color = color;
+    out->progress = progress;
     if (equal(op, "--sync")) {
         if (i < count && equal(parts[i], "--needed")) {
             ++i;
@@ -99,8 +100,17 @@ extern "C" int br_parse_request(int argc, const char* const* argv, br_request* o
         } else if (i + 1 < count && equal(parts[i], "--refresh") && equal(parts[i + 1], "--sysupgrade")) {
             i += 2;
             out->operation = 'B';
-            if (i < count && equal(parts[i], "--noconfirm")) ++i;
-            if (i < count && equal(parts[i], "--needed")) { ++i; upgrade_needs_targets = 1; }
+            if (i < count && equal(parts[i], "--noconfirm")) { ++i; out->noconfirm = 1; }
+            if (i < count && equal(parts[i], "--needed")) { ++i; out->needed = 1; }
+            constexpr char prefix[] = "--braurser-transaction=";
+            if (i >= count || strncmp(parts[i], prefix, sizeof(prefix) - 1) != 0) return 0;
+            const char* digest = parts[i++] + sizeof(prefix) - 1;
+            if (strlen(digest) != 64) return 0;
+            for (size_t j = 0; j < 64; ++j) {
+                if (!((digest[j] >= '0' && digest[j] <= '9') ||
+                      (digest[j] >= 'a' && digest[j] <= 'f'))) return 0;
+            }
+            memcpy(out->transaction, digest, sizeof(out->transaction));
         } else return 0;
     } else if (equal(op, "--remove")) {
         if (i + 1 >= count || !equal(parts[i], "--nosave") || !equal(parts[i + 1], "--recursive")) return 0;
@@ -118,10 +128,10 @@ extern "C" int br_parse_request(int argc, const char* const* argv, br_request* o
         ++i;
         if (i < count && equal(parts[i], "--noconfirm")) ++i;
     } else return 0;
-    if (out->operation == 'B' && i == count && !upgrade_needs_targets) return 1;
+    if (out->operation == 'B' && i == count && !out->needed) return 1;
     if (i >= count || !equal(parts[i], "--")) return 0;
     ++i;
-    if (out->operation == 'B' && (!upgrade_needs_targets || i == count)) return 0;
+    if (out->operation == 'B' && !out->needed) return 0;
     size_t max = out->operation == 'D' ? 64u : 512u;
     if (i == count || static_cast<size_t>(count - i) > max) return 0;
     for (; i < count; ++i) {
@@ -137,6 +147,160 @@ extern "C" int br_parse_request(int argc, const char* const* argv, br_request* o
         out->targets[out->count++] = s;
     }
     return 1;
+}
+
+extern "C" size_t br_build_upgrade_argv(const br_request* req, const char* dbpath,
+                                        const char** argv, size_t capacity) {
+    if (!req || req->operation != 'B' || req->count > 512 || !br_valid_dbpath(dbpath) ||
+        !argv || capacity < req->count + 11) return 0;
+    size_t n = 0;
+    argv[n++] = "pacman";
+    argv[n++] = "--sync";
+    argv[n++] = "--sysupgrade";
+    argv[n++] = "--noconfirm";
+    argv[n++] = "--dbpath";
+    argv[n++] = dbpath;
+    if (req->color) argv[n++] = "--color=never";
+    if (req->progress) argv[n++] = "--noprogressbar";
+    if (req->needed) argv[n++] = "--needed";
+    if (req->count) argv[n++] = "--";
+    for (size_t i = 0; i < req->count; ++i) argv[n++] = req->targets[i];
+    argv[n] = nullptr;
+    return n;
+}
+
+extern "C" size_t br_build_print_argv(const br_request* req, const char* dbpath,
+                                      const char** argv, size_t capacity) {
+    if (!req || req->operation != 'B' || req->count > 512 || !dbpath || !argv ||
+        capacity < req->count + 13) return 0;
+    size_t n = 0;
+    argv[n++] = "pacman";
+    argv[n++] = "--sync";
+    argv[n++] = "--sysupgrade";
+    argv[n++] = "--print";
+    argv[n++] = "--print-format";
+    argv[n++] = "%r/%n %v";
+    argv[n++] = "--dbpath";
+    argv[n++] = dbpath;
+    argv[n++] = "--color=never";
+    if (req->needed) argv[n++] = "--needed";
+    if (req->count) argv[n++] = "--";
+    for (size_t i = 0; i < req->count; ++i) argv[n++] = req->targets[i];
+    argv[n] = nullptr;
+    return n;
+}
+
+extern "C" void br_transaction_hex(const uint8_t raw[32], char hex[65]) {
+    br_hex32(raw, hex);
+}
+
+extern "C" int br_transaction_equal(const char a[65], const char b[65]) {
+    unsigned difference = static_cast<unsigned>(a[64]) | static_cast<unsigned>(b[64]);
+    for (size_t i = 0; i < 64; ++i) {
+        const unsigned char x = static_cast<unsigned char>(a[i]);
+        const unsigned char y = static_cast<unsigned char>(b[i]);
+        const unsigned valid_x = static_cast<unsigned>((x >= '0' && x <= '9') || (x >= 'a' && x <= 'f'));
+        const unsigned valid_y = static_cast<unsigned>((y >= '0' && y <= '9') || (y >= 'a' && y <= 'f'));
+        difference |= static_cast<unsigned>(x ^ y) | (valid_x ^ 1U) | (valid_y ^ 1U);
+    }
+    return difference == 0;
+}
+
+extern "C" int br_valid_dbpath(const char* path) {
+    if (!path || path[0] != '/') return 0;
+    size_t n = strnlen(path, PATH_MAX + 1);
+    if (!n || n >= PATH_MAX || has_control(path, n)) return 0;
+    const char* cursor = path;
+    while (*cursor) {
+        while (*cursor == '/') ++cursor;
+        const char* end = strchr(cursor, '/');
+        if (!end) end = cursor + strlen(cursor);
+        if (end - cursor == 2 && cursor[0] == '.' && cursor[1] == '.') return 0;
+        cursor = end;
+    }
+    return 1;
+}
+
+extern "C" int br_trusted_directory(const struct stat* metadata) {
+    return metadata && S_ISDIR(metadata->st_mode) && metadata->st_uid == 0 &&
+           !(metadata->st_mode & 0022);
+}
+
+namespace {
+int trusted_descriptor(int fd, const br_database_provider* provider) {
+    struct stat metadata{};
+    if (fd < 0) return -1;
+    int result = provider ? provider->stat_directory(fd, &metadata, provider->context) : fstat(fd, &metadata);
+    if (result || !br_trusted_directory(&metadata)) { close(fd); return -1; }
+    return fd;
+}
+}
+
+extern "C" int br_open_trusted_directory(int parent, const char* name, const br_database_provider* provider) {
+    if (!name || (provider && !provider->stat_directory)) return -1;
+    return trusted_descriptor(openat(parent, name, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC), provider);
+}
+
+extern "C" int br_open_database_path(const char* path, const br_database_provider* provider) {
+    if (!br_valid_dbpath(path) || (provider && !provider->stat_directory)) return -1;
+    int dir = trusted_descriptor(open("/", O_PATH | O_DIRECTORY | O_CLOEXEC), provider);
+    if (dir < 0) return -1;
+    const char* cursor = path + 1;
+    while (*cursor) {
+        if (*cursor == '/') { ++cursor; continue; }
+        const char* end = strchr(cursor, '/');
+        if (!end) end = cursor + strlen(cursor);
+        size_t length = static_cast<size_t>(end - cursor);
+        char name[NAME_MAX + 1]{};
+        if (length > NAME_MAX) { close(dir); return -1; }
+        memcpy(name, cursor, length);
+        int next = br_open_trusted_directory(dir, name, provider);
+        close(dir);
+        if (next < 0) return -1;
+        dir = next;
+        cursor = end;
+    }
+    return dir;
+}
+
+extern "C" br_sync_action br_sync_entry_action(const char* name, mode_t mode, int staged_present) {
+    if (!name || (staged_present != 0 && staged_present != 1)) return BR_SYNC_INVALID;
+    size_t n = strnlen(name, NAME_MAX + 1);
+    if (!n || n > NAME_MAX || strchr(name, '/')) return BR_SYNC_INVALID;
+    if (equal(name, ".") || equal(name, "..")) return BR_SYNC_SKIP;
+    if (!S_ISREG(mode)) return BR_SYNC_INVALID;
+    size_t suffix = 0;
+    if (n > 7 && equal(name + n - 7, ".db.sig")) suffix = 7;
+    else if (n > 3 && equal(name + n - 3, ".db")) suffix = 3;
+    if (!suffix || !br_valid_repo_name(name, n - suffix)) return BR_SYNC_COPY;
+    if (staged_present) return BR_SYNC_OVERWRITE;
+    return suffix == 7 ? BR_SYNC_DELETE : BR_SYNC_COPY;
+}
+
+extern "C" int br_add_archive(br_archive_batch* batch, dev_t device, ino_t inode, uint64_t bytes) {
+    constexpr uint64_t limit = UINT64_C(8589934592);
+    if (!batch || batch->count >= 64 || batch->total > limit || bytes > UINT64_C(4294967296) ||
+        bytes > limit - batch->total) return 0;
+    for (size_t i = 0; i < batch->count; ++i) {
+        if (batch->devices[i] == device && batch->inodes[i] == inode) return 0;
+    }
+    batch->devices[batch->count] = device;
+    batch->inodes[batch->count++] = inode;
+    batch->total += bytes;
+    return 1;
+}
+
+extern "C" int br_stage_space(uint64_t total, uint64_t blocks, uint64_t block_size) {
+    constexpr uint64_t reserve = UINT64_C(1073741824);
+    if (!block_size || total > UINT64_MAX - reserve) return 0;
+    const uint64_t required = total + reserve;
+    const uint64_t whole = required / block_size;
+    return blocks >= whole && (required % block_size == 0 || blocks > whole);
+}
+
+extern "C" void br_clean_archives(char paths[64][4096], size_t staged) {
+    if (staged > 64) staged = 64;
+    for (size_t i = 0; i < staged; ++i) if (paths[i][0]) unlink(paths[i]);
 }
 
 extern "C" int br_open_archive(const char* path, const char* home, uid_t caller,

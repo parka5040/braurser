@@ -119,6 +119,13 @@ std::expected<std::filesystem::path, ManualError> build_system_package(
     if (uname(&machine) != 0) return std::unexpected(fail("package-arch"));
     auto render = render_pkgbuild(receipt, date, has_elf ? machine.machine : "any");
     if (!render) return std::unexpected(render.error());
+    auto planned = receipt;
+    planned.files = validated->files;
+    planned.launcher_ids = validated->launchers;
+    planned.pkgname = render->first;
+    planned.installed_at = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    auto limits = validate_receipt_limits(planned);
+    if (!limits) return std::unexpected(limits.error());
     const auto root = job_dir / render->first;
     for (const auto& path : {job_dir, root, root / "packages", root / "sources", root / "build"}) {
         if (!core::ensure_private_dir(path)) return std::unexpected(fail("package-directory"));

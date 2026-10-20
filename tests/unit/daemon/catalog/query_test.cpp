@@ -8,6 +8,22 @@
 namespace braurser::daemon::catalog {
 namespace {
 
+TEST(OfficialIndex, EmptyLookupAndFirstInsertionWins) {
+    OfficialIndex index;
+    index.finish();
+    EXPECT_EQ(index.size(), 0);
+    EXPECT_FALSE(index.version("absent"));
+    index.add("zlib", "1");
+    index.add("alpha", "2");
+    index.add("zlib", "9");
+    index.finish();
+    EXPECT_EQ(index.size(), 2);
+    EXPECT_EQ(index.version("alpha"), "2");
+    EXPECT_EQ(index.version("zlib"), "1");
+    EXPECT_FALSE(index.version("alph"));
+    EXPECT_FALSE(index.version("zzzz"));
+}
+
 TEST(LocalQueryCompute, VersionedProvidesAndRepositoryPriority) {
     LocalRecord provider;
     provider.package.name = "provider";
@@ -28,7 +44,10 @@ TEST(LocalQueryCompute, VersionedProvidesAndRepositoryPriority) {
     RepoPackage second = first;
     second.version = "3-1";
     const std::vector<LocalRecord> local{provider, consumer, unused};
-    const std::vector<RepoPackage> repos{first, second};
+    OfficialIndex repos;
+    repos.add(first.name, first.version);
+    repos.add(second.name, second.version);
+    repos.finish();
     auto sets = LocalQuery{}.compute(local, repos);
     EXPECT_EQ(sets.orphans, (std::vector<std::string>{"unused"}));
     EXPECT_EQ(sets.native, (std::vector<std::string>{"provider"}));
@@ -44,13 +63,12 @@ TEST(LocalQueryParity, MatchesPacmanQuerySetsOnHost) {
     ASSERT_TRUE(configured) << configured.error().code;
     auto local = LocalDbReader{}.read(configured->db_path);
     ASSERT_TRUE(local) << local.error().code;
-    std::vector<RepoPackage> packages;
+    OfficialIndex packages;
     for (const auto& repo : configured->names) {
-        auto read = SyncDbReader{}.read(configured->db_path, repo);
+        auto read = SyncDbReader{}.read(configured->db_path, repo, [&](RepoPackage&& package) { packages.add(package.name, package.version); });
         ASSERT_TRUE(read) << read.error().code;
-        packages.insert(packages.end(), std::make_move_iterator(read->packages.begin()),
-                        std::make_move_iterator(read->packages.end()));
     }
+    packages.finish();
     const auto sets = LocalQuery{}.compute(*local, packages);
     const std::array<std::pair<std::string, const std::vector<std::string>*>, 6> tests{{
         {"-Qq", &sets.installed}, {"-Qqe", &sets.explicit_packages},

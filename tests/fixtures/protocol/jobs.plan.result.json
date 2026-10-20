@@ -11,6 +11,7 @@
   "restart": [],
   "requires_build_review": false,
   "build_review_refs": [],
+  "build_pins": [],
   "protected_blockers": [],
   "blockers": []
 }

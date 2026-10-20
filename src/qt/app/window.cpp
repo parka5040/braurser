@@ -71,6 +71,7 @@ Window::Window(Models& models, presenter::Copy& copy, Platform& platform)
     setCentralWidget(shell_);
     themes_.manage(*this);
     const auto observe = [this](auto& model) { subscriptions_.push_back(model.observe([this](const auto&) { schedule(); })); };
+    subscriptions_.push_back(presenter::bind_page_retention(models_.shell, models_.details, models_.installed));
     observe(models_.shell); observe(models_.discover); observe(models_.search); observe(models_.details);
     observe(models_.variants); observe(models_.confirm); observe(models_.activity); observe(models_.updates);
     observe(models_.installed); observe(models_.git); observe(models_.settings); observe(models_.first);
@@ -146,6 +147,7 @@ void Window::render() {
             focused = field->objectName(); cursor = field->cursorPosition();
         }
     }
+    delete scroll_->takeWidget();
     auto* content = column();
     auto& box = *static_cast<QVBoxLayout*>(content->layout());
     const auto page = page_name(destination);
@@ -192,9 +194,7 @@ void Window::render() {
     case Destination::Git: git_page(box); break;
     }
     box.addStretch();
-    QWidget* previous = scroll_->takeWidget();
     scroll_->setWidget(content);
-    delete previous;
     rendered_ = destination;
     rendered_id_ = location_id;
     scroll_->verticalScrollBar()->setValue(position);

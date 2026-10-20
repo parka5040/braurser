@@ -70,7 +70,7 @@ struct SnapshotBuilder::Impl {
     std::unique_ptr<Statement> sources_stmt;
 
     std::expected<void, catalog::CatalogError> reject(std::string code, std::string detail) {
-        failed = true;
+        if (code == "storage") failed = true;
         return std::unexpected(internal::error(std::move(code), std::move(detail)));
     }
     void close() {
@@ -334,11 +334,38 @@ std::expected<void, catalog::CatalogError> SnapshotBuilder::add(const catalog::S
         return impl_->reject("storage", e.what());
     }
 }
+std::expected<void, catalog::CatalogError> SnapshotBuilder::savepoint() {
+    if (!impl_->db) return std::unexpected(internal::error("state", "begin required"));
+    try {
+        impl_->db->execute("SAVEPOINT source");
+        return {};
+    } catch (const std::exception& e) {
+        return impl_->reject("storage", e.what());
+    }
+}
+std::expected<void, catalog::CatalogError> SnapshotBuilder::release_savepoint() {
+    if (!impl_->db) return std::unexpected(internal::error("state", "begin required"));
+    try {
+        impl_->db->execute("RELEASE SAVEPOINT source");
+        return {};
+    } catch (const std::exception& e) {
+        return impl_->reject("storage", e.what());
+    }
+}
+std::expected<void, catalog::CatalogError> SnapshotBuilder::rollback_to_savepoint() {
+    if (!impl_->db) return std::unexpected(internal::error("state", "begin required"));
+    try {
+        impl_->db->execute("ROLLBACK TO SAVEPOINT source");
+        return {};
+    } catch (const std::exception& e) {
+        return impl_->reject("storage", e.what());
+    }
+}
 std::expected<void, catalog::CatalogError> SnapshotBuilder::commit() {
     if (!impl_->db) return std::unexpected(internal::error("state", "begin required"));
     if (impl_->failed) {
         impl_->abort();
-        return std::unexpected(internal::error("invalid-record", "snapshot contains rejected records"));
+        return std::unexpected(internal::error("storage", "snapshot contains storage failures"));
     }
     try {
         impl_->db->execute(

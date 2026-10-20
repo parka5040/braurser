@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <span>
 #include <string>
@@ -35,6 +36,15 @@ private:
     core::ProcessRunner& runner_;
 };
 
+struct RecordCounts {
+    std::size_t packages{};
+    std::size_t rejected{};
+};
+
+using RepoSink = std::function<void(RepoPackage&&)>;
+using AurSink = std::function<void(AurPackage&&)>;
+using AppSink = std::function<void(AppMetadata&&)>;
+
 struct SyncResult {
     std::vector<RepoPackage> packages;
     std::size_t rejected{};
@@ -46,12 +56,15 @@ std::expected<RepoPackage, CatalogError> parse_repo_desc(std::string_view desc, 
 
 class SyncDbReader {
 public:
+    /// in: archive and repo are bounded; sink consumes each valid record immediately.
+    /// out: emitted and rejected counts; errors may follow emitted records.
+    std::expected<RecordCounts, CatalogError> read_bytes(std::span<const std::byte> archive, std::string_view repo, const RepoSink& sink) const;
+    /// in: db_path is absolute; sink consumes each valid record immediately.
+    /// out: emitted and rejected counts; errors may follow emitted records.
+    std::expected<RecordCounts, CatalogError> read(const std::filesystem::path& db_path, std::string_view repo, const RepoSink& sink) const;
     /// in: archive contains a bounded compressed pacman database.
     /// out: valid records and a rejected-record count.
     std::expected<SyncResult, CatalogError> read_bytes(std::span<const std::byte> archive, std::string_view repo) const;
-    /// in: db_path is the absolute pacman database root.
-    /// out: reads the named sync database.
-    std::expected<SyncResult, CatalogError> read(const std::filesystem::path& db_path, std::string_view repo) const;
 };
 
 struct LocalRecord {
@@ -83,15 +96,37 @@ struct QuerySets {
     std::vector<InstalledPackage> packages;
 };
 
+class OfficialIndex {
+public:
+    /// in: bounded package name and version; call finish before subsequent lookups.
+    /// err: oversized strings or arena throw length_error.
+    void add(std::string_view name, std::string_view version);
+    /// out: sorted index, keeping the first insertion of each name.
+    void finish();
+    /// pre: finish succeeded and no later add occurred.
+    /// out: version view valid until the next mutation, or null if absent.
+    std::optional<std::string_view> version(std::string_view name) const;
+    /// pre: finish succeeded.
+    /// out: unique package count.
+    std::size_t size() const noexcept { return entries_.size(); }
+private:
+    struct Entry { std::uint32_t offset; std::uint16_t name_length; std::uint16_t version_length; };
+    std::string arena_;
+    std::vector<Entry> entries_;
+};
+
 class LocalQuery {
 public:
-    /// in: repos are ordered as returned by pacman-conf.
+    /// in: official is finalized in configured repository priority order.
     /// out: installed-package query sets and computed flags.
-    QuerySets compute(std::span<const LocalRecord> local, std::span<const RepoPackage> repos) const;
+    QuerySets compute(std::span<const LocalRecord> local, const OfficialIndex& official) const;
 };
 
 class AurDump {
 public:
+    /// in: bytes contain a bounded compressed dump; sink consumes validated records.
+    /// out: emitted and rejected counts; errors may follow emitted records.
+    std::expected<RecordCounts, CatalogError> parse(std::span<const std::byte> bytes, const AurSink& sink) const;
     /// in: bytes contain the compressed AUR metadata dump.
     /// out: SAX-decoded validated packages, without constructing the full document.
     std::expected<std::vector<AurPackage>, CatalogError> parse(std::span<const std::byte> bytes) const;
@@ -100,6 +135,10 @@ public:
 class AurDumpFetcher {
 public:
     explicit AurDumpFetcher(core::HttpClient& http) : http_(http) {}
+    /// in: cache_root is absolute; sink consumes validated records immediately.
+    /// out: emitted and rejected counts; failed refresh preserves the previous dump.
+    /// err: errors may follow emitted records; caller must roll them back before fallback.
+    std::expected<RecordCounts, CatalogError> fetch(const std::filesystem::path& cache_root, const AurSink& sink) const;
     /// in: cache_root is the absolute XDG cache root.
     /// out: validated current dump; on failed refresh the previous dump remains.
     std::expected<std::vector<AurPackage>, CatalogError> fetch(const std::filesystem::path& cache_root) const;
@@ -134,14 +173,18 @@ struct AppStreamRecord {
 
 class AppStreamReader {
 public:
+    /// in: path is a compressed collection; sink consumes one component at a time.
+    /// out: bounded component count; errors may follow emitted records.
+    std::expected<std::size_t, CatalogError> read_records(const std::filesystem::path& path, const std::function<void(AppStreamRecord&&)>& sink, std::size_t component_limit = 300000) const;
+    /// in: sink consumes discovered application metadata immediately.
+    /// out: aggregate component count bounded across all collections.
+    std::expected<std::size_t, CatalogError> discover(const AppSink& sink) const;
     /// in: path is a compressed AppStream collection.
     /// out: metadata and all cached icon sizes for supported components.
     std::expected<std::vector<AppStreamRecord>, CatalogError> read_records(const std::filesystem::path& path) const;
     /// in: path is a compressed AppStream collection.
     /// out: bounded application metadata for supported component types.
     std::expected<std::vector<AppMetadata>, CatalogError> read(const std::filesystem::path& path) const;
-    /// out: metadata from discovered system AppStream collections.
-    std::expected<std::vector<AppMetadata>, CatalogError> discover() const;
 };
 
 class IconConverter {

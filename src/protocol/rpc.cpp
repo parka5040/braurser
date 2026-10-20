@@ -147,21 +147,21 @@ std::expected<Message, ProtocolError> parse_message(std::string_view text) {
                 if (!descriptor) return std::unexpected(ProtocolError{kMethodNotFound, "error.method_not_found"});
                 if (!descriptor->validate_params(j.at("params")))
                     return std::unexpected(ProtocolError{kInvalidParams, "error.invalid_params"});
-                return Message(Request{std::move(id), name, j.at("params")});
+                return Message(Request{std::move(id), name, std::move(j.at("params"))});
             }
             if (j.contains("apiVersion")) return std::unexpected(ProtocolError{kInvalidRequest, "error.invalid_request"});
             const auto* descriptor = notification(name);
             if (!descriptor) return std::unexpected(ProtocolError{kMethodNotFound, "error.method_not_found"});
             if (!descriptor->validate_params(j.at("params")))
                 return std::unexpected(ProtocolError{kInvalidParams, "error.invalid_params"});
-            return Message(Notification{name, j.at("params")});
+            return Message(Notification{name, std::move(j.at("params"))});
         }
         if (!fields(j, {"jsonrpc", "id", "result", "error"}) || !j.contains("id") ||
             j.contains("result") == j.contains("error"))
             return std::unexpected(ProtocolError{kInvalidRequest, "error.invalid_request"});
         RequestId id = read_id(j.at("id"));
         if (j.contains("error")) return Message(Response{std::move(id), read_error(j.at("error"))});
-        return Message(Response{std::move(id), j.at("result")});
+        return Message(Response{std::move(id), std::move(j.at("result"))});
     } catch (const nlohmann::json::exception&) {
         return std::unexpected(ProtocolError{kInvalidRequest, "error.invalid_request"});
     } catch (const std::invalid_argument&) {
@@ -194,6 +194,7 @@ std::string serialize_message(const Message& message) {
         }
     }, message);
     const auto text = j.dump();
+    j = nullptr;
     if (!parse_message(text)) throw std::invalid_argument("invalid message");
     return text;
 }

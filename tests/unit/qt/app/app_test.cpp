@@ -148,6 +148,34 @@ TEST(QtApp, SearchPopulatedEmptyLoadingAndError) {
     }
 }
 
+TEST(QtApp, SearchKeepsOneBoundedWidgetWindowAndPreviousNextControls) {
+    Screen screen;
+    protocol::SearchResult page;
+    page.packages.assign(50, presenter::fixtures::data().packages.front()); page.nextCursor = "next";
+    screen.server.reply("catalog.search", page); screen.page("search");
+    QPointer<QPushButton> old_card;
+    for (auto* widget : screen.window.findChildren<QPushButton*>()) {
+        if (dynamic_cast<kit::AppCard*>(widget)) { old_card = widget; break; }
+    }
+    ASSERT_FALSE(old_card.isNull());
+    bool destroyed_before_replacement = false;
+    QObject::connect(old_card.data(), &QObject::destroyed, &screen.window, [&] {
+        destroyed_before_replacement = std::ranges::none_of(screen.window.findChildren<QPushButton*>(), [](const auto* widget) {
+            return dynamic_cast<const kit::AppCard*>(widget) != nullptr;
+        });
+    });
+    for (int index = 0; index < 4; ++index) {
+        auto* next = action(screen.window, screen.copy.text("search.next")); ASSERT_NE(next, nullptr); next->click(); pump();
+    }
+    EXPECT_TRUE(old_card.isNull()); EXPECT_TRUE(destroyed_before_replacement);
+    const auto cards = screen.window.findChildren<QPushButton*>();
+    EXPECT_EQ(std::ranges::count_if(cards, [](const auto* widget) { return dynamic_cast<const kit::AppCard*>(widget) != nullptr; }), 200);
+    EXPECT_EQ(screen.models.search.state().visible_first, 51U); EXPECT_EQ(screen.models.search.state().visible_last, 250U);
+    auto* previous = action(screen.window, screen.copy.text("search.previous")); ASSERT_NE(previous, nullptr); previous->click(); pump();
+    EXPECT_EQ(screen.models.search.state().visible_first, 1U); EXPECT_EQ(screen.models.search.state().visible_last, 200U);
+    EXPECT_EQ(action(screen.window, screen.copy.text("search.previous")), nullptr);
+}
+
 TEST(QtApp, CategoryIsSentToCatalog) {
     Screen screen;
     presenter::FilterSelection selection;

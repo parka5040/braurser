@@ -1,12 +1,17 @@
 #include <braurser/daemon/manual/manual.hpp>
 #include <braurser/daemon/core/connect.hpp>
+#include <braurser/daemon/core/files.hpp>
 
 #include <arpa/inet.h>
 #include <curl/curl.h>
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
+#include <utility>
 #include <limits>
 #include <memory>
 #include <netinet/in.h>
@@ -45,7 +50,7 @@ bool valid_path(std::string_view path) {
         if (component.empty() || component == "." || component == ".." || component.size() > 255) return false;
         for (const char raw_ch : component) {
             const auto ch = static_cast<unsigned char>(raw_ch);
-            if (!(std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~')) return false;
+            if (!(std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~' || ch == '+' || ch == '@')) return false;
         }
         start = end == path.npos ? path.size() : end + 1;
         if (end != path.npos && start == path.size()) return false;
@@ -55,7 +60,7 @@ bool valid_path(std::string_view path) {
 
 struct ReplyState {
     GitReply reply;
-    bool exceeded{};
+    std::optional<ManualError> error;
     std::size_t headers{};
 };
 
@@ -63,11 +68,11 @@ size_t body_cb(char* data, size_t size, size_t count, void* context) {
     auto& state = *static_cast<ReplyState*>(context);
     if (size && count > SIZE_MAX / size) return 0;
     const auto bytes = size * count;
-    if (bytes > 512ULL * 1024 * 1024 - state.reply.body.size()) {
-        state.exceeded = true;
+    auto result = state.reply.body.append(std::string_view(data, bytes));
+    if (!result) {
+        state.error = std::move(result.error());
         return 0;
     }
-    state.reply.body.append(data, bytes);
     return bytes;
 }
 
@@ -98,6 +103,87 @@ curl_socket_t guarded_socket(void*, curlsocktype, curl_sockaddr* target) {
     return socket(target->family, target->socktype | SOCK_CLOEXEC, target->protocol);
 }
 
+}
+
+GitReply::Body::~Body() { if (fd_ >= 0) close(fd_); }
+
+GitReply::Body::Body(Body&& other) noexcept
+    : fd_(std::exchange(other.fd_, -1)), size_(std::exchange(other.size_, 0)), limit_(other.limit_) {}
+
+GitReply::Body& GitReply::Body::operator=(Body&& other) noexcept {
+    if (this != &other) {
+        if (fd_ >= 0) close(fd_);
+        fd_ = std::exchange(other.fd_, -1);
+        size_ = std::exchange(other.size_, 0);
+        limit_ = other.limit_;
+    }
+    return *this;
+}
+
+std::expected<GitReply::Body, ManualError> GitReply::Body::create(
+    const std::filesystem::path& cache_root, std::size_t max_bytes) {
+    if (!cache_root.is_absolute()) return std::unexpected(fail("git-spool"));
+    const auto manual = cache_root / "braurser/manual";
+    const auto directory = manual / "spool";
+    for (const auto& part : {cache_root / "braurser", manual, directory}) {
+        if (!core::ensure_private_dir(part)) return std::unexpected(fail("git-spool"));
+    }
+    Body result;
+    result.limit_ = std::min(max_bytes, kMaxBytes);
+    result.fd_ = open(directory.c_str(), O_RDWR | O_TMPFILE | O_CLOEXEC, 0600);
+    if (result.fd_ < 0) {
+        auto pattern = (directory / "response-XXXXXX").string();
+        result.fd_ = mkostemp(pattern.data(), O_CLOEXEC);
+        if (result.fd_ < 0) return std::unexpected(fail("git-spool"));
+        int removed;
+        do { removed = unlink(pattern.c_str()); } while (removed != 0 && errno == EINTR);
+        if (removed != 0) return std::unexpected(fail("git-spool"));
+    }
+    return result;
+}
+
+std::expected<void, ManualError> GitReply::Body::append(std::string_view bytes) {
+    if (bytes.size() > limit_ - size_) {
+        *this = Body{};
+        return std::unexpected(fail("git-size"));
+    }
+    std::size_t offset = 0;
+    while (offset < bytes.size()) {
+        const auto amount = std::min(bytes.size() - offset, kReadChunk);
+        const auto written = pwrite(fd_, bytes.data() + offset, amount, static_cast<off_t>(size_));
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) {
+            *this = Body{};
+            return std::unexpected(fail("git-spool-write"));
+        }
+        const auto count = static_cast<std::size_t>(written);
+        offset += count;
+        size_ += count;
+    }
+    return {};
+}
+
+std::expected<std::size_t, ManualError> GitReply::Body::read(
+    std::span<char> buffer, std::size_t offset) const {
+    if (offset > size_) return std::unexpected(fail("git-spool-read"));
+    const auto amount = std::min({buffer.size(), size_ - offset, kReadChunk});
+    std::size_t copied = 0;
+    while (copied < amount) {
+        const auto count = pread(fd_, buffer.data() + copied, amount - copied,
+                                 static_cast<off_t>(offset + copied));
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return std::unexpected(fail("git-spool-read"));
+        copied += static_cast<std::size_t>(count);
+    }
+    return copied;
+}
+
+std::expected<GitReply, ManualError> GitHttp::request_bounded(
+    std::string_view url, std::string_view body, bool post, std::size_t max_bytes) {
+    auto result = request(url, body, post);
+    if (result && result->body.size() > std::min(max_bytes, GitReply::Body::kMaxBytes))
+        return std::unexpected(fail("git-size"));
+    return result;
 }
 
 std::expected<GitUrl, ManualError> validate_git_url(std::string_view input) {
@@ -146,13 +232,28 @@ std::expected<GitUrl, ManualError> validate_git_url(std::string_view input) {
 
 std::expected<GitReply, ManualError> CurlGitHttp::request(
     std::string_view url, std::string_view body, bool post) {
+    return request_bounded(url, body, post, GitReply::Body::kMaxBytes);
+}
+
+std::expected<GitReply, ManualError> CurlGitHttp::request_bounded(
+    std::string_view url, std::string_view body, bool post, std::size_t max_bytes) {
     if (url.size() > 8192 || !url.starts_with("https://") ||
         (post && body.size() > 512ULL * 1024 * 1024)) return std::unexpected(fail("git-request"));
     static const bool initialized = curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
     if (!initialized) return std::unexpected(fail("curl-init"));
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> handle(curl_easy_init(), curl_easy_cleanup);
     if (!handle) return std::unexpected(fail("curl-init"));
+    auto cache = cache_root_;
+    if (cache.empty()) {
+        const auto* configured = std::getenv("XDG_CACHE_HOME");
+        const auto* home = std::getenv("HOME");
+        if (configured && *configured) cache = configured;
+        else if (home && *home) cache = std::filesystem::path(home) / ".cache";
+    }
+    auto spool = GitReply::Body::create(cache, max_bytes);
+    if (!spool) return std::unexpected(spool.error());
     ReplyState state;
+    state.reply.body = std::move(*spool);
     const std::string target(url);
     curl_slist* raw = curl_slist_append(nullptr, post ?
         "Content-Type: application/x-git-upload-pack-request" :
@@ -176,7 +277,8 @@ std::expected<GitReply, ManualError> CurlGitHttp::request(
     curl_easy_setopt(handle.get(), CURLOPT_NOPROXY, "*");
     curl_easy_setopt(handle.get(), CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(handle.get(), CURLOPT_TIMEOUT, 600L);
-    curl_easy_setopt(handle.get(), CURLOPT_MAXFILESIZE_LARGE, static_cast<curl_off_t>(512ULL * 1024 * 1024));
+    curl_easy_setopt(handle.get(), CURLOPT_MAXFILESIZE_LARGE,
+                     static_cast<curl_off_t>(std::min(max_bytes, GitReply::Body::kMaxBytes)));
     curl_easy_setopt(handle.get(), CURLOPT_OPENSOCKETFUNCTION, guarded_socket);
     curl_easy_setopt(handle.get(), CURLOPT_WRITEFUNCTION, body_cb);
     curl_easy_setopt(handle.get(), CURLOPT_WRITEDATA, &state);
@@ -188,12 +290,14 @@ std::expected<GitReply, ManualError> CurlGitHttp::request(
         curl_easy_setopt(handle.get(), CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size()));
     }
     const auto status = curl_easy_perform(handle.get());
-    if (status != CURLE_OK) return std::unexpected(fail(state.exceeded ? "git-size" : "git-connect"));
+    if (state.error) return std::unexpected(std::move(*state.error));
+    if (status != CURLE_OK)
+        return std::unexpected(fail(status == CURLE_FILESIZE_EXCEEDED ? "git-size" : "git-connect"));
     curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &state.reply.status);
     return std::move(state.reply);
 }
 
-std::expected<std::string, ManualError> GuardedGitTransport::exchange(
+std::expected<GitReply::Body, ManualError> GuardedGitTransport::exchange(
     std::string_view url, std::string_view payload) {
     auto parsed = validate_git_url(url);
     if (!parsed) return std::unexpected(parsed.error());

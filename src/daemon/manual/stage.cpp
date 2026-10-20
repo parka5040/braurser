@@ -299,6 +299,7 @@ std::expected<StageManifest, ManualError> validate_stage(
                 xmlFreeParserCtxt(context);
             }
         } else refused.push_back(name);
+        if (manifest.files.size() > kMaxReceiptFiles) return std::unexpected(fail("receipt-limit"));
         if (refused.size() > 20) break;
     }
     if (ec) return std::unexpected(fail("stage-read"));
@@ -330,13 +331,19 @@ std::expected<std::string, ManualError> run_staging(
             !std::all_of(makeflags.begin() + 2, makeflags.end(), [](unsigned char ch) { return std::isdigit(ch); }))
             return std::unexpected(fail("makeflags"));
     }
+    std::error_code prlimit_error;
+    const auto prlimit = std::filesystem::canonical("/usr/bin/prlimit", prlimit_error);
+    if (prlimit_error || !prlimit.native().starts_with("/usr/") ||
+        prlimit.native().starts_with("/usr/local/") || access("/usr/bin/prlimit", X_OK) != 0)
+        return std::unexpected(fail("staging-prlimit"));
+    auto cleanup = [&] { (void)core::remove_tree_confined(stage.parent_path(), stage); };
     std::filesystem::path prefix = scope == Scope::System ? "/usr/local" : home / ".local";
     core::ProcessSpec spec;
     spec.executable = "/usr/bin/bwrap";
     spec.args = {"--unshare-all", "--die-with-parent", "--new-session",
                  "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin",
                  "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib", "/lib64",
-                 "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"};
+                 "--proc", "/proc", "--dev", "/dev", "--size", "536870912", "--tmpfs", "/tmp"};
     if (std::filesystem::exists("/etc/ld.so.cache"))
         spec.args.insert(spec.args.end(), {"--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache"});
     if (scope == Scope::User) {
@@ -351,22 +358,24 @@ std::expected<std::string, ManualError> run_staging(
                                         "--setenv", "LANG", "C.UTF-8",
                                         "--setenv", "PREFIX", prefix.string()});
     if (!makeflags.empty()) spec.args.insert(spec.args.end(), {"--setenv", "MAKEFLAGS", std::string(makeflags)});
-    spec.args.push_back("--");
+    spec.args.insert(spec.args.end(), {"--", "/usr/bin/prlimit", "--as=4294967296", "--nproc=512",
+                                      "--fsize=2147483648", "--cpu=1800", "--"});
     if (kind == EntryKind::Script) spec.args.insert(spec.args.end(), {"/usr/bin/bash", "./install.sh"});
     else spec.args.insert(spec.args.end(), {"/usr/bin/make", "-f", "Makefile", "install", "PREFIX=" + prefix.string()});
     spec.timeout = std::chrono::minutes(30);
     spec.max_stdout = spec.max_stderr = 2 * 1024 * 1024;
     auto result = runner.run(spec);
-    if (!result) return std::unexpected(fail("staging-process"));
+    if (!result) { cleanup(); return std::unexpected(fail("staging-process")); }
     std::string log = core::strip_terminal_controls(core::redact(result->out + result->err));
     if (log.size() > 4 * 1024 * 1024) log.resize(4 * 1024 * 1024);
     if (result->exit_code != 0 || result->signaled || result->timed_out ||
         result->out_truncated || result->err_truncated) {
         if (log.size() > 4096) log.erase(0, log.size() - 4096);
+        cleanup();
         return std::unexpected(fail("staging-failed", log));
     }
     auto checked = validate_stage(stage, scope);
-    if (!checked) return std::unexpected(checked.error());
+    if (!checked) { cleanup(); return std::unexpected(checked.error()); }
     return log;
 }
 

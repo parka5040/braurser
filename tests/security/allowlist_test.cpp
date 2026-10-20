@@ -10,10 +10,10 @@ using braurser::elevate::normalize;
 
 TEST(AllowlistFixtures, EveryCapturedParuAndYayInvocation) {
     constexpr std::array paru{
-        'A','A','E','D','E','A','A','B','B','C','C','E','V','A','A','A','A','E','D','E','D','E','D','D'
+        'A','A','E','D','E','A','A','X','X','C','C','E','V','A','A','A','A','E','D','E','D','E','D','D'
     };
     constexpr std::array yay{
-        'A','E','A','E','A','E','X','X','B','E','C','C','E','V','V','A','E','A','E','A','E','A','E','D','E','D','E','D','E','D','E'
+        'A','E','A','E','A','E','X','X','X','E','C','C','E','V','V','A','E','A','E','A','E','A','E','D','E','D','E','D','E','D','E'
     };
     for (auto fixture : {"paru", "yay"}) {
         std::ifstream file(std::string(BRAURSER_FIXTURES) + "/" + fixture + ".argv");
@@ -66,7 +66,8 @@ TEST(AllowlistNormalization, RejectsDangerousOptionsAndTargets) {
 TEST(AllowlistNormalization, CommunityPolicyRejectsOfficialTransactionsAndOtherJobs) {
     constexpr auto job = "/home/builder/.cache/braurser/build/paru/job1";
     auto update = normalize(std::vector<std::string>{"pacman", "-S", "-y", "-u", "--"});
-    ASSERT_TRUE(update);
+    EXPECT_FALSE(update);
+    EXPECT_EQ(update.reason, "refresh");
     EXPECT_FALSE(braurser::elevate::allowed_for_job(update, job));
     auto remove = normalize(std::vector<std::string>{"pacman", "-R", "-n", "-s", "--", "tree"});
     ASSERT_TRUE(remove);
@@ -79,6 +80,17 @@ TEST(AllowlistNormalization, CommunityPolicyRejectsOfficialTransactionsAndOtherJ
         "/home/builder/.cache/braurser/build/paru/job2/pkg/pkg-1-1-any.pkg.tar.zst"});
     ASSERT_TRUE(other);
     EXPECT_FALSE(braurser::elevate::allowed_for_job(other, job));
+}
+
+TEST(AllowlistNormalization, RejectsEveryRefreshSpelling) {
+    for (const auto* flag : {"-y", "--refresh"}) {
+        auto result = normalize(std::vector<std::string>{"pacman", "-S", flag, "-u", "--"});
+        EXPECT_FALSE(result);
+        EXPECT_EQ(result.reason, "refresh");
+        result = normalize(std::vector<std::string>{"pacman", "-S", "--needed", flag, "--", "tree"});
+        EXPECT_FALSE(result);
+        EXPECT_EQ(result.reason, "refresh");
+    }
 }
 
 TEST(AllowlistNormalization, CanonicalizesObservedFlags) {

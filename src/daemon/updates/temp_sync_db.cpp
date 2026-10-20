@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <fcntl.h>
@@ -23,7 +22,6 @@ struct Fd {
     Fd& operator=(const Fd&) = delete;
     explicit Fd(int v) : value(v) {}
 };
-std::atomic<unsigned long long> counter{0};
 bool valid_path(const std::filesystem::path& path) {
     if (!path.is_absolute() || path == "/" || path.native().size() > 4096 ||
         !std::ranges::all_of(path.native(), [](unsigned char c) { return c >= 0x20 && c != 0x7f; })) return false;
@@ -32,27 +30,10 @@ bool valid_path(const std::filesystem::path& path) {
     return true;
 }
 UpdateError file_error() { return {UpdateErrorCode::FileFailure, "private database setup failed"}; }
-bool digits(std::string_view text) {
-    return !text.empty() && text.size() <= 20 && std::ranges::all_of(text, [](unsigned char c) { return c >= '0' && c <= '9'; });
-}
-bool stale_entry(std::string_view name) {
-    if (!name.starts_with("db-")) return false;
-    name.remove_prefix(3);
-    const auto dash = name.find('-');
-    if (dash == std::string_view::npos || !digits(name.substr(0, dash)) || !digits(name.substr(dash + 1))) return false;
-    return name.substr(0, dash) != std::to_string(getpid());
-}
-void sweep_stale(const std::filesystem::path& root) {
-    std::vector<std::filesystem::path> stale;
-    std::error_code ec;
-    std::filesystem::directory_iterator it(root, ec);
-    if (ec) return;
-    std::size_t seen = 0;
-    for (const auto end = std::filesystem::directory_iterator{}; it != end && ++seen <= 1024; it.increment(ec)) {
-        if (ec) return;
-        if (stale_entry(it->path().filename().native())) stale.push_back(it->path());
-    }
-    for (const auto& path : stale) static_cast<void>(core::remove_tree_confined(root, path));
+bool valid_report_id(std::string_view text) {
+    return !text.empty() && text.size() <= 128 && std::ranges::all_of(text, [](unsigned char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+    });
 }
 std::expected<void, UpdateError> copy_db(int source, int target, const std::string& name, std::uint64_t& total) {
     Fd input(openat(source, name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
@@ -121,42 +102,56 @@ std::expected<void, UpdateError> prepare(const std::filesystem::path& real_db, c
 TempSyncDb::TempSyncDb(std::filesystem::path root, std::filesystem::path path)
     : root_(std::move(root)), path_(std::move(path)) {}
 TempSyncDb::TempSyncDb(TempSyncDb&& other) noexcept
-    : root_(std::move(other.root_)), path_(std::exchange(other.path_, {})) {}
+    : root_(std::move(other.root_)), path_(std::exchange(other.path_, {})), retained_(other.retained_) {}
 TempSyncDb& TempSyncDb::operator=(TempSyncDb&& other) noexcept {
     if (this != &other) {
-        if (!path_.empty()) static_cast<void>(core::remove_tree_confined(root_, path_));
+        if (!retained_ && !path_.empty()) static_cast<void>(core::remove_tree_confined(root_, path_));
         root_ = std::move(other.root_);
         path_ = std::exchange(other.path_, {});
+        retained_ = other.retained_;
     }
     return *this;
 }
 TempSyncDb::~TempSyncDb() {
-    if (!path_.empty()) static_cast<void>(core::remove_tree_confined(root_, path_));
+    if (!retained_ && !path_.empty()) static_cast<void>(core::remove_tree_confined(root_, path_));
+}
+
+void TempSyncDb::sweep(const std::filesystem::path& cache, std::string_view keep) {
+    if (!valid_path(cache) || (!keep.empty() && !valid_report_id(keep))) return;
+    const auto root = cache / "braurser" / "syncdb-check";
+    if (!core::ensure_private_dir(root)) return;
+    std::error_code ec;
+    std::filesystem::directory_iterator it(root, ec);
+    if (ec) return;
+    std::vector<std::filesystem::path> stale;
+    std::size_t seen = 0;
+    for (const auto end = std::filesystem::directory_iterator{}; it != end && ++seen <= 1024; it.increment(ec)) {
+        if (ec) return;
+        const auto name = it->path().filename().string();
+        if (name != keep) stale.push_back(it->path());
+    }
+    for (const auto& path : stale) static_cast<void>(core::remove_tree_confined(root, path));
 }
 
 std::expected<TempSyncDb, UpdateError> TempSyncDb::create(core::ProcessRunner& runner,
-    const std::filesystem::path& real_db, const std::filesystem::path& runtime,
-    const std::filesystem::path& fakeroot) {
-    if (!valid_path(real_db) || !valid_path(runtime) || !valid_path(fakeroot))
+    const std::filesystem::path& real_db, const std::filesystem::path& cache,
+    std::string_view report_id, bool refresh, const std::filesystem::path& fakeroot) {
+    if (!valid_path(real_db) || !valid_path(cache) || !valid_report_id(report_id) || !valid_path(fakeroot))
         return std::unexpected(UpdateError{UpdateErrorCode::InvalidInput, "invalid temporary database path"});
     struct stat binary{};
-    if (stat(fakeroot.c_str(), &binary) != 0 || !S_ISREG(binary.st_mode) || access(fakeroot.c_str(), X_OK) != 0)
+    if (refresh && (stat(fakeroot.c_str(), &binary) != 0 || !S_ISREG(binary.st_mode) || access(fakeroot.c_str(), X_OK) != 0))
         return std::unexpected(UpdateError{UpdateErrorCode::Unavailable, "fakeroot is unavailable; install base-devel"});
-    const auto root = runtime / "braurser" / "checkdb";
+    const auto root = cache / "braurser" / "syncdb-check";
     if (auto ensured = core::ensure_private_dir(root); !ensured)
         return std::unexpected(file_error());
-    sweep_stale(root);
     Fd parent(open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
     if (parent.value < 0) return std::unexpected(file_error());
-    std::filesystem::path temp;
-    for (unsigned attempt = 0; attempt < 32; ++attempt) {
-        const auto name = "db-" + std::to_string(getpid()) + "-" + std::to_string(counter.fetch_add(1));
-        if (mkdirat(parent.value, name.c_str(), 0700) == 0) { temp = root / name; break; }
-        if (errno != EEXIST) return std::unexpected(file_error());
-    }
-    if (temp.empty()) return std::unexpected(file_error());
+    const std::string name(report_id);
+    if (mkdirat(parent.value, name.c_str(), 0700) != 0) return std::unexpected(file_error());
+    const auto temp = root / name;
     TempSyncDb result(root, temp);
     if (auto created = prepare(real_db, temp); !created) return std::unexpected(created.error());
+    if (!refresh) return result;
     core::ProcessSpec spec;
     spec.executable = fakeroot;
     spec.args = {"--", "/usr/bin/pacman", "-Sy", "--dbpath", temp.string(), "--logfile", "/dev/null", "--disable-sandbox"};

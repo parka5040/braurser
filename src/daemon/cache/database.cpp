@@ -84,6 +84,11 @@ Database::Database(const std::filesystem::path& path, int flags) {
         check(sqlite3_db_config(handle_, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 0, nullptr), handle_);
         execute("PRAGMA foreign_keys=ON");
         execute("PRAGMA trusted_schema=OFF");
+        if ((flags & SQLITE_OPEN_READONLY) != 0) {
+            execute("PRAGMA cache_size=-2048");
+            execute("PRAGMA mmap_size=67108864");
+            execute("PRAGMA temp_store=FILE");
+        }
         Fts5SelfCheck::run(*this);
     } catch (...) {
         sqlite3_close(handle_);

@@ -157,15 +157,17 @@ std::optional<CachedArticle> WikiCache::read(std::string_view title, std::string
         if (age < std::chrono::seconds(0)) return std::nullopt;
         if (data.at("negative").get<bool>()) {
             if (age > std::chrono::hours(24)) return std::nullopt;
+            (void)core::touch_file(root_ / name);
             return CachedArticle{std::nullopt, false};
         }
         auto doc = decode_document(data.at("document"));
         doc.fetched_at = fetched;
+        (void)core::touch_file(root_ / name);
         return CachedArticle{std::move(doc), age > std::chrono::hours(24 * 7)};
     } catch (const json::exception&) { return std::nullopt; }
 }
 
-bool WikiCache::write(std::string_view title, const std::optional<Document>& document,
+bool WikiCache::write(std::string_view title, const Document* document,
                       std::string_view package_name) const {
     const auto name = filename(title);
     if (name.empty() || !root_.is_absolute()) return false;
@@ -174,7 +176,51 @@ bool WikiCache::write(std::string_view title, const std::optional<Document>& doc
                  {"fetched_at", std::chrono::duration_cast<std::chrono::seconds>(clock_.now().time_since_epoch()).count()}};
     if (document) data["document"] = encode_document(*document);
     const auto bytes = data.dump();
-    return bytes.size() <= 4 * 1024 * 1024 && core::atomic_write(root_ / name, bytes, 0600).has_value();
+    if (bytes.size() > 4 * 1024 * 1024) return false;
+    auto entries = core::list_regular_files(root_, 65536);
+    if (!entries) return false;
+    std::vector<core::FileEntry> retained;
+    std::uintmax_t total = 0;
+    for (auto& entry : *entries) {
+        if (entry.name == name) continue;
+        bool expired = false;
+        if (const auto content = core::read_bounded(root_ / entry.name, 4 * 1024 * 1024)) {
+            try {
+                const auto cached = json::parse(*content);
+                if (cached.at("negative").get<bool>()) {
+                    const auto seconds = cached.at("fetched_at").get<std::int64_t>();
+                    if (seconds >= 0 && seconds <= 4'102'444'800LL) {
+                        const auto fetched = std::chrono::system_clock::time_point(std::chrono::seconds(seconds));
+                        expired = clock_.now() - fetched > std::chrono::hours(24);
+                    }
+                }
+            } catch (const json::exception&) {}
+        }
+        if (expired) {
+            if (!core::remove_tree_confined(root_, entry.name)) return false;
+            continue;
+        }
+        if (entry.info.st_size < 0) return false;
+        const auto size = static_cast<std::uintmax_t>(entry.info.st_size);
+        if (size > UINTMAX_MAX - total) return false;
+        total += size;
+        retained.push_back(std::move(entry));
+    }
+    std::sort(retained.begin(), retained.end(), [](const auto& left, const auto& right) {
+        if (left.info.st_mtim.tv_sec != right.info.st_mtim.tv_sec)
+            return left.info.st_mtim.tv_sec < right.info.st_mtim.tv_sec;
+        if (left.info.st_mtim.tv_nsec != right.info.st_mtim.tv_nsec)
+            return left.info.st_mtim.tv_nsec < right.info.st_mtim.tv_nsec;
+        return left.name < right.name;
+    });
+    std::size_t evicted = 0;
+    while (total > 64 * 1024 * 1024 - bytes.size() || retained.size() - evicted >= 2000) {
+        if (evicted == retained.size()) return false;
+        const auto& entry = retained[evicted++];
+        if (!core::remove_tree_confined(root_, entry.name)) return false;
+        total -= static_cast<std::uintmax_t>(entry.info.st_size);
+    }
+    return core::atomic_write(root_ / name, bytes, 0600).has_value();
 }
 
 }

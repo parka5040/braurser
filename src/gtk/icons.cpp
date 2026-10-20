@@ -68,7 +68,8 @@ Glib::RefPtr<Gdk::Texture> icon_texture(std::string_view icon, const Gdk::RGBA& 
     return texture;
 }
 
-Glib::RefPtr<Gdk::Texture> app_icon_texture(std::string_view path) {
+Glib::RefPtr<Gdk::Texture> app_icon_texture(std::string_view path, int scale) {
+    if (scale < 1 || scale > 4) { return {}; }
     if (path.empty() || path.size() > 4096 || path.front() != '/' || path.find('\0') != std::string_view::npos) { return {}; }
     const int fd = ::open(std::string(path).c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) { return {}; }
@@ -94,8 +95,18 @@ Glib::RefPtr<Gdk::Texture> app_icon_texture(std::string_view path) {
             (static_cast<std::uint32_t>(bytes[at + 2]) << 8) | bytes[at + 3];
     };
     if (dimension(16) == 0 || dimension(16) > 1024 || dimension(20) == 0 || dimension(20) > 1024) { return {}; }
-    try { return Gdk::Texture::create_from_bytes(Glib::Bytes::create(bytes.data(), bytes.size())); }
-    catch (const Glib::Error&) { return {}; }
+    auto* stream = g_memory_input_stream_new_from_data(bytes.data(), static_cast<gssize>(bytes.size()), nullptr);
+    GError* error = nullptr;
+    auto* pixbuf = gdk_pixbuf_new_from_stream_at_scale(stream, 64 * scale, 64 * scale, TRUE, nullptr, &error);
+    g_object_unref(stream);
+    if (!pixbuf) { g_clear_error(&error); return {}; }
+    auto* pixels = gdk_pixbuf_read_pixel_bytes(pixbuf);
+    auto texture = Glib::wrap(GDK_TEXTURE(gdk_memory_texture_new(gdk_pixbuf_get_width(pixbuf), gdk_pixbuf_get_height(pixbuf),
+        gdk_pixbuf_get_has_alpha(pixbuf) ? GDK_MEMORY_R8G8B8A8 : GDK_MEMORY_R8G8B8,
+        pixels, static_cast<gsize>(gdk_pixbuf_get_rowstride(pixbuf)))));
+    g_bytes_unref(pixels);
+    g_object_unref(pixbuf);
+    return texture;
 }
 
 Icon::Icon(std::string_view icon, int size, std::string_view token)

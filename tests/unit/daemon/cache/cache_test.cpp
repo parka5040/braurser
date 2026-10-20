@@ -257,8 +257,8 @@ TEST(Cache, BadIntegrityOrDestinationDoesNotReplaceSnapshot) {
     auto rejected = repo("valid");
     rejected.name = "invalid/name";
     EXPECT_EQ(writer.add(rejected).error().code, "invalid-record");
-    EXPECT_EQ(writer.commit().error().code, "invalid-record");
-    EXPECT_EQ(names(reader, {}), (std::vector<std::string>{"kept"}));
+    ASSERT_TRUE(writer.commit());
+    EXPECT_TRUE(names(reader, {}).empty());
     auto original = old.prepare("SELECT name FROM packages");
     ASSERT_TRUE(original.step());
     EXPECT_EQ(original.text(0), "kept");
@@ -474,6 +474,101 @@ TEST(Search, StableSortPaginationAndCursorStaleness) {
     EXPECT_EQ(store.search(query).error().code, "invalid-query");
 }
 
+TEST(Cache, InvalidRecordsAndMissingAppDoNotPoisonSnapshot) {
+    Directory directory;
+    SnapshotBuilder writer(directory.path);
+    ASSERT_TRUE(writer.begin({"core"}));
+    ASSERT_TRUE(writer.add(repo("kept")));
+    auto invalid_repo = repo("bad/name");
+    EXPECT_EQ(writer.add(invalid_repo).error().code, "invalid-record");
+    catalog::AurPackage invalid_aur;
+    EXPECT_EQ(writer.add(invalid_aur).error().code, "invalid-record");
+    catalog::InstalledPackage invalid_installed;
+    EXPECT_EQ(writer.add(invalid_installed).error().code, "invalid-record");
+    catalog::SourceState invalid_source;
+    EXPECT_EQ(writer.add(invalid_source).error().code, "invalid-record");
+    catalog::AppMetadata app;
+    EXPECT_EQ(writer.add(app).error().code, "invalid-record");
+    app.pkgname = "missing";
+    app.appstream_id = "org.example.missing";
+    EXPECT_EQ(writer.add(app).error().code, "invalid-record");
+    app.pkgname = "kept";
+    ASSERT_TRUE(writer.add(app));
+    ASSERT_TRUE(writer.commit());
+    Store store(directory.path);
+    EXPECT_EQ(names(store, {}), (std::vector<std::string>{"kept"}));
+    Database db(directory.path / "braurser/catalog.sqlite", SQLITE_OPEN_READONLY);
+    auto rows = db.prepare("SELECT count(*) FROM apps");
+    ASSERT_TRUE(rows.step());
+    EXPECT_EQ(rows.integer(0), 1);
+}
+
+TEST(Cache, StorageFailureStillPoisonsSnapshot) {
+    Directory directory;
+    SnapshotBuilder writer(directory.path);
+    ASSERT_TRUE(writer.begin({"core"}));
+    ASSERT_TRUE(writer.add(repo("kept")));
+    ASSERT_TRUE(writer.commit());
+    ASSERT_TRUE(writer.begin({"core"}));
+    ASSERT_TRUE(writer.add(repo("duplicate")));
+    EXPECT_EQ(writer.add(repo("duplicate")).error().code, "storage");
+    EXPECT_EQ(writer.commit().error().code, "storage");
+    Store store(directory.path);
+    EXPECT_EQ(names(store, {}), (std::vector<std::string>{"kept"}));
+}
+
+TEST(Cache, SavepointRollsBackOnlyPartialSourceAndCanBeReused) {
+    Directory directory;
+    SnapshotBuilder writer(directory.path);
+    EXPECT_FALSE(writer.savepoint());
+    ASSERT_TRUE(writer.begin({"core"}));
+    ASSERT_TRUE(writer.add(repo("official")));
+    ASSERT_TRUE(writer.savepoint());
+    catalog::AurPackage community;
+    community.name = community.package_base = "partial";
+    community.version = "1";
+    ASSERT_TRUE(writer.add(community));
+    ASSERT_TRUE(writer.rollback_to_savepoint());
+    community.name = community.package_base = "cached";
+    ASSERT_TRUE(writer.add(community));
+    ASSERT_TRUE(writer.release_savepoint());
+    ASSERT_TRUE(writer.savepoint());
+    ASSERT_TRUE(writer.add(repo("discarded")));
+    ASSERT_TRUE(writer.rollback_to_savepoint());
+    ASSERT_TRUE(writer.release_savepoint());
+    ASSERT_TRUE(writer.commit());
+    Store store(directory.path);
+    EXPECT_EQ(names(store, {}), (std::vector<std::string>{"cached", "official"}));
+}
+
+TEST(Cache, ReadConnectionsUseBoundedSharedPageCacheAndHitsCarrySizes) {
+    Directory directory;
+    SnapshotBuilder writer(directory.path);
+    ASSERT_TRUE(writer.begin({"core"}));
+    auto package = repo("sized");
+    package.download_size = 123;
+    ASSERT_TRUE(writer.add(package));
+    catalog::InstalledPackage installed;
+    installed.name = "sized";
+    installed.version = "1";
+    installed.size = 456;
+    ASSERT_TRUE(writer.add(installed));
+    ASSERT_TRUE(writer.commit());
+    Store store(directory.path);
+    auto page = store.search({});
+    ASSERT_TRUE(page);
+    ASSERT_EQ(page->hits.size(), 1);
+    EXPECT_EQ(page->hits.front().download_size, 123);
+    EXPECT_EQ(page->hits.front().installed_size, 456);
+    Database db(directory.path / "braurser/catalog.sqlite", SQLITE_OPEN_READONLY);
+    for (const auto& [sql, value] : std::array<std::pair<const char*, std::int64_t>, 3>{{
+        {"PRAGMA cache_size", -2048}, {"PRAGMA mmap_size", 67108864}, {"PRAGMA temp_store", 1}}}) {
+        auto pragma = db.prepare(sql);
+        ASSERT_TRUE(pragma.step());
+        EXPECT_EQ(pragma.integer(0), value) << sql;
+    }
+}
+
 TEST(Cache, LargeProvidesAndOneMebibyteBoundary) {
     Directory directory;
     SnapshotBuilder writer(directory.path);
@@ -500,8 +595,8 @@ TEST(Cache, LargeProvidesAndOneMebibyteBoundary) {
     auto rejected = writer.add(boundary);
     ASSERT_FALSE(rejected);
     EXPECT_EQ(rejected.error().code, "invalid-record");
-    EXPECT_EQ(writer.commit().error().code, "invalid-record");
-    EXPECT_EQ(store.search({})->total, 2);
+    ASSERT_TRUE(writer.commit());
+    EXPECT_EQ(store.search({})->total, 0);
 }
 
 TEST(Search, PacmanRepoPriorityAndExplicitShadowedRepo) {

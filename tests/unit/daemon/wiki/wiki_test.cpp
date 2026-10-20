@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <sys/stat.h>
@@ -111,10 +112,68 @@ TEST(Wiki, CacheReturnsStaleWhenOfflineAndNegativeExpires) {
     EXPECT_EQ(failed_fetch.status, LookupStatus::Found);
     EXPECT_TRUE(failed_fetch.stale);
     EXPECT_FALSE(cache.read("Firefox", "other-package"));
-    EXPECT_TRUE(cache.write("missing", std::nullopt));
+    EXPECT_TRUE(cache.write("missing", nullptr));
     EXPECT_TRUE(cache.read("missing"));
     clock.current += std::chrono::hours(25);
     EXPECT_FALSE(cache.read("missing"));
+    std::filesystem::remove_all(root);
+}
+
+TEST(Wiki, CacheEvictsOldestAndPurgesExpiredNegatives) {
+    TestClock clock;
+    auto pattern = (std::filesystem::temp_directory_path() / "braurser-wiki-budget-XXXXXX").string();
+    ASSERT_NE(mkdtemp(pattern.data()), nullptr);
+    const std::filesystem::path root(pattern);
+    WikiCache cache(root, clock);
+    ASSERT_TRUE(cache.write("expired", nullptr));
+    const auto directory = root / "braurser/wiki";
+    const auto expired = std::filesystem::directory_iterator(directory)->path();
+    clock.current += std::chrono::hours(25);
+    const auto old_time = std::filesystem::file_time_type::clock::now() - std::chrono::hours(48);
+    for (int i = 0; i < 2000; ++i) {
+        const auto file = directory / ("entry-" + std::to_string(i) + ".json");
+        { std::ofstream output(file); output << "{}"; }
+        std::filesystem::last_write_time(file, old_time + std::chrono::seconds(i));
+    }
+    ASSERT_TRUE(cache.write("new", nullptr));
+    EXPECT_FALSE(std::filesystem::exists(expired));
+    EXPECT_FALSE(std::filesystem::exists(directory / "entry-0.json"));
+    EXPECT_TRUE(std::filesystem::exists(directory / "entry-1.json"));
+    const auto entries = core::list_regular_files(directory, 3000);
+    ASSERT_TRUE(entries);
+    EXPECT_EQ(entries->size(), 2000U);
+    std::filesystem::remove_all(root);
+}
+
+TEST(Wiki, CacheEnforcesAggregateBytesAndRefreshesAccessTime) {
+    TestClock clock;
+    auto pattern = (std::filesystem::temp_directory_path() / "braurser-wiki-bytes-XXXXXX").string();
+    ASSERT_NE(mkdtemp(pattern.data()), nullptr);
+    const std::filesystem::path root(pattern);
+    WikiCache cache(root, clock);
+    ASSERT_TRUE(cache.write("hot", nullptr));
+    const auto directory = root / "braurser/wiki";
+    const auto hot = std::filesystem::directory_iterator(directory)->path();
+    const auto old_time = std::filesystem::file_time_type::clock::now() - std::chrono::hours(48);
+    std::filesystem::last_write_time(hot, old_time - std::chrono::hours(1));
+    for (int i = 0; i < 17; ++i) {
+        const auto file = directory / ("large-" + std::to_string(i) + ".json");
+        { std::ofstream output(file); output << "{}"; }
+        std::filesystem::resize_file(file, 4 * 1024 * 1024);
+        std::filesystem::last_write_time(file, old_time + std::chrono::seconds(i));
+    }
+    ASSERT_TRUE(cache.read("hot"));
+    EXPECT_GT(std::filesystem::last_write_time(hot), old_time);
+    ASSERT_TRUE(cache.write("new", nullptr));
+    EXPECT_TRUE(std::filesystem::exists(hot));
+    EXPECT_FALSE(std::filesystem::exists(directory / "large-0.json"));
+    EXPECT_FALSE(std::filesystem::exists(directory / "large-1.json"));
+    EXPECT_TRUE(std::filesystem::exists(directory / "large-2.json"));
+    const auto entries = core::list_regular_files(directory, 2000);
+    ASSERT_TRUE(entries);
+    std::uintmax_t total = 0;
+    for (const auto& entry : *entries) total += static_cast<std::uintmax_t>(entry.info.st_size);
+    EXPECT_LE(total, 64U * 1024 * 1024);
     std::filesystem::remove_all(root);
 }
 

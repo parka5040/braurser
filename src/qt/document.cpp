@@ -15,7 +15,7 @@ namespace braurser::qt::kit {
 namespace {
 constexpr std::size_t text_limit = 65536;
 constexpr std::size_t document_limit = 1048576;
-constexpr std::size_t code_limit = 262144;
+constexpr std::size_t code_limit = 448 * 1024;
 
 bool hidden_format(char16_t value) {
     return value == 0x061C || (value >= 0x200B && value <= 0x200F) || (value >= 0x202A && value <= 0x202E) ||
@@ -56,7 +56,7 @@ public:
     int heightForWidth(int width) const override {
         const int inset = property("brRole") == "prose" ? 0 : 28;
         document()->setTextWidth(std::max(1, width - inset));
-        return std::clamp(static_cast<int>(std::ceil(document()->size().height())) + inset, 44, 4000);
+        return std::clamp(static_cast<int>(std::ceil(document()->size().height())) + inset, 44, 16777215);
     }
     QSize sizeHint() const override { return {480, heightForWidth(480)}; }
     QSize minimumSizeHint() const override { return {0, 44}; }
@@ -150,19 +150,22 @@ DocumentView::DocumentView(std::span<const DocumentBlock> document, std::string_
     validate_document(document);
     auto* box = detail::column(this, 4);
     box->setSpacing(16);
+    auto* browser = new DocumentBrowser(this);
+    browsers_.push_back(browser);
+    connect(browser, &QTextBrowser::anchorClicked, this, [this](const QUrl& url) {
+        const auto bytes = url.toEncoded();
+        if (allowed_link(std::string_view(bytes.constData(), static_cast<std::size_t>(bytes.size())))) { Q_EMIT link_activated(url); }
+    });
+    auto* native_document = browser->document();
+    native_document->setDefaultFont(QApplication::font());
+    QTextCursor cursor(native_document);
+    box->addWidget(browser);
+    bool first_block = true;
     for (const auto& block : document) {
-        auto* browser = new DocumentBrowser(this);
-        browsers_.push_back(browser);
-        connect(browser, &QTextBrowser::anchorClicked, this, [this](const QUrl& url) {
-            const auto bytes = url.toEncoded();
-            if (allowed_link(std::string_view(bytes.constData(), static_cast<std::size_t>(bytes.size())))) { Q_EMIT link_activated(url); }
-        });
-        auto* native_document = new QTextDocument(browser);
-        native_document->setDefaultFont(QApplication::font());
-        browser->setDocument(native_document);
-        QTextCursor cursor(native_document);
         QTextBlockFormat paragraph;
         paragraph.setBottomMargin(8);
+        if (!first_block) { cursor.insertBlock(paragraph, QTextCharFormat{}); }
+        first_block = false;
         cursor.setBlockFormat(paragraph);
         switch (block.kind) {
         case BlockKind::Heading: {
@@ -173,7 +176,6 @@ DocumentView::DocumentView(std::span<const DocumentBlock> document, std::string_
             paragraph.setHeadingLevel(static_cast<int>(block.level));
             cursor.setBlockFormat(paragraph);
             cursor.insertText(safe_text(block.text), format);
-            browser->setAccessibleName(safe_text(block.text));
             break;
         }
         case BlockKind::Paragraph:
@@ -194,37 +196,33 @@ DocumentView::DocumentView(std::span<const DocumentBlock> document, std::string_
         case BlockKind::Code: {
             QTextCharFormat format;
             format.setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
-            cursor.insertText(safe_text(block.text), format);
-            browser->setProperty("brRole", "code");
-            browser->setLineWrapMode(QTextEdit::NoWrap);
-            browser->setAccessibleName("Code");
-            browser->setAccessibleDescription("Selectable code. The adjacent Copy button copies this block.");
-            break;
-        }
-        case BlockKind::Note:
-        case BlockKind::Warning: {
-            browser->setProperty("brRole", block.kind == BlockKind::Warning ? "warning" : "info");
-            QTextCharFormat format;
-            format.setFontWeight(QFont::DemiBold);
-            cursor.insertText(safe_text(block.text), format);
-            cursor.insertBlock();
-            insert_runs(cursor, block.runs);
-            browser->setAccessibleName(safe_text(block.text));
-            break;
-        }
-        }
-        cursor.movePosition(QTextCursor::Start);
-        browser->setTextCursor(cursor);
-        browser->ensureCursorVisible();
-        box->addWidget(browser);
-        if (block.kind == BlockKind::Code) {
-            const auto text = safe_text(block.text);
+            paragraph.setNonBreakableLines(true);
+            paragraph.setBackground(palette().brush(QPalette::AlternateBase));
+            cursor.setBlockFormat(paragraph);
+            cursor.insertText(safe_code(block.text), format);
+            const auto text = safe_code(block.text);
             auto* copy = new detail::ActionButton(Action{std::string(copy_label), [text] {
                 QApplication::clipboard()->setText(text);
             }, true, false}, this);
             box->addWidget(copy);
+            break;
+        }
+        case BlockKind::Note:
+        case BlockKind::Warning: {
+            paragraph.setBackground(palette().brush(QPalette::AlternateBase));
+            cursor.setBlockFormat(paragraph);
+            QTextCharFormat format;
+            format.setFontWeight(QFont::DemiBold);
+            cursor.insertText(safe_text(block.text), format);
+            cursor.insertBlock(paragraph, QTextCharFormat{});
+            insert_runs(cursor, block.runs);
+            break;
+        }
         }
     }
+    cursor.movePosition(QTextCursor::Start);
+    browser->setTextCursor(cursor);
+    browser->ensureCursorVisible();
 }
 
 QString DocumentView::plain_text() const {

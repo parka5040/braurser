@@ -116,32 +116,32 @@ public:
 
     /// pre: begin succeeded.
     /// in: one validated repository package.
-    /// err: storage failure.
+    /// err: invalid-record skips without writes; only storage failures poison the snapshot.
     virtual std::expected<void, CatalogError> add(const RepoPackage& package) = 0;
 
     /// pre: begin succeeded.
     /// in: one validated community package.
-    /// err: storage failure.
+    /// err: invalid-record skips without writes; only storage failures poison the snapshot.
     virtual std::expected<void, CatalogError> add(const AurPackage& package) = 0;
 
-    /// pre: begin succeeded; the named package was added earlier.
+    /// pre: begin succeeded.
     /// in: application metadata joined by pkgname.
-    /// err: storage failure.
+    /// err: invalid-record skips without writes; only storage failures poison the snapshot.
     virtual std::expected<void, CatalogError> add(const AppMetadata& app) = 0;
 
     /// pre: begin succeeded.
     /// in: one installed package with its computed query flags.
-    /// err: storage failure.
+    /// err: invalid-record skips without writes; only storage failures poison the snapshot.
     virtual std::expected<void, CatalogError> add(const InstalledPackage& package) = 0;
 
     /// pre: begin succeeded.
     /// in: refresh bookkeeping for one source.
-    /// err: storage failure.
+    /// err: invalid-record skips without writes; only storage failures poison the snapshot.
     virtual std::expected<void, CatalogError> add(const SourceState& source) = 0;
 
     /// pre: begin succeeded.
     /// out: the new snapshot atomically replaces the previous one.
-    /// err: validation or storage failure; the previous snapshot stays in place.
+    /// err: storage failure; the previous snapshot stays in place.
     virtual std::expected<void, CatalogError> commit() = 0;
 
     /// out: discards an uncommitted snapshot.
@@ -190,6 +190,8 @@ struct SearchHit {
     std::optional<std::string> upgradable_to;
     std::vector<std::string> also_in;
     bool shadowed{};
+    std::optional<std::uint64_t> installed_size;
+    std::optional<std::uint64_t> download_size;
 };
 
 struct SearchPage {

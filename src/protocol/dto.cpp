@@ -8,7 +8,34 @@
 namespace braurser::protocol {
 namespace {
 
+struct ObjectKeys {
+    std::initializer_list<std::string_view> envelope{};
+    bool tagged = false;
+};
+
 template <class T>
+struct IsVector : std::false_type {};
+
+template <class T, class Allocator>
+struct IsVector<std::vector<T, Allocator>> : std::true_type {};
+
+template <class T>
+void validate_value(const nlohmann::json& j) {
+    if constexpr (std::is_same_v<T, std::string>) {
+        if (!j.is_string()) throw std::invalid_argument("invalid string type");
+    } else if constexpr (std::is_arithmetic_v<T>) {
+        static_cast<void>(j.get<T>());
+    } else if constexpr (std::is_same_v<T, nlohmann::json>) {
+        static_cast<void>(j);
+    } else if constexpr (IsVector<T>::value) {
+        if (!j.is_array()) throw std::invalid_argument("invalid array type");
+        for (const auto& item : j) validate_value<typename T::value_type>(item);
+    } else {
+        validate_json(j, TypeTag<T>{});
+    }
+}
+
+template <bool Materialize, class T>
 void read_field(const nlohmann::json& j, const char* key, T& out) {
     if (!j.contains(key)) throw std::invalid_argument("missing field");
     validate_wire(j.at(key), key);
@@ -23,16 +50,25 @@ void read_field(const nlohmann::json& j, const char* key, T& out) {
         if (!j.at(key).is_number() || !std::isfinite(j.at(key).get<double>()) ||
             j.at(key).get<double>() < 0) throw std::invalid_argument("invalid number");
     }
-    out = j.at(key).get<T>();
+    if constexpr (Materialize) out = j.at(key).get<T>();
+    else validate_value<T>(j.at(key));
 }
 
-template <class T>
+template <bool Materialize, class T>
 void read_field(const nlohmann::json& j, const char* key, std::optional<T>& out) {
     if (j.contains(key) && !j.at(key).is_null()) {
         T checked{};
-        read_field(j, key, checked);
-        out = std::move(checked);
+        read_field<Materialize>(j, key, checked);
+        if constexpr (Materialize) out = std::move(checked);
     }
+}
+
+bool present(const nlohmann::json& j, const char* key) {
+    return j.contains(key) && !j.at(key).is_null();
+}
+
+const std::string& text(const nlohmann::json& j, const char* key) {
+    return j.at(key).get_ref<const std::string&>();
 }
 
 template <class T>
@@ -45,11 +81,19 @@ void write_field(nlohmann::json& j, const char* key, const std::optional<T>& val
     if (value) j[key] = *value;
 }
 
-void read_object(const nlohmann::json& j, std::initializer_list<std::string_view> keys) {
+void read_object(const nlohmann::json& j, std::initializer_list<std::string_view> keys, ObjectKeys extra) {
     if (!j.is_object()) throw std::invalid_argument("expected object");
-    validate_wire(j);
+    std::array<std::string_view, 4> excluded{};
+    if (extra.envelope.size() + static_cast<std::size_t>(extra.tagged) > excluded.size())
+        throw std::invalid_argument("invalid object projection");
+    std::copy(extra.envelope.begin(), extra.envelope.end(), excluded.begin());
+    const auto count = extra.envelope.size() + static_cast<std::size_t>(extra.tagged);
+    if (extra.tagged) excluded[extra.envelope.size()] = "kind";
+    validate_wire(j, {}, std::span(excluded).first(count));
     for (auto it = j.begin(); it != j.end(); ++it) {
-        if (std::find(keys.begin(), keys.end(), it.key()) == keys.end())
+        if (std::find(keys.begin(), keys.end(), it.key()) == keys.end() &&
+            std::find(extra.envelope.begin(), extra.envelope.end(), it.key()) == extra.envelope.end() &&
+            !(extra.tagged && it.key() == "kind"))
             throw std::invalid_argument("unknown field");
     }
 }
@@ -57,13 +101,25 @@ void read_object(const nlohmann::json& j, std::initializer_list<std::string_view
 }
 
 
-void from_json(const nlohmann::json& j, PackageRef& out) {
-    read_object(j, {"source","repo","name"});
-    read_field(j, "source", out.source);
-    read_field(j, "repo", out.repo);
-    read_field(j, "name", out.name);
-    if (!br_valid_pkgname(out.name.data(), out.name.size()) ||
-        (out.repo && !br_valid_repo_name(out.repo->data(), out.repo->size())))
+template <bool Materialize>
+void read_json(const nlohmann::json& j, QuestionChoice& out, ObjectKeys extra);
+
+#define BRAURSER_READ_JSON(type) \
+template <bool Materialize> \
+void read_json(const nlohmann::json& j, type& out, ObjectKeys extra); \
+void from_json(const nlohmann::json& j, type& out) { read_json<true>(j, out, {}); } \
+void validate_json(const nlohmann::json& j, TypeTag<type>) { type out{}; read_json<false>(j, out, {}); } \
+template <bool Materialize> \
+void read_json(const nlohmann::json& j, type& out, ObjectKeys extra)
+
+
+BRAURSER_READ_JSON(PackageRef) {
+    read_object(j, {"source","repo","name"}, extra);
+    read_field<Materialize>(j, "source", out.source);
+    read_field<Materialize>(j, "repo", out.repo);
+    read_field<Materialize>(j, "name", out.name);
+    if (!br_valid_pkgname(text(j, "name").data(), text(j, "name").size()) ||
+        (present(j, "repo") && !br_valid_repo_name(text(j, "repo").data(), text(j, "repo").size())))
         throw std::invalid_argument("invalid package reference");
 }
 
@@ -72,27 +128,28 @@ void to_json(nlohmann::json& j, const PackageRef& value) {
     write_field(j, "source", value.source);
     write_field(j, "repo", value.repo);
     write_field(j, "name", value.name);
-    PackageRef checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<PackageRef>{});
 }
 
-void from_json(const nlohmann::json& j, PackageSummary& out) {
-    read_object(j, {"package","version","description","installed","installedVersion","installedSize","downloadSize","appName","iconPath","alsoIn","shadowed"});
-    read_field(j, "package", out.package);
-    read_field(j, "version", out.version);
-    read_field(j, "description", out.description);
-    read_field(j, "installed", out.installed);
-    read_field(j, "installedVersion", out.installedVersion);
-    read_field(j, "installedSize", out.installedSize);
-    read_field(j, "downloadSize", out.downloadSize);
-    read_field(j, "appName", out.appName);
-    read_field(j, "iconPath", out.iconPath);
-    read_field(j, "alsoIn", out.alsoIn);
-    read_field(j, "shadowed", out.shadowed);
-    if (out.alsoIn) {
-        if (out.alsoIn->size() > 256) throw std::invalid_argument("too many repositories");
-        for (const auto& repo : *out.alsoIn)
+BRAURSER_READ_JSON(PackageSummary) {
+    read_object(j, {"package","version","description","installed","installedVersion","installedSize","downloadSize","appName","iconPath","alsoIn","shadowed"}, extra);
+    read_field<Materialize>(j, "package", out.package);
+    read_field<Materialize>(j, "version", out.version);
+    read_field<Materialize>(j, "description", out.description);
+    read_field<Materialize>(j, "installed", out.installed);
+    read_field<Materialize>(j, "installedVersion", out.installedVersion);
+    read_field<Materialize>(j, "installedSize", out.installedSize);
+    read_field<Materialize>(j, "downloadSize", out.downloadSize);
+    read_field<Materialize>(j, "appName", out.appName);
+    read_field<Materialize>(j, "iconPath", out.iconPath);
+    read_field<Materialize>(j, "alsoIn", out.alsoIn);
+    read_field<Materialize>(j, "shadowed", out.shadowed);
+    if (present(j, "alsoIn")) {
+        if (j.at("alsoIn").size() > 256) throw std::invalid_argument("too many repositories");
+        for (const auto& item : j.at("alsoIn")) {
+            const auto& repo = item.get_ref<const std::string&>();
             if (!br_valid_repo_name(repo.data(), repo.size())) throw std::invalid_argument("invalid repository");
+        }
     }
 }
 
@@ -109,34 +166,32 @@ void to_json(nlohmann::json& j, const PackageSummary& value) {
     write_field(j, "iconPath", value.iconPath);
     write_field(j, "alsoIn", value.alsoIn);
     write_field(j, "shadowed", value.shadowed);
-    PackageSummary checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<PackageSummary>{});
 }
 
-void from_json(const nlohmann::json& j, Screenshot& out) {
-    read_object(j, {"url","caption"});
-    read_field(j, "url", out.url);
-    read_field(j, "caption", out.caption);
+BRAURSER_READ_JSON(Screenshot) {
+    read_object(j, {"url","caption"}, extra);
+    read_field<Materialize>(j, "url", out.url);
+    read_field<Materialize>(j, "caption", out.caption);
 }
 
 void to_json(nlohmann::json& j, const Screenshot& value) {
     j = nlohmann::json::object();
     write_field(j, "url", value.url);
     write_field(j, "caption", value.caption);
-    Screenshot checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<Screenshot>{});
 }
 
-void from_json(const nlohmann::json& j, AppMetadata& out) {
-    read_object(j, {"appstream_id","name","summary","description_paragraphs","icon_path","screenshots","categories","launchables"});
-    read_field(j, "appstream_id", out.appstream_id);
-    read_field(j, "name", out.name);
-    read_field(j, "summary", out.summary);
-    read_field(j, "description_paragraphs", out.description_paragraphs);
-    read_field(j, "icon_path", out.icon_path);
-    read_field(j, "screenshots", out.screenshots);
-    read_field(j, "categories", out.categories);
-    read_field(j, "launchables", out.launchables);
+BRAURSER_READ_JSON(AppMetadata) {
+    read_object(j, {"appstream_id","name","summary","description_paragraphs","icon_path","screenshots","categories","launchables"}, extra);
+    read_field<Materialize>(j, "appstream_id", out.appstream_id);
+    read_field<Materialize>(j, "name", out.name);
+    read_field<Materialize>(j, "summary", out.summary);
+    read_field<Materialize>(j, "description_paragraphs", out.description_paragraphs);
+    read_field<Materialize>(j, "icon_path", out.icon_path);
+    read_field<Materialize>(j, "screenshots", out.screenshots);
+    read_field<Materialize>(j, "categories", out.categories);
+    read_field<Materialize>(j, "launchables", out.launchables);
 }
 
 void to_json(nlohmann::json& j, const AppMetadata& value) {
@@ -149,21 +204,20 @@ void to_json(nlohmann::json& j, const AppMetadata& value) {
     write_field(j, "screenshots", value.screenshots);
     write_field(j, "categories", value.categories);
     write_field(j, "launchables", value.launchables);
-    AppMetadata checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<AppMetadata>{});
 }
 
-void from_json(const nlohmann::json& j, CommunityInfo& out) {
-    read_object(j, {"maintainer","submitter","votes","popularity","out_of_date_since","first_submitted","last_modified","package_base","upstream_url"});
-    read_field(j, "maintainer", out.maintainer);
-    read_field(j, "submitter", out.submitter);
-    read_field(j, "votes", out.votes);
-    read_field(j, "popularity", out.popularity);
-    read_field(j, "out_of_date_since", out.out_of_date_since);
-    read_field(j, "first_submitted", out.first_submitted);
-    read_field(j, "last_modified", out.last_modified);
-    read_field(j, "package_base", out.package_base);
-    read_field(j, "upstream_url", out.upstream_url);
+BRAURSER_READ_JSON(CommunityInfo) {
+    read_object(j, {"maintainer","submitter","votes","popularity","out_of_date_since","first_submitted","last_modified","package_base","upstream_url"}, extra);
+    read_field<Materialize>(j, "maintainer", out.maintainer);
+    read_field<Materialize>(j, "submitter", out.submitter);
+    read_field<Materialize>(j, "votes", out.votes);
+    read_field<Materialize>(j, "popularity", out.popularity);
+    read_field<Materialize>(j, "out_of_date_since", out.out_of_date_since);
+    read_field<Materialize>(j, "first_submitted", out.first_submitted);
+    read_field<Materialize>(j, "last_modified", out.last_modified);
+    read_field<Materialize>(j, "package_base", out.package_base);
+    read_field<Materialize>(j, "upstream_url", out.upstream_url);
 }
 
 void to_json(nlohmann::json& j, const CommunityInfo& value) {
@@ -177,23 +231,24 @@ void to_json(nlohmann::json& j, const CommunityInfo& value) {
     write_field(j, "last_modified", value.last_modified);
     write_field(j, "package_base", value.package_base);
     write_field(j, "upstream_url", value.upstream_url);
-    CommunityInfo checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<CommunityInfo>{});
 }
 
-void from_json(const nlohmann::json& j, PackageDetails& out) {
-    read_object(j, {"package","version","description","dependencies","url","alsoIn","shadowed"});
-    read_field(j, "package", out.package);
-    read_field(j, "version", out.version);
-    read_field(j, "description", out.description);
-    read_field(j, "dependencies", out.dependencies);
-    read_field(j, "url", out.url);
-    read_field(j, "alsoIn", out.alsoIn);
-    read_field(j, "shadowed", out.shadowed);
-    if (out.alsoIn) {
-        if (out.alsoIn->size() > 256) throw std::invalid_argument("too many repositories");
-        for (const auto& repo : *out.alsoIn)
+BRAURSER_READ_JSON(PackageDetails) {
+    read_object(j, {"package","version","description","dependencies","url","alsoIn","shadowed"}, extra);
+    read_field<Materialize>(j, "package", out.package);
+    read_field<Materialize>(j, "version", out.version);
+    read_field<Materialize>(j, "description", out.description);
+    read_field<Materialize>(j, "dependencies", out.dependencies);
+    read_field<Materialize>(j, "url", out.url);
+    read_field<Materialize>(j, "alsoIn", out.alsoIn);
+    read_field<Materialize>(j, "shadowed", out.shadowed);
+    if (present(j, "alsoIn")) {
+        if (j.at("alsoIn").size() > 256) throw std::invalid_argument("too many repositories");
+        for (const auto& item : j.at("alsoIn")) {
+            const auto& repo = item.get_ref<const std::string&>();
             if (!br_valid_repo_name(repo.data(), repo.size())) throw std::invalid_argument("invalid repository");
+        }
     }
 }
 
@@ -206,31 +261,32 @@ void to_json(nlohmann::json& j, const PackageDetails& value) {
     write_field(j, "url", value.url);
     write_field(j, "alsoIn", value.alsoIn);
     write_field(j, "shadowed", value.shadowed);
-    PackageDetails checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<PackageDetails>{});
 }
 
-void from_json(const nlohmann::json& j, SearchFilters& out) {
-    read_object(j, {"installed","not_installed","explicit","dependency","orphans","foreign","native","upgradable","repos","groups","aur_only","repo_only","apps_only","category"});
-    if (j.contains("installed")) read_field(j, "installed", out.installed);
-    if (j.contains("not_installed")) read_field(j, "not_installed", out.not_installed);
-    if (j.contains("explicit")) read_field(j, "explicit", out.explicit_);
-    if (j.contains("dependency")) read_field(j, "dependency", out.dependency);
-    if (j.contains("orphans")) read_field(j, "orphans", out.orphans);
-    if (j.contains("foreign")) read_field(j, "foreign", out.foreign);
-    if (j.contains("native")) read_field(j, "native", out.native);
-    if (j.contains("upgradable")) read_field(j, "upgradable", out.upgradable);
-    if (j.contains("repos")) read_field(j, "repos", out.repos);
-    if (j.contains("groups")) read_field(j, "groups", out.groups);
-    if (j.contains("aur_only")) read_field(j, "aur_only", out.aur_only);
-    if (j.contains("repo_only")) read_field(j, "repo_only", out.repo_only);
-    if (j.contains("apps_only")) read_field(j, "apps_only", out.apps_only);
-    read_field(j, "category", out.category);
-    if (out.aur_only && out.repo_only) throw std::invalid_argument("conflicting source filters");
-    for (const auto& repo : out.repos) {
+BRAURSER_READ_JSON(SearchFilters) {
+    read_object(j, {"installed","not_installed","explicit","dependency","orphans","foreign","native","upgradable","repos","groups","aur_only","repo_only","apps_only","category"}, extra);
+    if (j.contains("installed")) read_field<Materialize>(j, "installed", out.installed);
+    if (j.contains("not_installed")) read_field<Materialize>(j, "not_installed", out.not_installed);
+    if (j.contains("explicit")) read_field<Materialize>(j, "explicit", out.explicit_);
+    if (j.contains("dependency")) read_field<Materialize>(j, "dependency", out.dependency);
+    if (j.contains("orphans")) read_field<Materialize>(j, "orphans", out.orphans);
+    if (j.contains("foreign")) read_field<Materialize>(j, "foreign", out.foreign);
+    if (j.contains("native")) read_field<Materialize>(j, "native", out.native);
+    if (j.contains("upgradable")) read_field<Materialize>(j, "upgradable", out.upgradable);
+    if (j.contains("repos")) read_field<Materialize>(j, "repos", out.repos);
+    if (j.contains("groups")) read_field<Materialize>(j, "groups", out.groups);
+    if (j.contains("aur_only")) read_field<Materialize>(j, "aur_only", out.aur_only);
+    if (j.contains("repo_only")) read_field<Materialize>(j, "repo_only", out.repo_only);
+    if (j.contains("apps_only")) read_field<Materialize>(j, "apps_only", out.apps_only);
+    read_field<Materialize>(j, "category", out.category);
+    if (j.value("aur_only", false) && j.value("repo_only", false)) throw std::invalid_argument("conflicting source filters");
+    if (j.contains("repos")) for (const auto& item : j.at("repos")) {
+        const auto& repo = item.get_ref<const std::string&>();
         if (!br_valid_repo_name(repo.data(), repo.size())) throw std::invalid_argument("invalid repository");
     }
-    for (const auto& group : out.groups) {
+    if (j.contains("groups")) for (const auto& item : j.at("groups")) {
+        const auto& group = item.get_ref<const std::string&>();
         if (!br_valid_pkgname(group.data(), group.size())) throw std::invalid_argument("invalid group");
     }
 }
@@ -251,29 +307,28 @@ void to_json(nlohmann::json& j, const SearchFilters& value) {
     write_field(j, "repo_only", value.repo_only);
     write_field(j, "apps_only", value.apps_only);
     write_field(j, "category", value.category);
-    SearchFilters checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<SearchFilters>{});
 }
 
-void from_json(const nlohmann::json& j, CatalogFilters& out) {
+BRAURSER_READ_JSON(CatalogFilters) {
     read_object(j, {"installed", "explicit", "deps", "orphans", "foreign", "native", "upgradable",
-                    "sourceRepo", "group", "aurOnly", "repoOnly", "appsOnly"});
-    if (j.contains("installed")) read_field(j, "installed", out.installed);
-    if (j.contains("explicit")) read_field(j, "explicit", out.explicit_);
-    if (j.contains("deps")) read_field(j, "deps", out.deps);
-    if (j.contains("orphans")) read_field(j, "orphans", out.orphans);
-    if (j.contains("foreign")) read_field(j, "foreign", out.foreign);
-    if (j.contains("native")) read_field(j, "native", out.native);
-    if (j.contains("upgradable")) read_field(j, "upgradable", out.upgradable);
-    read_field(j, "sourceRepo", out.sourceRepo);
-    read_field(j, "group", out.group);
-    if (j.contains("aurOnly")) read_field(j, "aurOnly", out.aurOnly);
-    if (j.contains("repoOnly")) read_field(j, "repoOnly", out.repoOnly);
-    if (j.contains("appsOnly")) read_field(j, "appsOnly", out.appsOnly);
-    if (out.aurOnly && out.repoOnly) throw std::invalid_argument("conflicting source filters");
-    if (out.sourceRepo && !br_valid_repo_name(out.sourceRepo->data(), out.sourceRepo->size()))
+                    "sourceRepo", "group", "aurOnly", "repoOnly", "appsOnly"}, extra);
+    if (j.contains("installed")) read_field<Materialize>(j, "installed", out.installed);
+    if (j.contains("explicit")) read_field<Materialize>(j, "explicit", out.explicit_);
+    if (j.contains("deps")) read_field<Materialize>(j, "deps", out.deps);
+    if (j.contains("orphans")) read_field<Materialize>(j, "orphans", out.orphans);
+    if (j.contains("foreign")) read_field<Materialize>(j, "foreign", out.foreign);
+    if (j.contains("native")) read_field<Materialize>(j, "native", out.native);
+    if (j.contains("upgradable")) read_field<Materialize>(j, "upgradable", out.upgradable);
+    read_field<Materialize>(j, "sourceRepo", out.sourceRepo);
+    read_field<Materialize>(j, "group", out.group);
+    if (j.contains("aurOnly")) read_field<Materialize>(j, "aurOnly", out.aurOnly);
+    if (j.contains("repoOnly")) read_field<Materialize>(j, "repoOnly", out.repoOnly);
+    if (j.contains("appsOnly")) read_field<Materialize>(j, "appsOnly", out.appsOnly);
+    if (j.value("aurOnly", false) && j.value("repoOnly", false)) throw std::invalid_argument("conflicting source filters");
+    if (present(j, "sourceRepo") && !br_valid_repo_name(text(j, "sourceRepo").data(), text(j, "sourceRepo").size()))
         throw std::invalid_argument("invalid repository");
-    if (out.group && !br_valid_pkgname(out.group->data(), out.group->size()))
+    if (present(j, "group") && !br_valid_pkgname(text(j, "group").data(), text(j, "group").size()))
         throw std::invalid_argument("invalid group");
 }
 
@@ -291,18 +346,17 @@ void to_json(nlohmann::json& j, const CatalogFilters& value) {
     write_field(j, "aurOnly", value.aurOnly);
     write_field(j, "repoOnly", value.repoOnly);
     write_field(j, "appsOnly", value.appsOnly);
-    CatalogFilters checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<CatalogFilters>{});
 }
 
-void from_json(const nlohmann::json& j, SearchQuery& out) {
-    read_object(j, {"text","filters","sort","cursor","limit"});
-    read_field(j, "text", out.text);
-    read_field(j, "filters", out.filters);
-    read_field(j, "sort", out.sort);
-    read_field(j, "cursor", out.cursor);
-    read_field(j, "limit", out.limit);
-    if (out.limit == 0 || out.limit > 200 || out.text.size() > 512)
+BRAURSER_READ_JSON(SearchQuery) {
+    read_object(j, {"text","filters","sort","cursor","limit"}, extra);
+    read_field<Materialize>(j, "text", out.text);
+    read_field<Materialize>(j, "filters", out.filters);
+    read_field<Materialize>(j, "sort", out.sort);
+    read_field<Materialize>(j, "cursor", out.cursor);
+    read_field<Materialize>(j, "limit", out.limit);
+    if (j.at("limit").get<std::uint64_t>() == 0 || j.at("limit").get<std::uint64_t>() > 200 || text(j, "text").size() > 512)
         throw std::invalid_argument("invalid search bounds");
 }
 
@@ -313,15 +367,14 @@ void to_json(nlohmann::json& j, const SearchQuery& value) {
     write_field(j, "sort", value.sort);
     write_field(j, "cursor", value.cursor);
     write_field(j, "limit", value.limit);
-    SearchQuery checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<SearchQuery>{});
 }
 
-void from_json(const nlohmann::json& j, SearchPage& out) {
-    read_object(j, {"packages","next_cursor","stale"});
-    read_field(j, "packages", out.packages);
-    read_field(j, "next_cursor", out.next_cursor);
-    read_field(j, "stale", out.stale);
+BRAURSER_READ_JSON(SearchPage) {
+    read_object(j, {"packages","next_cursor","stale"}, extra);
+    read_field<Materialize>(j, "packages", out.packages);
+    read_field<Materialize>(j, "next_cursor", out.next_cursor);
+    read_field<Materialize>(j, "stale", out.stale);
 }
 
 void to_json(nlohmann::json& j, const SearchPage& value) {
@@ -329,16 +382,15 @@ void to_json(nlohmann::json& j, const SearchPage& value) {
     write_field(j, "packages", value.packages);
     write_field(j, "next_cursor", value.next_cursor);
     write_field(j, "stale", value.stale);
-    SearchPage checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<SearchPage>{});
 }
 
-void from_json(const nlohmann::json& j, VariantOption& out) {
-    read_object(j, {"package","kind","development","recommended"});
-    read_field(j, "package", out.package);
-    read_field(j, "kind", out.kind);
-    read_field(j, "development", out.development);
-    read_field(j, "recommended", out.recommended);
+BRAURSER_READ_JSON(VariantOption) {
+    read_object(j, {"package","kind","development","recommended"}, extra);
+    read_field<Materialize>(j, "package", out.package);
+    read_field<Materialize>(j, "kind", out.kind);
+    read_field<Materialize>(j, "development", out.development);
+    read_field<Materialize>(j, "recommended", out.recommended);
 }
 
 void to_json(nlohmann::json& j, const VariantOption& value) {
@@ -347,30 +399,28 @@ void to_json(nlohmann::json& j, const VariantOption& value) {
     write_field(j, "kind", value.kind);
     write_field(j, "development", value.development);
     write_field(j, "recommended", value.recommended);
-    VariantOption checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<VariantOption>{});
 }
 
-void from_json(const nlohmann::json& j, VariantChoices& out) {
-    read_object(j, {"options","urls_differ"});
-    read_field(j, "options", out.options);
-    read_field(j, "urls_differ", out.urls_differ);
+BRAURSER_READ_JSON(VariantChoices) {
+    read_object(j, {"options","urls_differ"}, extra);
+    read_field<Materialize>(j, "options", out.options);
+    read_field<Materialize>(j, "urls_differ", out.urls_differ);
 }
 
 void to_json(nlohmann::json& j, const VariantChoices& value) {
     j = nlohmann::json::object();
     write_field(j, "options", value.options);
     write_field(j, "urls_differ", value.urls_differ);
-    VariantChoices checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<VariantChoices>{});
 }
 
-void from_json(const nlohmann::json& j, WikiText& out) {
-    read_object(j, {"s","emphasis","strong","code"});
-    read_field(j, "s", out.s);
-    if (j.contains("emphasis")) read_field(j, "emphasis", out.emphasis);
-    if (j.contains("strong")) read_field(j, "strong", out.strong);
-    if (j.contains("code")) read_field(j, "code", out.code);
+BRAURSER_READ_JSON(WikiText) {
+    read_object(j, {"s","emphasis","strong","code"}, extra);
+    read_field<Materialize>(j, "s", out.s);
+    if (j.contains("emphasis")) read_field<Materialize>(j, "emphasis", out.emphasis);
+    if (j.contains("strong")) read_field<Materialize>(j, "strong", out.strong);
+    if (j.contains("code")) read_field<Materialize>(j, "code", out.code);
 }
 
 void to_json(nlohmann::json& j, const WikiText& value) {
@@ -379,125 +429,116 @@ void to_json(nlohmann::json& j, const WikiText& value) {
     write_field(j, "emphasis", value.emphasis);
     write_field(j, "strong", value.strong);
     write_field(j, "code", value.code);
-    WikiText checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<WikiText>{});
 }
 
-void from_json(const nlohmann::json& j, WikiLink& out) {
-    read_object(j, {"label","href"});
-    read_field(j, "label", out.label);
-    read_field(j, "href", out.href);
+BRAURSER_READ_JSON(WikiLink) {
+    read_object(j, {"label","href"}, extra);
+    read_field<Materialize>(j, "label", out.label);
+    read_field<Materialize>(j, "href", out.href);
 }
 
 void to_json(nlohmann::json& j, const WikiLink& value) {
     j = nlohmann::json::object();
     write_field(j, "label", value.label);
     write_field(j, "href", value.href);
-    WikiLink checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<WikiLink>{});
 }
 
-void from_json(const nlohmann::json& j, WikiHeading& out) {
-    read_object(j, {"level","text"});
-    read_field(j, "level", out.level);
-    read_field(j, "text", out.text);
-    if (out.level < 2 || out.level > 4) throw std::invalid_argument("invalid heading level");
+BRAURSER_READ_JSON(WikiHeading) {
+    read_object(j, {"level","text"}, extra);
+    read_field<Materialize>(j, "level", out.level);
+    read_field<Materialize>(j, "text", out.text);
+    if (j.at("level").get<std::uint64_t>() < 2 || j.at("level").get<std::uint64_t>() > 4) throw std::invalid_argument("invalid heading level");
 }
 
 void to_json(nlohmann::json& j, const WikiHeading& value) {
     j = nlohmann::json::object();
     write_field(j, "level", value.level);
     write_field(j, "text", value.text);
-    WikiHeading checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<WikiHeading>{});
 }
 
-void from_json(const nlohmann::json& j, WikiParagraph& out) {
-    read_object(j, {"inlines"});
-    read_field(j, "inlines", out.inlines);
+BRAURSER_READ_JSON(WikiParagraph) {
+    read_object(j, {"inlines"}, extra);
+    read_field<Materialize>(j, "inlines", out.inlines);
 }
 
 void to_json(nlohmann::json& j, const WikiParagraph& value) {
     j = nlohmann::json::object();
     write_field(j, "inlines", value.inlines);
-    WikiParagraph checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<WikiParagraph>{});
 }
 
-void from_json(const nlohmann::json& j, WikiList& out) {
-    read_object(j, {"ordered","items"});
-    read_field(j, "ordered", out.ordered);
-    read_field(j, "items", out.items);
+BRAURSER_READ_JSON(WikiList) {
+    read_object(j, {"ordered","items"}, extra);
+    read_field<Materialize>(j, "ordered", out.ordered);
+    read_field<Materialize>(j, "items", out.items);
 }
 
 void to_json(nlohmann::json& j, const WikiList& value) {
     j = nlohmann::json::object();
     write_field(j, "ordered", value.ordered);
     write_field(j, "items", value.items);
-    WikiList checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<WikiList>{});
 }
 
-void from_json(const nlohmann::json& j, WikiCode& out) {
-    read_object(j, {"text"});
-    read_field(j, "text", out.text);
+BRAURSER_READ_JSON(WikiCode) {
+    read_object(j, {"text"}, extra);
+    read_field<Materialize>(j, "text", out.text);
 }
 
 void to_json(nlohmann::json& j, const WikiCode& value) {
     j = nlohmann::json::object();
     write_field(j, "text", value.text);
-    WikiCode checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<WikiCode>{});
 }
 
-void from_json(const nlohmann::json& j, WikiNote& out) {
-    read_object(j, {"inlines"});
-    read_field(j, "inlines", out.inlines);
+BRAURSER_READ_JSON(WikiNote) {
+    read_object(j, {"inlines"}, extra);
+    read_field<Materialize>(j, "inlines", out.inlines);
 }
 
 void to_json(nlohmann::json& j, const WikiNote& value) {
     j = nlohmann::json::object();
     write_field(j, "inlines", value.inlines);
-    WikiNote checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<WikiNote>{});
 }
 
-void from_json(const nlohmann::json& j, WikiWarning& out) {
-    read_object(j, {"inlines"});
-    read_field(j, "inlines", out.inlines);
+BRAURSER_READ_JSON(WikiWarning) {
+    read_object(j, {"inlines"}, extra);
+    read_field<Materialize>(j, "inlines", out.inlines);
 }
 
 void to_json(nlohmann::json& j, const WikiWarning& value) {
     j = nlohmann::json::object();
     write_field(j, "inlines", value.inlines);
-    WikiWarning checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<WikiWarning>{});
 }
 
-void from_json(const nlohmann::json& j, WikiSection& out) {
-    read_object(j, {"level","title"});
-    read_field(j, "level", out.level);
-    read_field(j, "title", out.title);
-    if (out.level < 2 || out.level > 4) throw std::invalid_argument("invalid heading level");
+BRAURSER_READ_JSON(WikiSection) {
+    read_object(j, {"level","title"}, extra);
+    read_field<Materialize>(j, "level", out.level);
+    read_field<Materialize>(j, "title", out.title);
+    if (j.at("level").get<std::uint64_t>() < 2 || j.at("level").get<std::uint64_t>() > 4) throw std::invalid_argument("invalid heading level");
 }
 
 void to_json(nlohmann::json& j, const WikiSection& value) {
     j = nlohmann::json::object();
     write_field(j, "level", value.level);
     write_field(j, "title", value.title);
-    WikiSection checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<WikiSection>{});
 }
 
-void from_json(const nlohmann::json& j, WikiDocument& out) {
-    read_object(j, {"title","source_url","fetched_at","stale","attribution_key","blocks","sections"});
-    read_field(j, "title", out.title);
-    read_field(j, "source_url", out.source_url);
-    read_field(j, "fetched_at", out.fetched_at);
-    read_field(j, "stale", out.stale);
-    read_field(j, "attribution_key", out.attribution_key);
-    read_field(j, "blocks", out.blocks);
-    read_field(j, "sections", out.sections);
+BRAURSER_READ_JSON(WikiDocument) {
+    read_object(j, {"title","source_url","fetched_at","stale","attribution_key","blocks","sections"}, extra);
+    read_field<Materialize>(j, "title", out.title);
+    read_field<Materialize>(j, "source_url", out.source_url);
+    read_field<Materialize>(j, "fetched_at", out.fetched_at);
+    read_field<Materialize>(j, "stale", out.stale);
+    read_field<Materialize>(j, "attribution_key", out.attribution_key);
+    read_field<Materialize>(j, "blocks", out.blocks);
+    read_field<Materialize>(j, "sections", out.sections);
 }
 
 void to_json(nlohmann::json& j, const WikiDocument& value) {
@@ -509,17 +550,16 @@ void to_json(nlohmann::json& j, const WikiDocument& value) {
     write_field(j, "attribution_key", value.attribution_key);
     write_field(j, "blocks", value.blocks);
     write_field(j, "sections", value.sections);
-    WikiDocument checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<WikiDocument>{});
 }
 
-void from_json(const nlohmann::json& j, NewsItem& out) {
-    read_object(j, {"title","url","published","requires_manual_intervention","acknowledged"});
-    read_field(j, "title", out.title);
-    read_field(j, "url", out.url);
-    read_field(j, "published", out.published);
-    read_field(j, "requires_manual_intervention", out.requires_manual_intervention);
-    read_field(j, "acknowledged", out.acknowledged);
+BRAURSER_READ_JSON(NewsItem) {
+    read_object(j, {"title","url","published","requires_manual_intervention","acknowledged"}, extra);
+    read_field<Materialize>(j, "title", out.title);
+    read_field<Materialize>(j, "url", out.url);
+    read_field<Materialize>(j, "published", out.published);
+    read_field<Materialize>(j, "requires_manual_intervention", out.requires_manual_intervention);
+    read_field<Materialize>(j, "acknowledged", out.acknowledged);
 }
 
 void to_json(nlohmann::json& j, const NewsItem& value) {
@@ -529,16 +569,15 @@ void to_json(nlohmann::json& j, const NewsItem& value) {
     write_field(j, "published", value.published);
     write_field(j, "requires_manual_intervention", value.requires_manual_intervention);
     write_field(j, "acknowledged", value.acknowledged);
-    NewsItem checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<NewsItem>{});
 }
 
-void from_json(const nlohmann::json& j, RestartAdviceDTO& out) {
-    read_object(j, {"package","level","reason_key","detail"});
-    read_field(j, "package", out.package);
-    read_field(j, "level", out.level);
-    read_field(j, "reason_key", out.reason_key);
-    read_field(j, "detail", out.detail);
+BRAURSER_READ_JSON(RestartAdviceDTO) {
+    read_object(j, {"package","level","reason_key","detail"}, extra);
+    read_field<Materialize>(j, "package", out.package);
+    read_field<Materialize>(j, "level", out.level);
+    read_field<Materialize>(j, "reason_key", out.reason_key);
+    read_field<Materialize>(j, "detail", out.detail);
 }
 
 void to_json(nlohmann::json& j, const RestartAdviceDTO& value) {
@@ -547,17 +586,16 @@ void to_json(nlohmann::json& j, const RestartAdviceDTO& value) {
     write_field(j, "level", value.level);
     write_field(j, "reason_key", value.reason_key);
     write_field(j, "detail", value.detail);
-    RestartAdviceDTO checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<RestartAdviceDTO>{});
 }
 
-void from_json(const nlohmann::json& j, UpdateItem& out) {
-    read_object(j, {"package","from_version","to_version","source","restart"});
-    read_field(j, "package", out.package);
-    read_field(j, "from_version", out.from_version);
-    read_field(j, "to_version", out.to_version);
-    read_field(j, "source", out.source);
-    read_field(j, "restart", out.restart);
+BRAURSER_READ_JSON(UpdateItem) {
+    read_object(j, {"package","from_version","to_version","source","restart"}, extra);
+    read_field<Materialize>(j, "package", out.package);
+    read_field<Materialize>(j, "from_version", out.from_version);
+    read_field<Materialize>(j, "to_version", out.to_version);
+    read_field<Materialize>(j, "source", out.source);
+    read_field<Materialize>(j, "restart", out.restart);
 }
 
 void to_json(nlohmann::json& j, const UpdateItem& value) {
@@ -567,19 +605,18 @@ void to_json(nlohmann::json& j, const UpdateItem& value) {
     write_field(j, "to_version", value.to_version);
     write_field(j, "source", value.source);
     write_field(j, "restart", value.restart);
-    UpdateItem checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<UpdateItem>{});
 }
 
-void from_json(const nlohmann::json& j, UpdateReport& out) {
-    read_object(j, {"report_id","checked_at","official","community","manual","news","overall_restart"});
-    read_field(j, "report_id", out.report_id);
-    read_field(j, "checked_at", out.checked_at);
-    read_field(j, "official", out.official);
-    read_field(j, "community", out.community);
-    read_field(j, "manual", out.manual);
-    read_field(j, "news", out.news);
-    read_field(j, "overall_restart", out.overall_restart);
+BRAURSER_READ_JSON(UpdateReport) {
+    read_object(j, {"report_id","checked_at","official","community","manual","news","overall_restart"}, extra);
+    read_field<Materialize>(j, "report_id", out.report_id);
+    read_field<Materialize>(j, "checked_at", out.checked_at);
+    read_field<Materialize>(j, "official", out.official);
+    read_field<Materialize>(j, "community", out.community);
+    read_field<Materialize>(j, "manual", out.manual);
+    read_field<Materialize>(j, "news", out.news);
+    read_field<Materialize>(j, "overall_restart", out.overall_restart);
 }
 
 void to_json(nlohmann::json& j, const UpdateReport& value) {
@@ -591,29 +628,27 @@ void to_json(nlohmann::json& j, const UpdateReport& value) {
     write_field(j, "manual", value.manual);
     write_field(j, "news", value.news);
     write_field(j, "overall_restart", value.overall_restart);
-    UpdateReport checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<UpdateReport>{});
 }
 
-void from_json(const nlohmann::json& j, Replacement& out) {
-    read_object(j, {"old","new"});
-    read_field(j, "old", out.old);
-    read_field(j, "new", out.new_);
+BRAURSER_READ_JSON(Replacement) {
+    read_object(j, {"old","new"}, extra);
+    read_field<Materialize>(j, "old", out.old);
+    read_field<Materialize>(j, "new", out.new_);
 }
 
 void to_json(nlohmann::json& j, const Replacement& value) {
     j = nlohmann::json::object();
     write_field(j, "old", value.old);
     write_field(j, "new", value.new_);
-    Replacement checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<Replacement>{});
 }
 
-void from_json(const nlohmann::json& j, Blocker& out) {
-    read_object(j, {"code","message_key","args"});
-    read_field(j, "code", out.code);
-    read_field(j, "message_key", out.message_key);
-    read_field(j, "args", out.args);
+BRAURSER_READ_JSON(Blocker) {
+    read_object(j, {"code","message_key","args"}, extra);
+    read_field<Materialize>(j, "code", out.code);
+    read_field<Materialize>(j, "message_key", out.message_key);
+    read_field<Materialize>(j, "args", out.args);
 }
 
 void to_json(nlohmann::json& j, const Blocker& value) {
@@ -621,28 +656,59 @@ void to_json(nlohmann::json& j, const Blocker& value) {
     write_field(j, "code", value.code);
     write_field(j, "message_key", value.message_key);
     write_field(j, "args", value.args);
-    Blocker checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<Blocker>{});
 }
 
-void from_json(const nlohmann::json& j, TransactionPlan& out) {
-    read_object(j, {"plan_id","revision","approval_token","kind","installs","upgrades","removals","replacements","conflicts","download_bytes","install_delta_bytes","restart","requires_build_review","build_review_refs","protected_blockers","blockers"});
-    read_field(j, "plan_id", out.plan_id);
-    read_field(j, "revision", out.revision);
-    read_field(j, "approval_token", out.approval_token);
-    read_field(j, "kind", out.kind);
-    read_field(j, "installs", out.installs);
-    read_field(j, "upgrades", out.upgrades);
-    read_field(j, "removals", out.removals);
-    read_field(j, "replacements", out.replacements);
-    read_field(j, "conflicts", out.conflicts);
-    read_field(j, "download_bytes", out.download_bytes);
-    read_field(j, "install_delta_bytes", out.install_delta_bytes);
-    read_field(j, "restart", out.restart);
-    read_field(j, "requires_build_review", out.requires_build_review);
-    read_field(j, "build_review_refs", out.build_review_refs);
-    read_field(j, "protected_blockers", out.protected_blockers);
-    read_field(j, "blockers", out.blockers);
+BRAURSER_READ_JSON(BuildPin) {
+    read_object(j, {"pkgbase", "pkgnames", "commit"}, extra);
+    read_field<Materialize>(j, "pkgbase", out.pkgbase);
+    read_field<Materialize>(j, "pkgnames", out.pkgnames);
+    read_field<Materialize>(j, "commit", out.commit);
+    const auto& pkgbase = text(j, "pkgbase");
+    const auto& commit = text(j, "commit");
+    const auto& names = j.at("pkgnames");
+    if (!br_valid_pkgname(pkgbase.data(), pkgbase.size()) || names.empty() || names.size() > 256 ||
+        (commit.size() != 40 && commit.size() != 64) ||
+        !std::all_of(commit.begin(), commit.end(), [](unsigned char ch) {
+            return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+        })) throw std::invalid_argument("invalid build pin");
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        const auto& name = names[index].get_ref<const std::string&>();
+        if (!br_valid_pkgname(name.data(), name.size())) throw std::invalid_argument("invalid build package");
+        for (std::size_t other = 0; other < index; ++other)
+            if (names[other] == names[index]) throw std::invalid_argument("invalid build package");
+    }
+}
+
+void to_json(nlohmann::json& j, const BuildPin& value) {
+    j = {{"pkgbase", value.pkgbase}, {"pkgnames", value.pkgnames}, {"commit", value.commit}};
+    validate_json(j, TypeTag<BuildPin>{});
+}
+
+BRAURSER_READ_JSON(TransactionPlan) {
+    read_object(j, {"plan_id","revision","approval_token","kind","installs","upgrades","removals","replacements","conflicts","download_bytes","install_delta_bytes","restart","requires_build_review","build_review_refs","build_pins","protected_blockers","blockers"}, extra);
+    read_field<Materialize>(j, "plan_id", out.plan_id);
+    read_field<Materialize>(j, "revision", out.revision);
+    read_field<Materialize>(j, "approval_token", out.approval_token);
+    read_field<Materialize>(j, "kind", out.kind);
+    read_field<Materialize>(j, "installs", out.installs);
+    read_field<Materialize>(j, "upgrades", out.upgrades);
+    read_field<Materialize>(j, "removals", out.removals);
+    read_field<Materialize>(j, "replacements", out.replacements);
+    read_field<Materialize>(j, "conflicts", out.conflicts);
+    read_field<Materialize>(j, "download_bytes", out.download_bytes);
+    read_field<Materialize>(j, "install_delta_bytes", out.install_delta_bytes);
+    read_field<Materialize>(j, "restart", out.restart);
+    read_field<Materialize>(j, "requires_build_review", out.requires_build_review);
+    read_field<Materialize>(j, "build_review_refs", out.build_review_refs);
+    read_field<Materialize>(j, "build_pins", out.build_pins);
+    if (j.at("build_pins").size() > 16) throw std::invalid_argument("too many build pins");
+    for (std::size_t index = 0; index < j.at("build_pins").size(); ++index)
+        for (std::size_t other = 0; other < index; ++other)
+            if (j.at("build_pins")[index].at("pkgbase") == j.at("build_pins")[other].at("pkgbase"))
+                throw std::invalid_argument("duplicate build pin");
+    read_field<Materialize>(j, "protected_blockers", out.protected_blockers);
+    read_field<Materialize>(j, "blockers", out.blockers);
 }
 
 void to_json(nlohmann::json& j, const TransactionPlan& value) {
@@ -661,19 +727,20 @@ void to_json(nlohmann::json& j, const TransactionPlan& value) {
     write_field(j, "restart", value.restart);
     write_field(j, "requires_build_review", value.requires_build_review);
     write_field(j, "build_review_refs", value.build_review_refs);
+    write_field(j, "build_pins", value.build_pins);
     write_field(j, "protected_blockers", value.protected_blockers);
     write_field(j, "blockers", value.blockers);
-    TransactionPlan checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<TransactionPlan>{});
 }
 
-void from_json(const nlohmann::json& j, Progress& out) {
-    read_object(j, {"phase","current","total","unit"});
-    read_field(j, "phase", out.phase);
-    read_field(j, "current", out.current);
-    read_field(j, "total", out.total);
-    read_field(j, "unit", out.unit);
-    if (out.current && out.total && *out.current > *out.total)
+BRAURSER_READ_JSON(Progress) {
+    read_object(j, {"phase","current","total","unit"}, extra);
+    read_field<Materialize>(j, "phase", out.phase);
+    read_field<Materialize>(j, "current", out.current);
+    read_field<Materialize>(j, "total", out.total);
+    read_field<Materialize>(j, "unit", out.unit);
+    if (present(j, "current") && present(j, "total") &&
+        j.at("current").get<std::uint64_t>() > j.at("total").get<std::uint64_t>())
         throw std::invalid_argument("invalid progress");
 }
 
@@ -683,27 +750,25 @@ void to_json(nlohmann::json& j, const Progress& value) {
     write_field(j, "current", value.current);
     write_field(j, "total", value.total);
     write_field(j, "unit", value.unit);
-    Progress checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<Progress>{});
 }
 
-void from_json(const nlohmann::json& j, ProviderQuestion& out) {
-    read_object(j, {"options"});
-    read_field(j, "options", out.options);
+BRAURSER_READ_JSON(ProviderQuestion) {
+    read_object(j, {"options"}, extra);
+    read_field<Materialize>(j, "options", out.options);
 }
 
 void to_json(nlohmann::json& j, const ProviderQuestion& value) {
     j = nlohmann::json::object();
     write_field(j, "options", value.options);
-    ProviderQuestion checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<ProviderQuestion>{});
 }
 
-void from_json(const nlohmann::json& j, BuildReviewQuestion& out) {
-    read_object(j, {"refs","pkgbuild"});
-    read_field(j, "refs", out.refs);
-    read_field(j, "pkgbuild", out.pkgbuild);
-    if (out.pkgbuild && (out.pkgbuild->empty() || out.pkgbuild->size() > 256 * 1024))
+BRAURSER_READ_JSON(BuildReviewQuestion) {
+    read_object(j, {"refs","pkgbuild"}, extra);
+    read_field<Materialize>(j, "refs", out.refs);
+    read_field<Materialize>(j, "pkgbuild", out.pkgbuild);
+    if (present(j, "pkgbuild") && (text(j, "pkgbuild").empty() || text(j, "pkgbuild").size() > 256 * 1024))
         throw std::invalid_argument("invalid build file");
 }
 
@@ -711,61 +776,54 @@ void to_json(nlohmann::json& j, const BuildReviewQuestion& value) {
     j = nlohmann::json::object();
     write_field(j, "refs", value.refs);
     write_field(j, "pkgbuild", value.pkgbuild);
-    BuildReviewQuestion checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<BuildReviewQuestion>{});
 }
 
-void from_json(const nlohmann::json& j, ConflictQuestion& out) {
-    read_object(j, {"a","b"});
-    read_field(j, "a", out.a);
-    read_field(j, "b", out.b);
+BRAURSER_READ_JSON(ConflictQuestion) {
+    read_object(j, {"a","b"}, extra);
+    read_field<Materialize>(j, "a", out.a);
+    read_field<Materialize>(j, "b", out.b);
 }
 
 void to_json(nlohmann::json& j, const ConflictQuestion& value) {
     j = nlohmann::json::object();
     write_field(j, "a", value.a);
     write_field(j, "b", value.b);
-    ConflictQuestion checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<ConflictQuestion>{});
 }
 
-void from_json(const nlohmann::json& j, NewsAckQuestion& out) {
-    read_object(j, {"items"});
-    read_field(j, "items", out.items);
+BRAURSER_READ_JSON(NewsAckQuestion) {
+    read_object(j, {"items"}, extra);
+    read_field<Materialize>(j, "items", out.items);
 }
 
 void to_json(nlohmann::json& j, const NewsAckQuestion& value) {
     j = nlohmann::json::object();
     write_field(j, "items", value.items);
-    NewsAckQuestion checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<NewsAckQuestion>{});
 }
 
-void from_json(const nlohmann::json& j, GitRedirectQuestion& out) {
-    read_object(j, {"from_host","to_host"});
-    read_field(j, "from_host", out.from_host);
-    read_field(j, "to_host", out.to_host);
+BRAURSER_READ_JSON(GitRedirectQuestion) {
+    read_object(j, {"from_host","to_host"}, extra);
+    read_field<Materialize>(j, "from_host", out.from_host);
+    read_field<Materialize>(j, "to_host", out.to_host);
 }
 
 void to_json(nlohmann::json& j, const GitRedirectQuestion& value) {
     j = nlohmann::json::object();
     write_field(j, "from_host", value.from_host);
     write_field(j, "to_host", value.to_host);
-    GitRedirectQuestion checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<GitRedirectQuestion>{});
 }
 
-void from_json(const nlohmann::json& j, Question& out) {
+BRAURSER_READ_JSON(Question) {
     if (!j.is_object()) throw std::invalid_argument("invalid question");
     validate_wire(j);
-    read_field(j, "question_id", out.question_id);
-    read_field(j, "token", out.token);
-    read_field(j, "expires_at", out.expires_at);
-    auto payload = j;
-    payload.erase("question_id");
-    payload.erase("token");
-    payload.erase("expires_at");
-    out.choice = payload.get<QuestionChoice>();
+    read_field<Materialize>(j, "question_id", out.question_id);
+    read_field<Materialize>(j, "token", out.token);
+    read_field<Materialize>(j, "expires_at", out.expires_at);
+    static_cast<void>(extra);
+    read_json<Materialize>(j, out.choice, {{"question_id", "token", "expires_at"}});
 }
 
 void to_json(nlohmann::json& j, const Question& value) {
@@ -773,20 +831,19 @@ void to_json(nlohmann::json& j, const Question& value) {
     write_field(j, "question_id", value.question_id);
     write_field(j, "token", value.token);
     write_field(j, "expires_at", value.expires_at);
-    Question checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<Question>{});
 }
 
-void from_json(const nlohmann::json& j, Settings& out) {
-    read_object(j, {"ui","helper","check_frequency","notifications","autostart","review_builds","show_log","theme"});
-    read_field(j, "ui", out.ui);
-    read_field(j, "helper", out.helper);
-    read_field(j, "check_frequency", out.check_frequency);
-    read_field(j, "notifications", out.notifications);
-    read_field(j, "autostart", out.autostart);
-    read_field(j, "review_builds", out.review_builds);
-    read_field(j, "show_log", out.show_log);
-    read_field(j, "theme", out.theme);
+BRAURSER_READ_JSON(Settings) {
+    read_object(j, {"ui","helper","check_frequency","notifications","autostart","review_builds","show_log","theme"}, extra);
+    read_field<Materialize>(j, "ui", out.ui);
+    read_field<Materialize>(j, "helper", out.helper);
+    read_field<Materialize>(j, "check_frequency", out.check_frequency);
+    read_field<Materialize>(j, "notifications", out.notifications);
+    read_field<Materialize>(j, "autostart", out.autostart);
+    read_field<Materialize>(j, "review_builds", out.review_builds);
+    read_field<Materialize>(j, "show_log", out.show_log);
+    read_field<Materialize>(j, "theme", out.theme);
 }
 
 void to_json(nlohmann::json& j, const Settings& value) {
@@ -799,20 +856,19 @@ void to_json(nlohmann::json& j, const Settings& value) {
     write_field(j, "review_builds", value.review_builds);
     write_field(j, "show_log", value.show_log);
     write_field(j, "theme", value.theme);
-    Settings checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<Settings>{});
 }
 
-void from_json(const nlohmann::json& j, SettingsPatch& out) {
-    read_object(j, {"ui", "helper", "check_frequency", "notifications", "autostart", "review_builds", "show_log", "theme"});
-    read_field(j, "ui", out.ui);
-    read_field(j, "helper", out.helper);
-    read_field(j, "check_frequency", out.check_frequency);
-    read_field(j, "notifications", out.notifications);
-    read_field(j, "autostart", out.autostart);
-    read_field(j, "review_builds", out.review_builds);
-    read_field(j, "show_log", out.show_log);
-    read_field(j, "theme", out.theme);
+BRAURSER_READ_JSON(SettingsPatch) {
+    read_object(j, {"ui", "helper", "check_frequency", "notifications", "autostart", "review_builds", "show_log", "theme"}, extra);
+    read_field<Materialize>(j, "ui", out.ui);
+    read_field<Materialize>(j, "helper", out.helper);
+    read_field<Materialize>(j, "check_frequency", out.check_frequency);
+    read_field<Materialize>(j, "notifications", out.notifications);
+    read_field<Materialize>(j, "autostart", out.autostart);
+    read_field<Materialize>(j, "review_builds", out.review_builds);
+    read_field<Materialize>(j, "show_log", out.show_log);
+    read_field<Materialize>(j, "theme", out.theme);
 }
 
 void to_json(nlohmann::json& j, const SettingsPatch& value) {
@@ -825,21 +881,20 @@ void to_json(nlohmann::json& j, const SettingsPatch& value) {
     write_field(j, "review_builds", value.review_builds);
     write_field(j, "show_log", value.show_log);
     write_field(j, "theme", value.theme);
-    SettingsPatch checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<SettingsPatch>{});
 }
 
-void from_json(const nlohmann::json& j, ManualPreview& out) {
-    read_object(j, {"preview_id","host","owner_repo","commit","script_path","script_text","scope_options","external_refs","staging_supported"});
-    read_field(j, "preview_id", out.preview_id);
-    read_field(j, "host", out.host);
-    read_field(j, "owner_repo", out.owner_repo);
-    read_field(j, "commit", out.commit);
-    read_field(j, "script_path", out.script_path);
-    read_field(j, "script_text", out.script_text);
-    read_field(j, "scope_options", out.scope_options);
-    read_field(j, "external_refs", out.external_refs);
-    read_field(j, "staging_supported", out.staging_supported);
+BRAURSER_READ_JSON(ManualPreview) {
+    read_object(j, {"preview_id","host","owner_repo","commit","script_path","script_text","scope_options","external_refs","staging_supported"}, extra);
+    read_field<Materialize>(j, "preview_id", out.preview_id);
+    read_field<Materialize>(j, "host", out.host);
+    read_field<Materialize>(j, "owner_repo", out.owner_repo);
+    read_field<Materialize>(j, "commit", out.commit);
+    read_field<Materialize>(j, "script_path", out.script_path);
+    read_field<Materialize>(j, "script_text", out.script_text);
+    read_field<Materialize>(j, "scope_options", out.scope_options);
+    read_field<Materialize>(j, "external_refs", out.external_refs);
+    read_field<Materialize>(j, "staging_supported", out.staging_supported);
 }
 
 void to_json(nlohmann::json& j, const ManualPreview& value) {
@@ -853,19 +908,18 @@ void to_json(nlohmann::json& j, const ManualPreview& value) {
     write_field(j, "scope_options", value.scope_options);
     write_field(j, "external_refs", value.external_refs);
     write_field(j, "staging_supported", value.staging_supported);
-    ManualPreview checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<ManualPreview>{});
 }
 
-void from_json(const nlohmann::json& j, ManualReceipt& out) {
-    read_object(j, {"receipt_id","name","scope","commit","installed_at","launcher_ids","removable"});
-    read_field(j, "receipt_id", out.receipt_id);
-    read_field(j, "name", out.name);
-    read_field(j, "scope", out.scope);
-    read_field(j, "commit", out.commit);
-    read_field(j, "installed_at", out.installed_at);
-    read_field(j, "launcher_ids", out.launcher_ids);
-    read_field(j, "removable", out.removable);
+BRAURSER_READ_JSON(ManualReceipt) {
+    read_object(j, {"receipt_id","name","scope","commit","installed_at","launcher_ids","removable"}, extra);
+    read_field<Materialize>(j, "receipt_id", out.receipt_id);
+    read_field<Materialize>(j, "name", out.name);
+    read_field<Materialize>(j, "scope", out.scope);
+    read_field<Materialize>(j, "commit", out.commit);
+    read_field<Materialize>(j, "installed_at", out.installed_at);
+    read_field<Materialize>(j, "launcher_ids", out.launcher_ids);
+    read_field<Materialize>(j, "removable", out.removable);
 }
 
 void to_json(nlohmann::json& j, const ManualReceipt& value) {
@@ -877,17 +931,16 @@ void to_json(nlohmann::json& j, const ManualReceipt& value) {
     write_field(j, "installed_at", value.installed_at);
     write_field(j, "launcher_ids", value.launcher_ids);
     write_field(j, "removable", value.removable);
-    ManualReceipt checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<ManualReceipt>{});
 }
 
-void from_json(const nlohmann::json& j, LauncherEntry& out) {
-    read_object(j, {"desktop_id","name","exec_display","path","owner"});
-    read_field(j, "desktop_id", out.desktop_id);
-    read_field(j, "name", out.name);
-    read_field(j, "exec_display", out.exec_display);
-    read_field(j, "path", out.path);
-    read_field(j, "owner", out.owner);
+BRAURSER_READ_JSON(LauncherEntry) {
+    read_object(j, {"desktop_id","name","exec_display","path","owner"}, extra);
+    read_field<Materialize>(j, "desktop_id", out.desktop_id);
+    read_field<Materialize>(j, "name", out.name);
+    read_field<Materialize>(j, "exec_display", out.exec_display);
+    read_field<Materialize>(j, "path", out.path);
+    read_field<Materialize>(j, "owner", out.owner);
 }
 
 void to_json(nlohmann::json& j, const LauncherEntry& value) {
@@ -897,19 +950,19 @@ void to_json(nlohmann::json& j, const LauncherEntry& value) {
     write_field(j, "exec_display", value.exec_display);
     write_field(j, "path", value.path);
     write_field(j, "owner", value.owner);
-    LauncherEntry checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<LauncherEntry>{});
 }
 
-void from_json(const nlohmann::json& j, Capabilities& out) {
-    read_object(j, {"helper","helper_version","elevation","init","distro_id","repos"});
-    read_field(j, "helper", out.helper);
-    read_field(j, "helper_version", out.helper_version);
-    read_field(j, "elevation", out.elevation);
-    read_field(j, "init", out.init);
-    read_field(j, "distro_id", out.distro_id);
-    read_field(j, "repos", out.repos);
-    for (const auto& repo : out.repos) {
+BRAURSER_READ_JSON(Capabilities) {
+    read_object(j, {"helper","helper_version","elevation","init","distro_id","repos"}, extra);
+    read_field<Materialize>(j, "helper", out.helper);
+    read_field<Materialize>(j, "helper_version", out.helper_version);
+    read_field<Materialize>(j, "elevation", out.elevation);
+    read_field<Materialize>(j, "init", out.init);
+    read_field<Materialize>(j, "distro_id", out.distro_id);
+    read_field<Materialize>(j, "repos", out.repos);
+    if (j.contains("repos")) for (const auto& item : j.at("repos")) {
+        const auto& repo = item.get_ref<const std::string&>();
         if (!br_valid_repo_name(repo.data(), repo.size())) throw std::invalid_argument("invalid repository");
     }
 }
@@ -922,16 +975,15 @@ void to_json(nlohmann::json& j, const Capabilities& value) {
     write_field(j, "init", value.init);
     write_field(j, "distro_id", value.distro_id);
     write_field(j, "repos", value.repos);
-    Capabilities checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<Capabilities>{});
 }
 
-void from_json(const nlohmann::json& j, SystemStatus& out) {
-    read_object(j, {"connectivity","catalog_age","active_job","elevation_method"});
-    read_field(j, "connectivity", out.connectivity);
-    read_field(j, "catalog_age", out.catalog_age);
-    read_field(j, "active_job", out.active_job);
-    read_field(j, "elevation_method", out.elevation_method);
+BRAURSER_READ_JSON(SystemStatus) {
+    read_object(j, {"connectivity","catalog_age","active_job","elevation_method"}, extra);
+    read_field<Materialize>(j, "connectivity", out.connectivity);
+    read_field<Materialize>(j, "catalog_age", out.catalog_age);
+    read_field<Materialize>(j, "active_job", out.active_job);
+    read_field<Materialize>(j, "elevation_method", out.elevation_method);
 }
 
 void to_json(nlohmann::json& j, const SystemStatus& value) {
@@ -940,31 +992,29 @@ void to_json(nlohmann::json& j, const SystemStatus& value) {
     write_field(j, "catalog_age", value.catalog_age);
     write_field(j, "active_job", value.active_job);
     write_field(j, "elevation_method", value.elevation_method);
-    SystemStatus checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<SystemStatus>{});
 }
 
-void from_json(const nlohmann::json& j, HelloParams& out) {
-    read_object(j, {"apiVersion"});
-    read_field(j, "apiVersion", out.apiVersion);
-    if (out.apiVersion != 1) throw std::invalid_argument("invalid API version");
+BRAURSER_READ_JSON(HelloParams) {
+    read_object(j, {"apiVersion"}, extra);
+    read_field<Materialize>(j, "apiVersion", out.apiVersion);
+    if (j.at("apiVersion").get<std::uint64_t>() != 1) throw std::invalid_argument("invalid API version");
 }
 
 void to_json(nlohmann::json& j, const HelloParams& value) {
     j = nlohmann::json::object();
     write_field(j, "apiVersion", value.apiVersion);
-    HelloParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<HelloParams>{});
 }
 
-void from_json(const nlohmann::json& j, HelloResult& out) {
-    read_object(j, {"serverVersion","apiVersion","helper","capabilities","uiBackends"});
-    read_field(j, "serverVersion", out.serverVersion);
-    read_field(j, "apiVersion", out.apiVersion);
-    read_field(j, "helper", out.helper);
-    read_field(j, "capabilities", out.capabilities);
-    read_field(j, "uiBackends", out.uiBackends);
-    if (out.apiVersion != 1) throw std::invalid_argument("invalid API version");
+BRAURSER_READ_JSON(HelloResult) {
+    read_object(j, {"serverVersion","apiVersion","helper","capabilities","uiBackends"}, extra);
+    read_field<Materialize>(j, "serverVersion", out.serverVersion);
+    read_field<Materialize>(j, "apiVersion", out.apiVersion);
+    read_field<Materialize>(j, "helper", out.helper);
+    read_field<Materialize>(j, "capabilities", out.capabilities);
+    read_field<Materialize>(j, "uiBackends", out.uiBackends);
+    if (j.at("apiVersion").get<std::uint64_t>() != 1) throw std::invalid_argument("invalid API version");
 }
 
 void to_json(nlohmann::json& j, const HelloResult& value) {
@@ -974,51 +1024,48 @@ void to_json(nlohmann::json& j, const HelloResult& value) {
     write_field(j, "helper", value.helper);
     write_field(j, "capabilities", value.capabilities);
     write_field(j, "uiBackends", value.uiBackends);
-    HelloResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<HelloResult>{});
 }
 
-void from_json(const nlohmann::json& j, StatusParams& out) {
+BRAURSER_READ_JSON(StatusParams) {
     static_cast<void>(out);
-    read_object(j, {});
+    read_object(j, {}, extra);
 }
 
 void to_json(nlohmann::json& j, const StatusParams& value) {
     static_cast<void>(value);
     j = nlohmann::json::object();
-    StatusParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<StatusParams>{});
 }
 
-void from_json(const nlohmann::json& j, CatalogSourceStatus& out) {
-    read_object(j, {"id","status","reasonCode","packageCount","skippedCount"});
-    read_field(j, "id", out.id);
-    read_field(j, "status", out.status);
-    read_field(j, "reasonCode", out.reasonCode);
-    read_field(j, "packageCount", out.packageCount);
-    read_field(j, "skippedCount", out.skippedCount);
-    if (out.status != "ok" && out.status != "unavailable" && out.status != "failed")
+BRAURSER_READ_JSON(CatalogSourceStatus) {
+    read_object(j, {"id","status","reasonCode","packageCount","skippedCount"}, extra);
+    read_field<Materialize>(j, "id", out.id);
+    read_field<Materialize>(j, "status", out.status);
+    read_field<Materialize>(j, "reasonCode", out.reasonCode);
+    read_field<Materialize>(j, "packageCount", out.packageCount);
+    read_field<Materialize>(j, "skippedCount", out.skippedCount);
+    if (text(j, "status") != "ok" && text(j, "status") != "unavailable" && text(j, "status") != "failed")
         throw std::invalid_argument("invalid source status");
 }
 
 void to_json(nlohmann::json& j, const CatalogSourceStatus& value) {
     j = {{"id", value.id}, {"status", value.status}, {"packageCount", value.packageCount}, {"skippedCount", value.skippedCount}};
     write_field(j, "reasonCode", value.reasonCode);
-    CatalogSourceStatus checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<CatalogSourceStatus>{});
 }
 
-void from_json(const nlohmann::json& j, StatusResult& out) {
-    read_object(j, {"connectivity","catalogAge","activeJob","elevationMethod","catalogState","catalogAgeSeconds","sources"});
-    read_field(j, "connectivity", out.connectivity);
-    read_field(j, "catalogAge", out.catalogAge);
-    read_field(j, "activeJob", out.activeJob);
-    read_field(j, "elevationMethod", out.elevationMethod);
-    read_field(j, "catalogState", out.catalogState);
-    read_field(j, "catalogAgeSeconds", out.catalogAgeSeconds);
-    read_field(j, "sources", out.sources);
-    if (out.catalogState != "missing" && out.catalogState != "refreshing" &&
-        out.catalogState != "ready" && out.catalogState != "stale")
+BRAURSER_READ_JSON(StatusResult) {
+    read_object(j, {"connectivity","catalogAge","activeJob","elevationMethod","catalogState","catalogAgeSeconds","sources"}, extra);
+    read_field<Materialize>(j, "connectivity", out.connectivity);
+    read_field<Materialize>(j, "catalogAge", out.catalogAge);
+    read_field<Materialize>(j, "activeJob", out.activeJob);
+    read_field<Materialize>(j, "elevationMethod", out.elevationMethod);
+    read_field<Materialize>(j, "catalogState", out.catalogState);
+    read_field<Materialize>(j, "catalogAgeSeconds", out.catalogAgeSeconds);
+    read_field<Materialize>(j, "sources", out.sources);
+    if (text(j, "catalogState") != "missing" && text(j, "catalogState") != "refreshing" &&
+        text(j, "catalogState") != "ready" && text(j, "catalogState") != "stale")
         throw std::invalid_argument("invalid catalog state");
 }
 
@@ -1031,20 +1078,19 @@ void to_json(nlohmann::json& j, const StatusResult& value) {
     write_field(j, "catalogState", value.catalogState);
     write_field(j, "catalogAgeSeconds", value.catalogAgeSeconds);
     write_field(j, "sources", value.sources);
-    StatusResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<StatusResult>{});
 }
 
-void from_json(const nlohmann::json& j, SearchParams& out) {
-    read_object(j, {"text","filters","cursor","limit","sort","category"});
-    read_field(j, "text", out.text);
-    read_field(j, "filters", out.filters);
-    read_field(j, "cursor", out.cursor);
-    read_field(j, "limit", out.limit);
-    if (j.contains("sort")) read_field(j, "sort", out.sort);
-    read_field(j, "category", out.category);
-    if (out.limit == 0 || out.limit > 200 || out.text.size() > 256 ||
-        (out.category && (out.category->empty() || out.category->size() > 256)))
+BRAURSER_READ_JSON(SearchParams) {
+    read_object(j, {"text","filters","cursor","limit","sort","category"}, extra);
+    read_field<Materialize>(j, "text", out.text);
+    read_field<Materialize>(j, "filters", out.filters);
+    read_field<Materialize>(j, "cursor", out.cursor);
+    read_field<Materialize>(j, "limit", out.limit);
+    if (j.contains("sort")) read_field<Materialize>(j, "sort", out.sort);
+    read_field<Materialize>(j, "category", out.category);
+    if (j.at("limit").get<std::uint64_t>() == 0 || j.at("limit").get<std::uint64_t>() > 200 || text(j, "text").size() > 256 ||
+        (present(j, "category") && (text(j, "category").empty() || text(j, "category").size() > 256)))
         throw std::invalid_argument("invalid search bounds");
 }
 
@@ -1056,17 +1102,16 @@ void to_json(nlohmann::json& j, const SearchParams& value) {
     write_field(j, "limit", value.limit);
     write_field(j, "sort", value.sort);
     write_field(j, "category", value.category);
-    SearchParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<SearchParams>{});
 }
 
-void from_json(const nlohmann::json& j, SearchResult& out) {
-    read_object(j, {"packages","nextCursor","stale","catalogState"});
-    read_field(j, "packages", out.packages);
-    read_field(j, "nextCursor", out.nextCursor);
-    read_field(j, "stale", out.stale);
-    read_field(j, "catalogState", out.catalogState);
-    if (out.catalogState && *out.catalogState != "refreshing" && *out.catalogState != "ready" && *out.catalogState != "stale")
+BRAURSER_READ_JSON(SearchResult) {
+    read_object(j, {"packages","nextCursor","stale","catalogState"}, extra);
+    read_field<Materialize>(j, "packages", out.packages);
+    read_field<Materialize>(j, "nextCursor", out.nextCursor);
+    read_field<Materialize>(j, "stale", out.stale);
+    read_field<Materialize>(j, "catalogState", out.catalogState);
+    if (present(j, "catalogState") && text(j, "catalogState") != "refreshing" && text(j, "catalogState") != "ready" && text(j, "catalogState") != "stale")
         throw std::invalid_argument("invalid catalog state");
 }
 
@@ -1076,28 +1121,26 @@ void to_json(nlohmann::json& j, const SearchResult& value) {
     write_field(j, "nextCursor", value.nextCursor);
     write_field(j, "stale", value.stale);
     write_field(j, "catalogState", value.catalogState);
-    SearchResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<SearchResult>{});
 }
 
-void from_json(const nlohmann::json& j, GetParams& out) {
-    read_object(j, {"packageId"});
-    read_field(j, "packageId", out.packageId);
+BRAURSER_READ_JSON(GetParams) {
+    read_object(j, {"packageId"}, extra);
+    read_field<Materialize>(j, "packageId", out.packageId);
 }
 
 void to_json(nlohmann::json& j, const GetParams& value) {
     j = nlohmann::json::object();
     write_field(j, "packageId", value.packageId);
-    GetParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<GetParams>{});
 }
 
-void from_json(const nlohmann::json& j, GetResult& out) {
-    read_object(j, {"details","installedState","source","appMetadata"});
-    read_field(j, "details", out.details);
-    read_field(j, "installedState", out.installedState);
-    read_field(j, "source", out.source);
-    read_field(j, "appMetadata", out.appMetadata);
+BRAURSER_READ_JSON(GetResult) {
+    read_object(j, {"details","installedState","source","appMetadata"}, extra);
+    read_field<Materialize>(j, "details", out.details);
+    read_field<Materialize>(j, "installedState", out.installedState);
+    read_field<Materialize>(j, "source", out.source);
+    read_field<Materialize>(j, "appMetadata", out.appMetadata);
 }
 
 void to_json(nlohmann::json& j, const GetResult& value) {
@@ -1106,146 +1149,179 @@ void to_json(nlohmann::json& j, const GetResult& value) {
     write_field(j, "installedState", value.installedState);
     write_field(j, "source", value.source);
     write_field(j, "appMetadata", value.appMetadata);
-    GetResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<GetResult>{});
 }
 
-void from_json(const nlohmann::json& j, VariantsParams& out) {
-    read_object(j, {"packageId"});
-    read_field(j, "packageId", out.packageId);
+BRAURSER_READ_JSON(VariantsParams) {
+    read_object(j, {"packageId"}, extra);
+    read_field<Materialize>(j, "packageId", out.packageId);
 }
 
 void to_json(nlohmann::json& j, const VariantsParams& value) {
     j = nlohmann::json::object();
     write_field(j, "packageId", value.packageId);
-    VariantsParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<VariantsParams>{});
 }
 
-void from_json(const nlohmann::json& j, VariantsResult& out) {
-    read_object(j, {"choices","questionRequired"});
-    read_field(j, "choices", out.choices);
-    read_field(j, "questionRequired", out.questionRequired);
+BRAURSER_READ_JSON(VariantsResult) {
+    read_object(j, {"choices","questionRequired"}, extra);
+    read_field<Materialize>(j, "choices", out.choices);
+    read_field<Materialize>(j, "questionRequired", out.questionRequired);
 }
 
 void to_json(nlohmann::json& j, const VariantsResult& value) {
     j = nlohmann::json::object();
     write_field(j, "choices", value.choices);
     write_field(j, "questionRequired", value.questionRequired);
-    VariantsResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<VariantsResult>{});
 }
 
-void from_json(const nlohmann::json& j, FacetsParams&) { read_object(j, {}); }
+BRAURSER_READ_JSON(FacetsParams) { static_cast<void>(out); read_object(j, {}, extra); }
 void to_json(nlohmann::json& j, const FacetsParams&) { j = nlohmann::json::object(); }
 
-void from_json(const nlohmann::json& j, FacetCount& out) {
-    read_object(j, {"name","packageCount"});
-    read_field(j, "name", out.name);
-    read_field(j, "packageCount", out.packageCount);
+BRAURSER_READ_JSON(FacetCount) {
+    read_object(j, {"name","packageCount"}, extra);
+    read_field<Materialize>(j, "name", out.name);
+    read_field<Materialize>(j, "packageCount", out.packageCount);
 }
 void to_json(nlohmann::json& j, const FacetCount& value) {
     j = {{"name", value.name}, {"packageCount", value.packageCount}};
-    FacetCount checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<FacetCount>{});
 }
-void from_json(const nlohmann::json& j, CategoryCount& out) {
-    read_object(j, {"id","packageCount"});
-    read_field(j, "id", out.id);
-    read_field(j, "packageCount", out.packageCount);
+BRAURSER_READ_JSON(CategoryCount) {
+    read_object(j, {"id","packageCount"}, extra);
+    read_field<Materialize>(j, "id", out.id);
+    read_field<Materialize>(j, "packageCount", out.packageCount);
 }
 void to_json(nlohmann::json& j, const CategoryCount& value) {
     j = {{"id", value.id}, {"packageCount", value.packageCount}};
-    CategoryCount checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<CategoryCount>{});
 }
-void from_json(const nlohmann::json& j, FacetsResult& out) {
-    read_object(j, {"repos","groups","categories"});
-    read_field(j, "repos", out.repos);
-    read_field(j, "groups", out.groups);
-    read_field(j, "categories", out.categories);
+BRAURSER_READ_JSON(FacetsResult) {
+    read_object(j, {"repos","groups","categories"}, extra);
+    read_field<Materialize>(j, "repos", out.repos);
+    read_field<Materialize>(j, "groups", out.groups);
+    read_field<Materialize>(j, "categories", out.categories);
 }
 void to_json(nlohmann::json& j, const FacetsResult& value) {
     j = {{"repos", value.repos}, {"groups", value.groups}, {"categories", value.categories}};
-    FacetsResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<FacetsResult>{});
 }
-void from_json(const nlohmann::json& j, BuildFilesParams& out) {
-    read_object(j, {"packageId"});
-    read_field(j, "packageId", out.packageId);
+namespace {
+bool build_path(std::string_view path) {
+    if (path.empty() || path.size() > 1024 || path.back() == '/' || path.find('\\') != path.npos) return false;
+    while (!path.empty()) {
+        const auto slash = path.find('/');
+        const auto part = path.substr(0, slash);
+        if (part == "." || part == ".." || !br_valid_path_component(part.data(), part.size())) return false;
+        if (slash == path.npos) break;
+        path.remove_prefix(slash + 1);
+    }
+    return true;
+}
+}
+
+BRAURSER_READ_JSON(BuildFilesParams) {
+    read_object(j, {"packageId", "commit", "path"}, extra);
+    read_field<Materialize>(j, "packageId", out.packageId);
+    if constexpr (Materialize) { out.commit.reset(); out.path.reset(); }
+    read_field<Materialize>(j, "commit", out.commit);
+    read_field<Materialize>(j, "path", out.path);
+    if (present(j, "path") && (!present(j, "commit") || !build_path(text(j, "path"))))
+        throw std::invalid_argument("invalid build path");
+    if (present(j, "commit") && ((text(j, "commit").size() != 40 && text(j, "commit").size() != 64) ||
+        !std::all_of(text(j, "commit").begin(), text(j, "commit").end(), [](unsigned char ch) {
+            return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+        }))) throw std::invalid_argument("invalid build commit");
 }
 void to_json(nlohmann::json& j, const BuildFilesParams& value) {
     j = {{"packageId", value.packageId}};
-    BuildFilesParams checked;
-    from_json(j, checked);
+    write_field(j, "commit", value.commit);
+    write_field(j, "path", value.path);
+    validate_json(j, TypeTag<BuildFilesParams>{});
 }
-void from_json(const nlohmann::json& j, BuildFile& out) {
-    read_object(j, {"name","text"});
-    read_field(j, "name", out.name);
-    read_field(j, "text", out.text);
+BRAURSER_READ_JSON(BuildFile) {
+    read_object(j, {"name","text","kind","size","sha256"}, extra);
+    read_field<Materialize>(j, "name", out.name);
+    read_field<Materialize>(j, "text", out.text);
+    read_field<Materialize>(j, "kind", out.kind);
+    read_field<Materialize>(j, "size", out.size);
+    read_field<Materialize>(j, "sha256", out.sha256);
+    const auto& kind = text(j, "kind");
+    const auto size = j.at("size").get<std::uint64_t>();
+    const auto& digest = text(j, "sha256");
+    if (!build_path(text(j, "name")) || (kind != "text" && kind != "binary" && kind != "omitted") ||
+        size > 4 * 1024 * 1024 || digest.size() != 64 ||
+        !std::all_of(digest.begin(), digest.end(), [](unsigned char ch) {
+            return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+        }) || (kind == "text" ? text(j, "text").size() != size : !text(j, "text").empty()) ||
+        (kind != "binary" && size > 448 * 1024)) throw std::invalid_argument("invalid build file");
 }
 void to_json(nlohmann::json& j, const BuildFile& value) {
-    j = {{"name", value.name}, {"text", value.text}};
-    BuildFile checked;
-    from_json(j, checked);
+    j = {{"name", value.name}, {"text", value.text}, {"kind", value.kind}, {"size", value.size}, {"sha256", value.sha256}};
+    validate_json(j, TypeTag<BuildFile>{});
 }
-void from_json(const nlohmann::json& j, BuildFilesResult& out) {
-    read_object(j, {"packageBase","files","truncated"});
-    read_field(j, "packageBase", out.packageBase);
-    read_field(j, "files", out.files);
-    read_field(j, "truncated", out.truncated);
+BRAURSER_READ_JSON(BuildFilesResult) {
+    read_object(j, {"packageBase","files","truncated"}, extra);
+    read_field<Materialize>(j, "packageBase", out.packageBase);
+    read_field<Materialize>(j, "files", out.files);
+    read_field<Materialize>(j, "truncated", out.truncated);
+    const auto& base = text(j, "packageBase");
+    if (!br_valid_pkgname(base.data(), base.size())) throw std::invalid_argument("invalid build base");
+    const auto& files = j.at("files");
+    for (auto file = files.begin(); file != files.end(); ++file) {
+        for (auto previous = files.begin(); previous != file; ++previous) {
+            if (text(*file, "name") == text(*previous, "name")) throw std::invalid_argument("duplicate build file");
+        }
+    }
 }
 void to_json(nlohmann::json& j, const BuildFilesResult& value) {
     j = {{"packageBase", value.packageBase}, {"files", value.files}, {"truncated", value.truncated}};
-    BuildFilesResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<BuildFilesResult>{});
 }
 
-void from_json(const nlohmann::json& j, RefreshParams& out) {
-    read_object(j, {"sources"});
-    read_field(j, "sources", out.sources);
+BRAURSER_READ_JSON(RefreshParams) {
+    read_object(j, {"sources"}, extra);
+    read_field<Materialize>(j, "sources", out.sources);
 }
 
 void to_json(nlohmann::json& j, const RefreshParams& value) {
     j = nlohmann::json::object();
     write_field(j, "sources", value.sources);
-    RefreshParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<RefreshParams>{});
 }
 
-void from_json(const nlohmann::json& j, JobIdResult& out) {
-    read_object(j, {"jobId"});
-    read_field(j, "jobId", out.jobId);
+BRAURSER_READ_JSON(JobIdResult) {
+    read_object(j, {"jobId"}, extra);
+    read_field<Materialize>(j, "jobId", out.jobId);
 }
 
 void to_json(nlohmann::json& j, const JobIdResult& value) {
     j = nlohmann::json::object();
     write_field(j, "jobId", value.jobId);
-    JobIdResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<JobIdResult>{});
 }
 
-void from_json(const nlohmann::json& j, WikiGetParams& out) {
-    read_object(j, {"packageId","allowRefresh"});
-    read_field(j, "packageId", out.packageId);
-    read_field(j, "allowRefresh", out.allowRefresh);
+BRAURSER_READ_JSON(WikiGetParams) {
+    read_object(j, {"packageId","allowRefresh"}, extra);
+    read_field<Materialize>(j, "packageId", out.packageId);
+    read_field<Materialize>(j, "allowRefresh", out.allowRefresh);
 }
 
 void to_json(nlohmann::json& j, const WikiGetParams& value) {
     j = nlohmann::json::object();
     write_field(j, "packageId", value.packageId);
     write_field(j, "allowRefresh", value.allowRefresh);
-    WikiGetParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<WikiGetParams>{});
 }
 
-void from_json(const nlohmann::json& j, WikiGetResult& out) {
-    read_object(j, {"document","sourceUrl","attribution","fetchedAt","stale"});
-    read_field(j, "document", out.document);
-    read_field(j, "sourceUrl", out.sourceUrl);
-    read_field(j, "attribution", out.attribution);
-    read_field(j, "fetchedAt", out.fetchedAt);
-    read_field(j, "stale", out.stale);
+BRAURSER_READ_JSON(WikiGetResult) {
+    read_object(j, {"document","sourceUrl","attribution","fetchedAt","stale"}, extra);
+    read_field<Materialize>(j, "document", out.document);
+    read_field<Materialize>(j, "sourceUrl", out.sourceUrl);
+    read_field<Materialize>(j, "attribution", out.attribution);
+    read_field<Materialize>(j, "fetchedAt", out.fetchedAt);
+    read_field<Materialize>(j, "stale", out.stale);
 }
 
 void to_json(nlohmann::json& j, const WikiGetResult& value) {
@@ -1255,30 +1331,28 @@ void to_json(nlohmann::json& j, const WikiGetResult& value) {
     write_field(j, "attribution", value.attribution);
     write_field(j, "fetchedAt", value.fetchedAt);
     write_field(j, "stale", value.stale);
-    WikiGetResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<WikiGetResult>{});
 }
 
-void from_json(const nlohmann::json& j, NewsListParams& out) {
-    read_object(j, {"cursor","limit"});
-    read_field(j, "cursor", out.cursor);
-    read_field(j, "limit", out.limit);
-    if (out.limit == 0 || out.limit > 200) throw std::invalid_argument("invalid limit");
+BRAURSER_READ_JSON(NewsListParams) {
+    read_object(j, {"cursor","limit"}, extra);
+    read_field<Materialize>(j, "cursor", out.cursor);
+    read_field<Materialize>(j, "limit", out.limit);
+    if (j.at("limit").get<std::uint64_t>() == 0 || j.at("limit").get<std::uint64_t>() > 200) throw std::invalid_argument("invalid limit");
 }
 
 void to_json(nlohmann::json& j, const NewsListParams& value) {
     j = nlohmann::json::object();
     write_field(j, "cursor", value.cursor);
     write_field(j, "limit", value.limit);
-    NewsListParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<NewsListParams>{});
 }
 
-void from_json(const nlohmann::json& j, NewsListResult& out) {
-    read_object(j, {"items","nextCursor","stale"});
-    read_field(j, "items", out.items);
-    read_field(j, "nextCursor", out.nextCursor);
-    read_field(j, "stale", out.stale);
+BRAURSER_READ_JSON(NewsListResult) {
+    read_object(j, {"items","nextCursor","stale"}, extra);
+    read_field<Materialize>(j, "items", out.items);
+    read_field<Materialize>(j, "nextCursor", out.nextCursor);
+    read_field<Materialize>(j, "stale", out.stale);
 }
 
 void to_json(nlohmann::json& j, const NewsListResult& value) {
@@ -1286,40 +1360,37 @@ void to_json(nlohmann::json& j, const NewsListResult& value) {
     write_field(j, "items", value.items);
     write_field(j, "nextCursor", value.nextCursor);
     write_field(j, "stale", value.stale);
-    NewsListResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<NewsListResult>{});
 }
 
-void from_json(const nlohmann::json& j, UpdatesCheckParams& out) {
-    read_object(j, {"refresh"});
-    read_field(j, "refresh", out.refresh);
+BRAURSER_READ_JSON(UpdatesCheckParams) {
+    read_object(j, {"refresh"}, extra);
+    read_field<Materialize>(j, "refresh", out.refresh);
 }
 
 void to_json(nlohmann::json& j, const UpdatesCheckParams& value) {
     j = nlohmann::json::object();
     write_field(j, "refresh", value.refresh);
-    UpdatesCheckParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<UpdatesCheckParams>{});
 }
 
-void from_json(const nlohmann::json& j, UpdatesOptionsParams& out) {
-    read_object(j, {"reportId"});
-    read_field(j, "reportId", out.reportId);
+BRAURSER_READ_JSON(UpdatesOptionsParams) {
+    read_object(j, {"reportId"}, extra);
+    read_field<Materialize>(j, "reportId", out.reportId);
 }
 
 void to_json(nlohmann::json& j, const UpdatesOptionsParams& value) {
     j = nlohmann::json::object();
     write_field(j, "reportId", value.reportId);
-    UpdatesOptionsParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<UpdatesOptionsParams>{});
 }
 
-void from_json(const nlohmann::json& j, UpdatesOptionsResult& out) {
-    read_object(j, {"officialAction","communityIndividualIds","manualIndividualIds"});
-    read_field(j, "officialAction", out.officialAction);
-    read_field(j, "communityIndividualIds", out.communityIndividualIds);
-    read_field(j, "manualIndividualIds", out.manualIndividualIds);
-    if (out.officialAction != "update-system") throw std::invalid_argument("invalid action");
+BRAURSER_READ_JSON(UpdatesOptionsResult) {
+    read_object(j, {"officialAction","communityIndividualIds","manualIndividualIds"}, extra);
+    read_field<Materialize>(j, "officialAction", out.officialAction);
+    read_field<Materialize>(j, "communityIndividualIds", out.communityIndividualIds);
+    read_field<Materialize>(j, "manualIndividualIds", out.manualIndividualIds);
+    if (text(j, "officialAction") != "update-system") throw std::invalid_argument("invalid action");
 }
 
 void to_json(nlohmann::json& j, const UpdatesOptionsResult& value) {
@@ -1327,29 +1398,27 @@ void to_json(nlohmann::json& j, const UpdatesOptionsResult& value) {
     write_field(j, "officialAction", value.officialAction);
     write_field(j, "communityIndividualIds", value.communityIndividualIds);
     write_field(j, "manualIndividualIds", value.manualIndividualIds);
-    UpdatesOptionsResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<UpdatesOptionsResult>{});
 }
 
-void from_json(const nlohmann::json& j, PlanSelection& out) {
-    read_object(j, {"kind","id"});
-    read_field(j, "kind", out.kind);
-    read_field(j, "id", out.id);
+BRAURSER_READ_JSON(PlanSelection) {
+    read_object(j, {"kind","id"}, extra);
+    read_field<Materialize>(j, "kind", out.kind);
+    read_field<Materialize>(j, "id", out.id);
 }
 
 void to_json(nlohmann::json& j, const PlanSelection& value) {
     j = nlohmann::json::object();
     write_field(j, "kind", value.kind);
     write_field(j, "id", value.id);
-    PlanSelection checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<PlanSelection>{});
 }
 
-void from_json(const nlohmann::json& j, UpdatesPlanParams& out) {
-    read_object(j, {"reportId","selection","alsoInstallPackageId"});
-    read_field(j, "reportId", out.reportId);
-    read_field(j, "selection", out.selection);
-    read_field(j, "alsoInstallPackageId", out.alsoInstallPackageId);
+BRAURSER_READ_JSON(UpdatesPlanParams) {
+    read_object(j, {"reportId","selection","alsoInstallPackageId"}, extra);
+    read_field<Materialize>(j, "reportId", out.reportId);
+    read_field<Materialize>(j, "selection", out.selection);
+    read_field<Materialize>(j, "alsoInstallPackageId", out.alsoInstallPackageId);
 }
 
 void to_json(nlohmann::json& j, const UpdatesPlanParams& value) {
@@ -1357,17 +1426,16 @@ void to_json(nlohmann::json& j, const UpdatesPlanParams& value) {
     write_field(j, "reportId", value.reportId);
     write_field(j, "selection", value.selection);
     write_field(j, "alsoInstallPackageId", value.alsoInstallPackageId);
-    UpdatesPlanParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<UpdatesPlanParams>{});
 }
 
-void from_json(const nlohmann::json& j, UpdatesPlanResult& out) {
-    read_object(j, {"planId","transactions","restartAdvice","requiresApproval","blockers"});
-    read_field(j, "planId", out.planId);
-    read_field(j, "transactions", out.transactions);
-    read_field(j, "restartAdvice", out.restartAdvice);
-    read_field(j, "requiresApproval", out.requiresApproval);
-    read_field(j, "blockers", out.blockers);
+BRAURSER_READ_JSON(UpdatesPlanResult) {
+    read_object(j, {"planId","transactions","restartAdvice","requiresApproval","blockers"}, extra);
+    read_field<Materialize>(j, "planId", out.planId);
+    read_field<Materialize>(j, "transactions", out.transactions);
+    read_field<Materialize>(j, "restartAdvice", out.restartAdvice);
+    read_field<Materialize>(j, "requiresApproval", out.requiresApproval);
+    read_field<Materialize>(j, "blockers", out.blockers);
 }
 
 void to_json(nlohmann::json& j, const UpdatesPlanResult& value) {
@@ -1377,28 +1445,27 @@ void to_json(nlohmann::json& j, const UpdatesPlanResult& value) {
     write_field(j, "restartAdvice", value.restartAdvice);
     write_field(j, "requiresApproval", value.requiresApproval);
     write_field(j, "blockers", value.blockers);
-    UpdatesPlanResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<UpdatesPlanResult>{});
 }
 
-void from_json(const nlohmann::json& j, PlanParams& out) {
-    read_object(j, {"kind","packageId","variantId","previewId","receiptId","scope","helper"});
-    read_field(j, "kind", out.kind);
-    read_field(j, "packageId", out.packageId);
-    read_field(j, "variantId", out.variantId);
-    read_field(j, "previewId", out.previewId);
-    read_field(j, "receiptId", out.receiptId);
-    read_field(j, "scope", out.scope);
-    read_field(j, "helper", out.helper);
-    const bool package = out.kind == "install" || out.kind == "remove" || out.kind == "update-community" || out.kind == "update-and-install";
-    const bool manual = out.kind == "manual-install" || out.kind == "manual-upgrade" || out.kind == "manual-remove";
-    if (!package && !manual && out.kind != "update-system" && out.kind != "setup-helper")
+BRAURSER_READ_JSON(PlanParams) {
+    read_object(j, {"kind","packageId","variantId","previewId","receiptId","scope","helper"}, extra);
+    read_field<Materialize>(j, "kind", out.kind);
+    read_field<Materialize>(j, "packageId", out.packageId);
+    read_field<Materialize>(j, "variantId", out.variantId);
+    read_field<Materialize>(j, "previewId", out.previewId);
+    read_field<Materialize>(j, "receiptId", out.receiptId);
+    read_field<Materialize>(j, "scope", out.scope);
+    read_field<Materialize>(j, "helper", out.helper);
+    const bool package = text(j, "kind") == "install" || text(j, "kind") == "remove" || text(j, "kind") == "update-community" || text(j, "kind") == "update-and-install";
+    const bool manual = text(j, "kind") == "manual-install" || text(j, "kind") == "manual-upgrade" || text(j, "kind") == "manual-remove";
+    if (!package && !manual && text(j, "kind") != "update-system" && text(j, "kind") != "setup-helper")
         throw std::invalid_argument("invalid plan kind");
-    if ((package && !out.packageId) || ((out.kind == "manual-install" || out.kind == "manual-upgrade") && !out.previewId) ||
-        ((out.kind == "manual-upgrade" || out.kind == "manual-remove") && !out.receiptId) ||
-        (out.kind == "setup-helper" && (!out.helper || out.helper->value == "auto")) ||
-        (!package && out.packageId) || (out.kind != "install" && out.variantId) ||
-        (!manual && (out.previewId || out.receiptId || out.scope)) || (out.kind != "setup-helper" && out.helper))
+    if ((package && !present(j, "packageId")) || ((text(j, "kind") == "manual-install" || text(j, "kind") == "manual-upgrade") && !present(j, "previewId")) ||
+        ((text(j, "kind") == "manual-upgrade" || text(j, "kind") == "manual-remove") && !present(j, "receiptId")) ||
+        (text(j, "kind") == "setup-helper" && (!present(j, "helper") || text(j, "helper") == "auto")) ||
+        (!package && present(j, "packageId")) || (text(j, "kind") != "install" && present(j, "variantId")) ||
+        (!manual && (present(j, "previewId") || present(j, "receiptId") || present(j, "scope"))) || (text(j, "kind") != "setup-helper" && present(j, "helper")))
         throw std::invalid_argument("invalid plan selection");
 }
 
@@ -1410,24 +1477,22 @@ void to_json(nlohmann::json& j, const PlanParams& value) {
     write_field(j, "receiptId", value.receiptId);
     write_field(j, "scope", value.scope);
     write_field(j, "helper", value.helper);
-    PlanParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<PlanParams>{});
 }
 
-void from_json(const nlohmann::json& j, InstallParams& out) {
-    read_object(j, {"planId","approvalToken"});
-    read_field(j, "planId", out.planId);
-    read_field(j, "approvalToken", out.approvalToken);
+BRAURSER_READ_JSON(InstallParams) {
+    read_object(j, {"planId","approvalToken"}, extra);
+    read_field<Materialize>(j, "planId", out.planId);
+    read_field<Materialize>(j, "approvalToken", out.approvalToken);
 }
 
 void to_json(nlohmann::json& j, const InstallParams& value) {
     j = {{"planId", value.planId}, {"approvalToken", value.approvalToken}};
-    InstallParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<InstallParams>{});
 }
 
 #define BRAURSER_APPROVAL_JSON(type) \
-void from_json(const nlohmann::json& j, type& out) { from_json(j, static_cast<InstallParams&>(out)); } \
+BRAURSER_READ_JSON(type) { read_json<Materialize>(j, static_cast<InstallParams&>(out), extra); } \
 void to_json(nlohmann::json& j, const type& value) { to_json(j, static_cast<const InstallParams&>(value)); }
 BRAURSER_APPROVAL_JSON(RemoveParams)
 BRAURSER_APPROVAL_JSON(UpgradeSystemParams)
@@ -1438,12 +1503,12 @@ BRAURSER_APPROVAL_JSON(ManualRemoveParams)
 BRAURSER_APPROVAL_JSON(SetupHelperParams)
 #undef BRAURSER_APPROVAL_JSON
 
-void from_json(const nlohmann::json& j, JobEvent& out) {
-    read_object(j, {"sequence","kind","payload"});
-    read_field(j, "sequence", out.sequence);
-    if (out.sequence == 0) throw std::invalid_argument("invalid event sequence");
-    read_field(j, "kind", out.kind);
-    read_field(j, "payload", out.payload);
+BRAURSER_READ_JSON(JobEvent) {
+    read_object(j, {"sequence","kind","payload"}, extra);
+    read_field<Materialize>(j, "sequence", out.sequence);
+    if (j.at("sequence").get<std::uint64_t>() == 0) throw std::invalid_argument("invalid event sequence");
+    read_field<Materialize>(j, "kind", out.kind);
+    read_field<Materialize>(j, "payload", out.payload);
 }
 
 void to_json(nlohmann::json& j, const JobEvent& value) {
@@ -1451,33 +1516,31 @@ void to_json(nlohmann::json& j, const JobEvent& value) {
     write_field(j, "sequence", value.sequence);
     write_field(j, "kind", value.kind);
     write_field(j, "payload", value.payload);
-    JobEvent checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<JobEvent>{});
 }
 
-void from_json(const nlohmann::json& j, JobsGetParams& out) {
-    read_object(j, {"jobId","eventsCursor"});
-    read_field(j, "jobId", out.jobId);
-    read_field(j, "eventsCursor", out.eventsCursor);
+BRAURSER_READ_JSON(JobsGetParams) {
+    read_object(j, {"jobId","eventsCursor"}, extra);
+    read_field<Materialize>(j, "jobId", out.jobId);
+    read_field<Materialize>(j, "eventsCursor", out.eventsCursor);
 }
 
 void to_json(nlohmann::json& j, const JobsGetParams& value) {
     j = nlohmann::json::object();
     write_field(j, "jobId", value.jobId);
     write_field(j, "eventsCursor", value.eventsCursor);
-    JobsGetParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<JobsGetParams>{});
 }
 
-void from_json(const nlohmann::json& j, JobsGetResult& out) {
-    read_object(j, {"state","plan","progress","result","error","events","nextCursor"});
-    read_field(j, "state", out.state);
-    read_field(j, "plan", out.plan);
-    read_field(j, "progress", out.progress);
-    read_field(j, "result", out.result);
-    read_field(j, "error", out.error);
-    read_field(j, "events", out.events);
-    read_field(j, "nextCursor", out.nextCursor);
+BRAURSER_READ_JSON(JobsGetResult) {
+    read_object(j, {"state","plan","progress","result","error","events","nextCursor"}, extra);
+    read_field<Materialize>(j, "state", out.state);
+    read_field<Materialize>(j, "plan", out.plan);
+    read_field<Materialize>(j, "progress", out.progress);
+    read_field<Materialize>(j, "result", out.result);
+    read_field<Materialize>(j, "error", out.error);
+    read_field<Materialize>(j, "events", out.events);
+    read_field<Materialize>(j, "nextCursor", out.nextCursor);
 }
 
 void to_json(nlohmann::json& j, const JobsGetResult& value) {
@@ -1489,85 +1552,79 @@ void to_json(nlohmann::json& j, const JobsGetResult& value) {
     write_field(j, "error", value.error);
     write_field(j, "events", value.events);
     write_field(j, "nextCursor", value.nextCursor);
-    JobsGetResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<JobsGetResult>{});
 }
 
-void from_json(const nlohmann::json& j, JobsListParams& out) {
-    read_object(j, {"cursor","limit"});
-    read_field(j, "cursor", out.cursor);
-    read_field(j, "limit", out.limit);
-    if (out.limit == 0 || out.limit > 200) throw std::invalid_argument("invalid limit");
+BRAURSER_READ_JSON(JobsListParams) {
+    read_object(j, {"cursor","limit"}, extra);
+    read_field<Materialize>(j, "cursor", out.cursor);
+    read_field<Materialize>(j, "limit", out.limit);
+    if (j.at("limit").get<std::uint64_t>() == 0 || j.at("limit").get<std::uint64_t>() > 200) throw std::invalid_argument("invalid limit");
 }
 
 void to_json(nlohmann::json& j, const JobsListParams& value) {
     j = nlohmann::json::object();
     write_field(j, "cursor", value.cursor);
     write_field(j, "limit", value.limit);
-    JobsListParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<JobsListParams>{});
 }
 
-void from_json(const nlohmann::json& j, JobSummary& out) {
-    read_object(j, {"jobId","state"});
-    read_field(j, "jobId", out.jobId);
-    read_field(j, "state", out.state);
+BRAURSER_READ_JSON(JobSummary) {
+    read_object(j, {"jobId","state"}, extra);
+    read_field<Materialize>(j, "jobId", out.jobId);
+    read_field<Materialize>(j, "state", out.state);
 }
 
 void to_json(nlohmann::json& j, const JobSummary& value) {
     j = nlohmann::json::object();
     write_field(j, "jobId", value.jobId);
     write_field(j, "state", value.state);
-    JobSummary checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<JobSummary>{});
 }
 
-void from_json(const nlohmann::json& j, JobsListResult& out) {
-    read_object(j, {"jobs","nextCursor"});
-    read_field(j, "jobs", out.jobs);
-    read_field(j, "nextCursor", out.nextCursor);
+BRAURSER_READ_JSON(JobsListResult) {
+    read_object(j, {"jobs","nextCursor"}, extra);
+    read_field<Materialize>(j, "jobs", out.jobs);
+    read_field<Materialize>(j, "nextCursor", out.nextCursor);
 }
 
 void to_json(nlohmann::json& j, const JobsListResult& value) {
     j = nlohmann::json::object();
     write_field(j, "jobs", value.jobs);
     write_field(j, "nextCursor", value.nextCursor);
-    JobsListResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<JobsListResult>{});
 }
 
-void from_json(const nlohmann::json& j, JobsCancelParams& out) {
-    read_object(j, {"jobId"});
-    read_field(j, "jobId", out.jobId);
+BRAURSER_READ_JSON(JobsCancelParams) {
+    read_object(j, {"jobId"}, extra);
+    read_field<Materialize>(j, "jobId", out.jobId);
 }
 
 void to_json(nlohmann::json& j, const JobsCancelParams& value) {
     j = nlohmann::json::object();
     write_field(j, "jobId", value.jobId);
-    JobsCancelParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<JobsCancelParams>{});
 }
 
-void from_json(const nlohmann::json& j, JobsCancelResult& out) {
-    read_object(j, {"accepted","reason"});
-    read_field(j, "accepted", out.accepted);
-    read_field(j, "reason", out.reason);
+BRAURSER_READ_JSON(JobsCancelResult) {
+    read_object(j, {"accepted","reason"}, extra);
+    read_field<Materialize>(j, "accepted", out.accepted);
+    read_field<Materialize>(j, "reason", out.reason);
 }
 
 void to_json(nlohmann::json& j, const JobsCancelResult& value) {
     j = nlohmann::json::object();
     write_field(j, "accepted", value.accepted);
     write_field(j, "reason", value.reason);
-    JobsCancelResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<JobsCancelResult>{});
 }
 
-void from_json(const nlohmann::json& j, JobsAnswerParams& out) {
-    read_object(j, {"jobId","questionId","choiceId","questionToken"});
-    read_field(j, "jobId", out.jobId);
-    read_field(j, "questionId", out.questionId);
-    read_field(j, "choiceId", out.choiceId);
-    read_field(j, "questionToken", out.questionToken);
+BRAURSER_READ_JSON(JobsAnswerParams) {
+    read_object(j, {"jobId","questionId","choiceId","questionToken"}, extra);
+    read_field<Materialize>(j, "jobId", out.jobId);
+    read_field<Materialize>(j, "questionId", out.questionId);
+    read_field<Materialize>(j, "choiceId", out.choiceId);
+    read_field<Materialize>(j, "questionToken", out.questionToken);
 }
 
 void to_json(nlohmann::json& j, const JobsAnswerParams& value) {
@@ -1576,27 +1633,25 @@ void to_json(nlohmann::json& j, const JobsAnswerParams& value) {
     write_field(j, "questionId", value.questionId);
     write_field(j, "choiceId", value.choiceId);
     write_field(j, "questionToken", value.questionToken);
-    JobsAnswerParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<JobsAnswerParams>{});
 }
 
-void from_json(const nlohmann::json& j, AcceptedResult& out) {
-    read_object(j, {"accepted"});
-    read_field(j, "accepted", out.accepted);
+BRAURSER_READ_JSON(AcceptedResult) {
+    read_object(j, {"accepted"}, extra);
+    read_field<Materialize>(j, "accepted", out.accepted);
 }
 
 void to_json(nlohmann::json& j, const AcceptedResult& value) {
     j = nlohmann::json::object();
     write_field(j, "accepted", value.accepted);
-    AcceptedResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<AcceptedResult>{});
 }
 
-void from_json(const nlohmann::json& j, ManualPreviewParams& out) {
-    read_object(j, {"httpsUrl","scriptPath","scope"});
-    read_field(j, "httpsUrl", out.httpsUrl);
-    read_field(j, "scriptPath", out.scriptPath);
-    read_field(j, "scope", out.scope);
+BRAURSER_READ_JSON(ManualPreviewParams) {
+    read_object(j, {"httpsUrl","scriptPath","scope"}, extra);
+    read_field<Materialize>(j, "httpsUrl", out.httpsUrl);
+    read_field<Materialize>(j, "scriptPath", out.scriptPath);
+    read_field<Materialize>(j, "scope", out.scope);
 }
 
 void to_json(nlohmann::json& j, const ManualPreviewParams& value) {
@@ -1604,95 +1659,88 @@ void to_json(nlohmann::json& j, const ManualPreviewParams& value) {
     write_field(j, "httpsUrl", value.httpsUrl);
     write_field(j, "scriptPath", value.scriptPath);
     write_field(j, "scope", value.scope);
-    ManualPreviewParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<ManualPreviewParams>{});
 }
 
-void from_json(const nlohmann::json& j, ManualListParams& out) {
+BRAURSER_READ_JSON(ManualListParams) {
     static_cast<void>(out);
-    read_object(j, {});
+    read_object(j, {}, extra);
 }
 
 void to_json(nlohmann::json& j, const ManualListParams& value) {
     static_cast<void>(value);
     j = nlohmann::json::object();
-    ManualListParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<ManualListParams>{});
 }
 
-void from_json(const nlohmann::json& j, ManualListResult& out) {
-    read_object(j, {"receipts"});
-    read_field(j, "receipts", out.receipts);
+BRAURSER_READ_JSON(ManualListResult) {
+    read_object(j, {"receipts"}, extra);
+    read_field<Materialize>(j, "receipts", out.receipts);
 }
 
 void to_json(nlohmann::json& j, const ManualListResult& value) {
     j = nlohmann::json::object();
     write_field(j, "receipts", value.receipts);
-    ManualListResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<ManualListResult>{});
 }
 
-void from_json(const nlohmann::json& j, JobsDequeueParams& out) {
-    read_object(j, {"jobId"});
-    read_field(j, "jobId", out.jobId);
+BRAURSER_READ_JSON(JobsDequeueParams) {
+    read_object(j, {"jobId"}, extra);
+    read_field<Materialize>(j, "jobId", out.jobId);
 }
 void to_json(nlohmann::json& j, const JobsDequeueParams& value) {
     j = {{"jobId", value.jobId}};
-    JobsDequeueParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<JobsDequeueParams>{});
 }
-void from_json(const nlohmann::json& j, JobsDequeueResult& out) {
-    read_object(j, {"removed"});
-    read_field(j, "removed", out.removed);
+BRAURSER_READ_JSON(JobsDequeueResult) {
+    read_object(j, {"removed"}, extra);
+    read_field<Materialize>(j, "removed", out.removed);
 }
 void to_json(nlohmann::json& j, const JobsDequeueResult& value) {
     j = {{"removed", value.removed}};
 }
 
-void from_json(const nlohmann::json& j, UnmanagedListParams& out) {
+BRAURSER_READ_JSON(UnmanagedListParams) {
     static_cast<void>(out);
-    read_object(j, {});
+    read_object(j, {}, extra);
 }
 
 void to_json(nlohmann::json& j, const UnmanagedListParams& value) {
     static_cast<void>(value);
     j = nlohmann::json::object();
-    UnmanagedListParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<UnmanagedListParams>{});
 }
 
-void from_json(const nlohmann::json& j, UnmanagedListResult& out) {
-    read_object(j, {"entries","scanTime"});
-    read_field(j, "entries", out.entries);
-    read_field(j, "scanTime", out.scanTime);
+BRAURSER_READ_JSON(UnmanagedListResult) {
+    read_object(j, {"entries","scanTime"}, extra);
+    read_field<Materialize>(j, "entries", out.entries);
+    read_field<Materialize>(j, "scanTime", out.scanTime);
 }
 
 void to_json(nlohmann::json& j, const UnmanagedListResult& value) {
     j = nlohmann::json::object();
     write_field(j, "entries", value.entries);
     write_field(j, "scanTime", value.scanTime);
-    UnmanagedListResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<UnmanagedListResult>{});
 }
 
-void from_json(const nlohmann::json& j, SettingsGetParams& out) {
+BRAURSER_READ_JSON(SettingsGetParams) {
     static_cast<void>(out);
-    read_object(j, {});
+    read_object(j, {}, extra);
 }
 
 void to_json(nlohmann::json& j, const SettingsGetParams& value) {
     static_cast<void>(value);
     j = nlohmann::json::object();
-    SettingsGetParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<SettingsGetParams>{});
 }
 
-void from_json(const nlohmann::json& j, SettingsGetResult& out) {
-    read_object(j, {"uiPreference","notifications","refreshPolicy","elevationPreference"});
-    read_field(j, "uiPreference", out.uiPreference);
-    read_field(j, "notifications", out.notifications);
-    read_field(j, "refreshPolicy", out.refreshPolicy);
-    read_field(j, "elevationPreference", out.elevationPreference);
+BRAURSER_READ_JSON(SettingsGetResult) {
+    read_object(j, {"uiPreference","notifications","refreshPolicy","elevationPreference"}, extra);
+    read_field<Materialize>(j, "uiPreference", out.uiPreference);
+    read_field<Materialize>(j, "notifications", out.notifications);
+    read_field<Materialize>(j, "refreshPolicy", out.refreshPolicy);
+    read_field<Materialize>(j, "elevationPreference", out.elevationPreference);
 }
 
 void to_json(nlohmann::json& j, const SettingsGetResult& value) {
@@ -1701,108 +1749,101 @@ void to_json(nlohmann::json& j, const SettingsGetResult& value) {
     write_field(j, "notifications", value.notifications);
     write_field(j, "refreshPolicy", value.refreshPolicy);
     write_field(j, "elevationPreference", value.elevationPreference);
-    SettingsGetResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<SettingsGetResult>{});
 }
 
-void from_json(const nlohmann::json& j, SettingsSetParams& out) {
-    read_object(j, {"changedFields"});
-    read_field(j, "changedFields", out.changedFields);
+BRAURSER_READ_JSON(SettingsSetParams) {
+    read_object(j, {"changedFields"}, extra);
+    read_field<Materialize>(j, "changedFields", out.changedFields);
 }
 
 void to_json(nlohmann::json& j, const SettingsSetParams& value) {
     j = nlohmann::json::object();
     write_field(j, "changedFields", value.changedFields);
-    SettingsSetParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<SettingsSetParams>{});
 }
 
-void from_json(const nlohmann::json& j, SettingsSetResult& out) {
-    read_object(j, {"settings"});
-    read_field(j, "settings", out.settings);
+BRAURSER_READ_JSON(SettingsSetResult) {
+    read_object(j, {"settings"}, extra);
+    read_field<Materialize>(j, "settings", out.settings);
 }
 
 void to_json(nlohmann::json& j, const SettingsSetResult& value) {
     j = nlohmann::json::object();
     write_field(j, "settings", value.settings);
-    SettingsSetResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<SettingsSetResult>{});
 }
 
-void from_json(const nlohmann::json& j, ClearCacheParams&) { read_object(j, {}); }
+BRAURSER_READ_JSON(ClearCacheParams) { static_cast<void>(out); read_object(j, {}, extra); }
 void to_json(nlohmann::json& j, const ClearCacheParams&) { j = nlohmann::json::object(); }
-void from_json(const nlohmann::json& j, ClearCacheResult& out) {
-    read_object(j, {"freedBytes"});
-    read_field(j, "freedBytes", out.freedBytes);
+BRAURSER_READ_JSON(ClearCacheResult) {
+    read_object(j, {"freedBytes"}, extra);
+    read_field<Materialize>(j, "freedBytes", out.freedBytes);
 }
 void to_json(nlohmann::json& j, const ClearCacheResult& value) { j = {{"freedBytes", value.freedBytes}}; }
-void from_json(const nlohmann::json& j, RestartStateParams&) { read_object(j, {}); }
+BRAURSER_READ_JSON(RestartStateParams) { static_cast<void>(out); read_object(j, {}, extra); }
 void to_json(nlohmann::json& j, const RestartStateParams&) { j = nlohmann::json::object(); }
-void from_json(const nlohmann::json& j, RestartAcknowledgeParams&) { read_object(j, {}); }
+BRAURSER_READ_JSON(RestartAcknowledgeParams) { static_cast<void>(out); read_object(j, {}, extra); }
 void to_json(nlohmann::json& j, const RestartAcknowledgeParams&) { j = nlohmann::json::object(); }
-void from_json(const nlohmann::json& j, RestartStateResult& out) {
-    read_object(j, {"level","reason_keys","since"});
-    read_field(j, "level", out.level);
-    read_field(j, "reason_keys", out.reason_keys);
-    read_field(j, "since", out.since);
-    if (out.reason_keys.size() > 64) throw std::invalid_argument("too many restart reasons");
-    for (const auto& key : out.reason_keys) validate_wire(nlohmann::json{{"reason_key", key}});
-    if (out.since) validate_wire(nlohmann::json{{"since", *out.since}});
+BRAURSER_READ_JSON(RestartStateResult) {
+    read_object(j, {"level","reason_keys","since"}, extra);
+    read_field<Materialize>(j, "level", out.level);
+    read_field<Materialize>(j, "reason_keys", out.reason_keys);
+    read_field<Materialize>(j, "since", out.since);
+    if (j.at("reason_keys").size() > 64) throw std::invalid_argument("too many restart reasons");
+    for (const auto& key : j.at("reason_keys")) validate_wire(key, "reason_key");
+    if (present(j, "since")) validate_wire(j.at("since"), "since");
 }
 void to_json(nlohmann::json& j, const RestartStateResult& value) {
     j = {{"level", value.level}, {"reason_keys", value.reason_keys}};
     write_field(j, "since", value.since);
-    RestartStateResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<RestartStateResult>{});
 }
-void from_json(const nlohmann::json& j, EmptyResult&) { read_object(j, {}); }
+BRAURSER_READ_JSON(EmptyResult) { static_cast<void>(out); read_object(j, {}, extra); }
 void to_json(nlohmann::json& j, const EmptyResult&) { j = nlohmann::json::object(); }
-void from_json(const nlohmann::json& j, HelperStatus& out) {
-    read_object(j, {"installed","version"});
-    read_field(j, "installed", out.installed);
-    read_field(j, "version", out.version);
-    if (!out.installed && out.version) throw std::invalid_argument("invalid helper status");
+BRAURSER_READ_JSON(HelperStatus) {
+    read_object(j, {"installed","version"}, extra);
+    read_field<Materialize>(j, "installed", out.installed);
+    read_field<Materialize>(j, "version", out.version);
+    if (!j.at("installed").get<bool>() && present(j, "version")) throw std::invalid_argument("invalid helper status");
 }
 void to_json(nlohmann::json& j, const HelperStatus& value) {
     j = {{"installed", value.installed}};
     write_field(j, "version", value.version);
-    HelperStatus checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<HelperStatus>{});
 }
-void from_json(const nlohmann::json& j, SetupStatusParams&) { read_object(j, {}); }
+BRAURSER_READ_JSON(SetupStatusParams) { static_cast<void>(out); read_object(j, {}, extra); }
 void to_json(nlohmann::json& j, const SetupStatusParams&) { j = nlohmann::json::object(); }
-void from_json(const nlohmann::json& j, SetupStatusResult& out) {
-    read_object(j, {"paru","yay","chosen","elevation","notes"});
-    read_field(j, "paru", out.paru);
-    read_field(j, "yay", out.yay);
-    read_field(j, "chosen", out.chosen);
-    read_field(j, "elevation", out.elevation);
-    read_field(j, "notes", out.notes);
+BRAURSER_READ_JSON(SetupStatusResult) {
+    read_object(j, {"paru","yay","chosen","elevation","notes"}, extra);
+    read_field<Materialize>(j, "paru", out.paru);
+    read_field<Materialize>(j, "yay", out.yay);
+    read_field<Materialize>(j, "chosen", out.chosen);
+    read_field<Materialize>(j, "elevation", out.elevation);
+    read_field<Materialize>(j, "notes", out.notes);
 }
 void to_json(nlohmann::json& j, const SetupStatusResult& value) {
     j = {{"paru", value.paru}, {"yay", value.yay}, {"chosen", value.chosen},
          {"elevation", value.elevation}, {"notes", value.notes}};
-    SetupStatusResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<SetupStatusResult>{});
 }
 
-void from_json(const nlohmann::json& j, NotifierCheckParams& out) {
+BRAURSER_READ_JSON(NotifierCheckParams) {
     static_cast<void>(out);
-    read_object(j, {});
+    read_object(j, {}, extra);
 }
 
 void to_json(nlohmann::json& j, const NotifierCheckParams& value) {
     static_cast<void>(value);
     j = nlohmann::json::object();
-    NotifierCheckParams checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<NotifierCheckParams>{});
 }
 
-void from_json(const nlohmann::json& j, NotifierCheckResult& out) {
-    read_object(j, {"updateCount","notificationSent","reason"});
-    read_field(j, "updateCount", out.updateCount);
-    read_field(j, "notificationSent", out.notificationSent);
-    read_field(j, "reason", out.reason);
+BRAURSER_READ_JSON(NotifierCheckResult) {
+    read_object(j, {"updateCount","notificationSent","reason"}, extra);
+    read_field<Materialize>(j, "updateCount", out.updateCount);
+    read_field<Materialize>(j, "notificationSent", out.notificationSent);
+    read_field<Materialize>(j, "reason", out.reason);
 }
 
 void to_json(nlohmann::json& j, const NotifierCheckResult& value) {
@@ -1810,36 +1851,31 @@ void to_json(nlohmann::json& j, const NotifierCheckResult& value) {
     write_field(j, "updateCount", value.updateCount);
     write_field(j, "notificationSent", value.notificationSent);
     write_field(j, "reason", value.reason);
-    NotifierCheckResult checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<NotifierCheckResult>{});
 }
 
-void from_json(const nlohmann::json& j, JobProgressNotification& out) {
-    read_object(j, {"jobId", "sequence", "phase", "current", "total", "unit"});
-    read_field(j, "jobId", out.jobId);
-    read_field(j, "sequence", out.sequence);
-    if (out.sequence == 0) throw std::invalid_argument("invalid event sequence");
-    auto progress = j;
-    progress.erase("jobId");
-    progress.erase("sequence");
-    out.progress = progress.get<Progress>();
+BRAURSER_READ_JSON(JobProgressNotification) {
+    read_object(j, {"jobId", "sequence", "phase", "current", "total", "unit"}, extra);
+    read_field<Materialize>(j, "jobId", out.jobId);
+    read_field<Materialize>(j, "sequence", out.sequence);
+    if (j.at("sequence").get<std::uint64_t>() == 0) throw std::invalid_argument("invalid event sequence");
+    read_json<Materialize>(j, out.progress, {{"jobId", "sequence"}});
 }
 
 void to_json(nlohmann::json& j, const JobProgressNotification& value) {
     j = value.progress;
     write_field(j, "jobId", value.jobId);
     write_field(j, "sequence", value.sequence);
-    JobProgressNotification checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<JobProgressNotification>{});
 }
 
-void from_json(const nlohmann::json& j, JobLogNotification& out) {
-    read_object(j, {"jobId","sequence","line"});
-    read_field(j, "jobId", out.jobId);
-    read_field(j, "sequence", out.sequence);
-    if (out.sequence == 0) throw std::invalid_argument("invalid event sequence");
-    read_field(j, "line", out.line);
-    if (out.line.size() > 4096) throw std::invalid_argument("log line too long");
+BRAURSER_READ_JSON(JobLogNotification) {
+    read_object(j, {"jobId","sequence","line"}, extra);
+    read_field<Materialize>(j, "jobId", out.jobId);
+    read_field<Materialize>(j, "sequence", out.sequence);
+    if (j.at("sequence").get<std::uint64_t>() == 0) throw std::invalid_argument("invalid event sequence");
+    read_field<Materialize>(j, "line", out.line);
+    if (text(j, "line").size() > 4096) throw std::invalid_argument("log line too long");
 }
 
 void to_json(nlohmann::json& j, const JobLogNotification& value) {
@@ -1847,16 +1883,15 @@ void to_json(nlohmann::json& j, const JobLogNotification& value) {
     write_field(j, "jobId", value.jobId);
     write_field(j, "sequence", value.sequence);
     write_field(j, "line", value.line);
-    JobLogNotification checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<JobLogNotification>{});
 }
 
-void from_json(const nlohmann::json& j, JobQuestionNotification& out) {
-    read_object(j, {"jobId","sequence","question"});
-    read_field(j, "jobId", out.jobId);
-    read_field(j, "sequence", out.sequence);
-    if (out.sequence == 0) throw std::invalid_argument("invalid event sequence");
-    read_field(j, "question", out.question);
+BRAURSER_READ_JSON(JobQuestionNotification) {
+    read_object(j, {"jobId","sequence","question"}, extra);
+    read_field<Materialize>(j, "jobId", out.jobId);
+    read_field<Materialize>(j, "sequence", out.sequence);
+    if (j.at("sequence").get<std::uint64_t>() == 0) throw std::invalid_argument("invalid event sequence");
+    read_field<Materialize>(j, "question", out.question);
 }
 
 void to_json(nlohmann::json& j, const JobQuestionNotification& value) {
@@ -1864,16 +1899,15 @@ void to_json(nlohmann::json& j, const JobQuestionNotification& value) {
     write_field(j, "jobId", value.jobId);
     write_field(j, "sequence", value.sequence);
     write_field(j, "question", value.question);
-    JobQuestionNotification checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<JobQuestionNotification>{});
 }
 
-void from_json(const nlohmann::json& j, JobAuthStateNotification& out) {
-    read_object(j, {"jobId","sequence","state"});
-    read_field(j, "jobId", out.jobId);
-    read_field(j, "sequence", out.sequence);
-    if (out.sequence == 0) throw std::invalid_argument("invalid event sequence");
-    read_field(j, "state", out.state);
+BRAURSER_READ_JSON(JobAuthStateNotification) {
+    read_object(j, {"jobId","sequence","state"}, extra);
+    read_field<Materialize>(j, "jobId", out.jobId);
+    read_field<Materialize>(j, "sequence", out.sequence);
+    if (j.at("sequence").get<std::uint64_t>() == 0) throw std::invalid_argument("invalid event sequence");
+    read_field<Materialize>(j, "state", out.state);
 }
 
 void to_json(nlohmann::json& j, const JobAuthStateNotification& value) {
@@ -1881,16 +1915,15 @@ void to_json(nlohmann::json& j, const JobAuthStateNotification& value) {
     write_field(j, "jobId", value.jobId);
     write_field(j, "sequence", value.sequence);
     write_field(j, "state", value.state);
-    JobAuthStateNotification checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<JobAuthStateNotification>{});
 }
 
-void from_json(const nlohmann::json& j, JobStateNotification& out) {
-    read_object(j, {"jobId","sequence","state"});
-    read_field(j, "jobId", out.jobId);
-    read_field(j, "sequence", out.sequence);
-    if (out.sequence == 0) throw std::invalid_argument("invalid event sequence");
-    read_field(j, "state", out.state);
+BRAURSER_READ_JSON(JobStateNotification) {
+    read_object(j, {"jobId","sequence","state"}, extra);
+    read_field<Materialize>(j, "jobId", out.jobId);
+    read_field<Materialize>(j, "sequence", out.sequence);
+    if (j.at("sequence").get<std::uint64_t>() == 0) throw std::invalid_argument("invalid event sequence");
+    read_field<Materialize>(j, "state", out.state);
 }
 
 void to_json(nlohmann::json& j, const JobStateNotification& value) {
@@ -1898,55 +1931,56 @@ void to_json(nlohmann::json& j, const JobStateNotification& value) {
     write_field(j, "jobId", value.jobId);
     write_field(j, "sequence", value.sequence);
     write_field(j, "state", value.state);
-    JobStateNotification checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<JobStateNotification>{});
 }
 
-void from_json(const nlohmann::json& j, CatalogChangedNotification& out) {
-    read_object(j, {"revision"});
-    read_field(j, "revision", out.revision);
+BRAURSER_READ_JSON(CatalogChangedNotification) {
+    read_object(j, {"revision"}, extra);
+    read_field<Materialize>(j, "revision", out.revision);
 }
 
 void to_json(nlohmann::json& j, const CatalogChangedNotification& value) {
     j = nlohmann::json::object();
     write_field(j, "revision", value.revision);
-    CatalogChangedNotification checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<CatalogChangedNotification>{});
 }
 
-void from_json(const nlohmann::json& j, UpdatesAvailableNotification& out) {
-    read_object(j, {"reportId","count"});
-    read_field(j, "reportId", out.reportId);
-    read_field(j, "count", out.count);
+BRAURSER_READ_JSON(UpdatesAvailableNotification) {
+    read_object(j, {"reportId","count"}, extra);
+    read_field<Materialize>(j, "reportId", out.reportId);
+    read_field<Materialize>(j, "count", out.count);
 }
 
 void to_json(nlohmann::json& j, const UpdatesAvailableNotification& value) {
     j = nlohmann::json::object();
     write_field(j, "reportId", value.reportId);
     write_field(j, "count", value.count);
-    UpdatesAvailableNotification checked;
-    from_json(j, checked);
+    validate_json(j, TypeTag<UpdatesAvailableNotification>{});
 }
 
 namespace {
 
-template <typename Variant>
-void read_variant(const nlohmann::json& j, Variant& out, std::initializer_list<std::pair<std::string_view, void (*)(const nlohmann::json&, Variant&)>> cases) {
+template <bool Materialize, typename Variant>
+void read_variant(const nlohmann::json& j, Variant& out, ObjectKeys extra,
+                  std::initializer_list<std::pair<std::string_view, void (*)(const nlohmann::json&, Variant&, ObjectKeys)>> cases) {
     if (!j.is_object() || !j.contains("kind") || !j.at("kind").is_string()) throw std::invalid_argument("invalid tagged union");
-    const auto kind = j.at("kind").get<std::string>();
+    const auto& kind = text(j, "kind");
     for (auto [tag, parser] : cases) {
         if (tag == kind) {
-            auto payload = j;
-            payload.erase("kind");
-            parser(payload, out);
+            extra.tagged = true;
+            parser(j, out, extra);
             return;
         }
     }
     throw std::invalid_argument("unknown tagged union kind");
 }
 
-template <typename T, typename Variant>
-void parse_case(const nlohmann::json& j, Variant& out) { out.value = j.get<T>(); }
+template <bool Materialize, typename T, typename Variant>
+void parse_case(const nlohmann::json& j, Variant& out, ObjectKeys extra) {
+    T value{};
+    read_json<Materialize>(j, value, extra);
+    if constexpr (Materialize) out.value = std::move(value);
+}
 
 template <typename Variant>
 void write_variant(nlohmann::json& j, const Variant& out, std::initializer_list<std::pair<std::string_view, std::size_t>> tags) {
@@ -1960,10 +1994,10 @@ void write_variant(nlohmann::json& j, const Variant& out, std::initializer_list<
 }
 
 
-void from_json(const nlohmann::json& j, Inline& out) {
-    read_variant(j, out, {
-        {"text", &parse_case<WikiText, Inline>},
-        {"link", &parse_case<WikiLink, Inline>},
+BRAURSER_READ_JSON(Inline) {
+    read_variant<Materialize>(j, out, extra, {
+        {"text", &parse_case<Materialize, WikiText, Inline>},
+        {"link", &parse_case<Materialize, WikiLink, Inline>},
     });
 }
 void to_json(nlohmann::json& j, const Inline& out) {
@@ -1973,14 +2007,14 @@ void to_json(nlohmann::json& j, const Inline& out) {
     });
 }
 
-void from_json(const nlohmann::json& j, WikiBlock& out) {
-    read_variant(j, out, {
-        {"heading", &parse_case<WikiHeading, WikiBlock>},
-        {"paragraph", &parse_case<WikiParagraph, WikiBlock>},
-        {"list", &parse_case<WikiList, WikiBlock>},
-        {"code", &parse_case<WikiCode, WikiBlock>},
-        {"note", &parse_case<WikiNote, WikiBlock>},
-        {"warning", &parse_case<WikiWarning, WikiBlock>},
+BRAURSER_READ_JSON(WikiBlock) {
+    read_variant<Materialize>(j, out, extra, {
+        {"heading", &parse_case<Materialize, WikiHeading, WikiBlock>},
+        {"paragraph", &parse_case<Materialize, WikiParagraph, WikiBlock>},
+        {"list", &parse_case<Materialize, WikiList, WikiBlock>},
+        {"code", &parse_case<Materialize, WikiCode, WikiBlock>},
+        {"note", &parse_case<Materialize, WikiNote, WikiBlock>},
+        {"warning", &parse_case<Materialize, WikiWarning, WikiBlock>},
     });
 }
 void to_json(nlohmann::json& j, const WikiBlock& out) {
@@ -1994,14 +2028,14 @@ void to_json(nlohmann::json& j, const WikiBlock& out) {
     });
 }
 
-void from_json(const nlohmann::json& j, QuestionChoice& out) {
-    read_variant(j, out, {
-        {"variant", &parse_case<VariantChoices, QuestionChoice>},
-        {"provider", &parse_case<ProviderQuestion, QuestionChoice>},
-        {"build_review", &parse_case<BuildReviewQuestion, QuestionChoice>},
-        {"conflict", &parse_case<ConflictQuestion, QuestionChoice>},
-        {"news_ack", &parse_case<NewsAckQuestion, QuestionChoice>},
-        {"git_redirect", &parse_case<GitRedirectQuestion, QuestionChoice>},
+BRAURSER_READ_JSON(QuestionChoice) {
+    read_variant<Materialize>(j, out, extra, {
+        {"variant", &parse_case<Materialize, VariantChoices, QuestionChoice>},
+        {"provider", &parse_case<Materialize, ProviderQuestion, QuestionChoice>},
+        {"build_review", &parse_case<Materialize, BuildReviewQuestion, QuestionChoice>},
+        {"conflict", &parse_case<Materialize, ConflictQuestion, QuestionChoice>},
+        {"news_ack", &parse_case<Materialize, NewsAckQuestion, QuestionChoice>},
+        {"git_redirect", &parse_case<Materialize, GitRedirectQuestion, QuestionChoice>},
     });
 }
 void to_json(nlohmann::json& j, const QuestionChoice& out) {
@@ -2014,5 +2048,7 @@ void to_json(nlohmann::json& j, const QuestionChoice& out) {
         {"git_redirect", 5},
     });
 }
+
+#undef BRAURSER_READ_JSON
 
 }

@@ -205,6 +205,9 @@ Search::~Search() { if (timer_token_) { timer_.cancel(*timer_token_); } }
 void Search::invalidate() {
     if (timer_token_) { timer_.cancel(*timer_token_); timer_token_.reset(); }
     ++state_.generation; state_.query.cursor.reset(); state_.next_cursor.reset(); state_.total.reset(); state_.loading = false;
+    pages_.clear(); first_page_ = 0; last_page_ = 0;
+    state_.has_previous = false; state_.has_next = false;
+    state_.visible_first = 0; state_.visible_last = 0; state_.results.clear();
 }
 void Search::query(std::string value) {
     bounded(value);
@@ -218,11 +221,11 @@ void Search::query(std::string value) {
 void Search::filters(FilterSelection selection) {
     auto mapping = map_filters(selection);
     invalidate(); state_.selection = std::move(selection); state_.mapping = std::move(mapping);
-    state_.query.filters = state_.mapping.filters; fetch(false);
+    state_.query.filters = state_.mapping.filters; fetch(0);
 }
 void Search::sort(std::string value) {
     if (value != "relevance" && value != "name") { throw std::invalid_argument("invalid sort"); }
-    invalidate(); state_.query.sort.value = std::move(value); fetch(false);
+    invalidate(); state_.query.sort.value = std::move(value); fetch(0);
 }
 void Search::facets() {
     call(rpc_, protocol::FacetsParams{}, [this](Reply<protocol::FacetsResult> reply) {
@@ -230,34 +233,67 @@ void Search::facets() {
         changed();
     });
 }
-void Search::submit() { invalidate(); fetch(false); }
+void Search::submit() { invalidate(); fetch(0); }
 void Search::next_page() {
-    if (state_.loading || !state_.next_cursor || state_.results.size() >= 10000) { return; }
-    state_.query.cursor = state_.next_cursor; fetch(true);
+    if (state_.loading || !state_.has_next) { return; }
+    fetch(last_page_ + 1);
 }
-void Search::fetch(bool append) {
-    const auto params = search_params(state_.query);
+void Search::previous_page() {
+    if (state_.loading || !state_.has_previous) { return; }
+    fetch(first_page_ - 1, true);
+}
+void Search::fetch(std::size_t page, bool prepend) {
+    auto query = state_.query;
+    query.cursor = page < pages_.size() ? pages_[page].cursor : state_.next_cursor;
+    if (page == 0 && pages_.empty()) { query.cursor.reset(); }
+    const auto params = search_params(query);
     if (!params) { state_.error = error_text(params.error().code); changed(); return; }
     state_.loading = true; state_.error.reset();
     const auto generation = state_.generation;
-    call(rpc_, *params, [this, generation, append](Reply<protocol::SearchResult> reply) {
+    call(rpc_, *params, [this, generation, page, prepend, cursor = query.cursor](Reply<protocol::SearchResult> reply) {
         if (generation != state_.generation) { return; }
         state_.loading = false;
         if (!reply) { state_.error = error_text(reply.error().code); }
+        else if (reply->packages.size() > 200) { state_.error = Text{"error.generic_title", {}}; }
         else {
-            if (!append) { state_.results.clear(); }
-            if (state_.results.size() + reply->packages.size() > 10000) { state_.error = Text{"error.generic_title", {}}; }
-            else {
-                state_.results.insert(state_.results.end(), reply->packages.begin(), reply->packages.end());
-                state_.next_cursor = reply->nextCursor; state_.stale = reply->stale;
-                if (!reply->nextCursor) { state_.total = state_.results.size(); }
+            const auto start = page < pages_.size() ? pages_[page].start : page == 0 ? 0 : pages_[page - 1].start + pages_[page - 1].size;
+            if (page == pages_.size()) { pages_.push_back({cursor, start, reply->packages.size()}); }
+            else { pages_[page].size = reply->packages.size(); }
+            if (prepend) {
+                state_.results.insert(state_.results.begin(), std::make_move_iterator(reply->packages.begin()), std::make_move_iterator(reply->packages.end()));
+                first_page_ = page;
+                while (state_.results.size() > 200 && last_page_ > first_page_) {
+                    state_.results.resize(state_.results.size() - pages_[last_page_].size); --last_page_;
+                }
+            } else {
+                if (page == 0) { state_.results.clear(); first_page_ = 0; }
+                state_.results.insert(state_.results.end(), std::make_move_iterator(reply->packages.begin()), std::make_move_iterator(reply->packages.end()));
+                last_page_ = page;
+                while (state_.results.size() > 200 && first_page_ < last_page_) {
+                    state_.results.erase(state_.results.begin(), state_.results.begin() + static_cast<std::ptrdiff_t>(pages_[first_page_].size)); ++first_page_;
+                }
+                state_.next_cursor = std::move(reply->nextCursor);
+                if (!state_.next_cursor) { state_.total = start + pages_[page].size; }
             }
+            if (pages_.size() > 1024) {
+                if (first_page_ == 0) {
+                    state_.results.erase(state_.results.begin(), state_.results.begin() + static_cast<std::ptrdiff_t>(pages_.front().size));
+                    ++first_page_;
+                }
+                pages_.erase(pages_.begin()); --first_page_; --last_page_;
+            }
+            state_.stale = reply->stale;
+            state_.has_previous = first_page_ > 0;
+            state_.has_next = last_page_ + 1 < pages_.size() || state_.next_cursor.has_value();
+            state_.visible_first = state_.results.empty() ? 0 : pages_[first_page_].start + 1;
+            state_.visible_last = pages_[last_page_].start + pages_[last_page_].size;
         }
         changed();
     });
     changed();
 }
 Details::Details(Rpc& rpc) : rpc_(rpc) {}
+void Details::release() { ++generation_; state_ = {}; changed(); }
 void Details::load(std::string id) {
     bounded(id, 512); ++generation_; state_ = {}; state_.id = std::move(id); state_.loading = true;
     call(rpc_, protocol::GetParams{state_.id}, [this, generation = generation_](Reply<protocol::GetResult> reply) {
@@ -392,28 +428,69 @@ void Confirm::plan(protocol::TransactionPlan value, bool dependents) {
     }
     state_.plan = std::move(value); state_.build_acknowledged = false; state_.dependents_acknowledged = false;
     state_.requires_dependents_ack = dependents; state_.stale = false; state_.error.reset(); state_.submitting = false; state_.job_id.reset();
-    state_.build_files.clear(); state_.pending_build_files = state_.plan->requires_build_review ? state_.plan->build_review_refs.size() : 0;
-    const auto generation = ++generation_;
+    std::vector<protocol::BuildFilesParams> reviews;
     if (state_.plan->requires_build_review) {
-        for (const auto& ref : state_.plan->build_review_refs) {
-            call(rpc_, protocol::BuildFilesParams{ref.name}, [this, generation](Reply<protocol::BuildFilesResult> reply) {
-                if (generation != generation_) { return; }
-                --state_.pending_build_files;
-                if (reply && !reply->files.empty() && !reply->truncated) { state_.build_files.push_back(*reply); }
-                else { state_.error = Text{"detail.build_unavailable", {}}; }
-                changed();
-            });
+        for (const auto& pin : state_.plan->build_pins) { reviews.push_back({pin.pkgbase, pin.commit}); }
+        if (reviews.empty()) {
+            for (const auto& ref : state_.plan->build_review_refs) { reviews.push_back({ref.name, {}}); }
         }
+    }
+    state_.build_files.clear(); state_.pending_build_files = reviews.size();
+    const auto generation = ++generation_;
+    for (const auto& request : reviews) {
+        call(rpc_, request, [this, generation, request](Reply<protocol::BuildFilesResult> reply) {
+            if (generation != generation_) { return; }
+            if (reply && !reply->files.empty() && !reply->truncated &&
+                (!request.commit || reply->packageBase == request.packageId)) { fetch_omitted(request, std::move(*reply), generation); }
+            else { --state_.pending_build_files; state_.error = Text{"detail.build_unavailable", {}}; changed(); }
+        });
     }
     changed();
 }
-void Confirm::acknowledge_build(bool value) { state_.build_acknowledged = value; changed(); }
+void Confirm::fetch_omitted(protocol::BuildFilesParams request, protocol::BuildFilesResult files, std::uint64_t generation) {
+    if (generation != generation_) { return; }
+    const auto omitted = std::ranges::find_if(files.files, [](const auto& file) { return file.kind == "omitted"; });
+    if (omitted == files.files.end()) {
+        --state_.pending_build_files;
+        state_.build_files.push_back(std::move(files));
+        changed();
+        return;
+    }
+    if (!request.commit) {
+        --state_.pending_build_files;
+        state_.error = Text{"detail.build_unavailable", {}};
+        changed();
+        return;
+    }
+    const auto index = static_cast<std::size_t>(omitted - files.files.begin());
+    request.path = omitted->name;
+    call(rpc_, request, [this, generation, request, index, files = std::move(files)](Reply<protocol::BuildFilesResult> reply) mutable {
+        if (generation != generation_) { return; }
+        const auto& expected = files.files[index];
+        if (!reply || reply->truncated || reply->packageBase != files.packageBase || reply->files.size() != 1 ||
+            reply->files.front().kind != "text" || reply->files.front().name != expected.name ||
+            reply->files.front().size != expected.size || reply->files.front().sha256 != expected.sha256) {
+            --state_.pending_build_files;
+            state_.error = Text{"detail.build_unavailable", {}};
+            changed();
+            return;
+        }
+        files.files[index] = std::move(reply->files.front());
+        fetch_omitted(request, std::move(files), generation);
+    });
+}
+void Confirm::acknowledge_build(bool value) {
+    state_.build_acknowledged = value && state_.pending_build_files == 0 && state_.plan &&
+        !state_.build_files.empty() && state_.build_files.size() ==
+        (state_.plan->build_pins.empty() ? state_.plan->build_review_refs.size() : state_.plan->build_pins.size());
+    changed();
+}
 void Confirm::acknowledge_dependents(bool value) { state_.dependents_acknowledged = value; changed(); }
 void Confirm::invalidate() { state_.stale = true; state_.build_acknowledged = false; state_.dependents_acknowledged = false; state_.error = Text{"confirm.plan_changed", {}}; changed(); }
 void Confirm::busy(bool value) { state_.busy = value; changed(); }
 bool Confirm::can_confirm() const {
     return state_.plan && !state_.plan->approval_token.empty() && !state_.submitting && !state_.stale && state_.plan->blockers.empty() && state_.plan->protected_blockers.empty() && state_.plan->conflicts.empty() &&
-        (!state_.plan->requires_build_review || (state_.build_acknowledged && state_.pending_build_files == 0 && !state_.build_files.empty() && state_.build_files.size() == state_.plan->build_review_refs.size())) && (!state_.requires_dependents_ack || state_.dependents_acknowledged);
+        (!state_.plan->requires_build_review || (state_.build_acknowledged && state_.pending_build_files == 0 && !state_.build_files.empty() && state_.build_files.size() == (state_.plan->build_pins.empty() ? state_.plan->build_review_refs.size() : state_.plan->build_pins.size()))) && (!state_.requires_dependents_ack || state_.dependents_acknowledged);
 }
 Text Confirm::action() const {
     if (state_.busy) { return {"confirm.add_queue", {}}; }
@@ -432,7 +509,7 @@ void Confirm::request(protocol::PlanParams params) {
     call(rpc_, params, [this, generation = ++generation_](Reply<protocol::TransactionPlan> reply) {
         if (generation != generation_) { return; }
         state_.submitting = false;
-        if (reply) { const auto notice = state_.error; const auto saved_request = request_; plan(*reply); request_ = saved_request; if (notice && notice->key == "confirm.plan_changed") { state_.error = notice; changed(); } } else { state_.error = error_text(reply.error().code); changed(); }
+        if (reply) { const auto notice = state_.error; const auto saved_request = request_; plan(*reply); request_ = saved_request; if (notice && notice->key == "confirm.plan_changed") { state_.error = notice; changed(); } } else { state_.error = reply.error().code == protocol::kUntrustedInput && reply.error().message_key == "detail.build_too_large" ? Text{"detail.build_too_large", {}} : error_text(reply.error().code); changed(); }
     });
     changed();
 }
@@ -475,8 +552,11 @@ void Updates::report(protocol::UpdateReport value) {
     ++generation_; state_.options.reset(); state_.plan.reset(); state_.error.reset(); state_.missing_news_acknowledged = false; state_.loading = false;
     state_.report = std::move(value);
     for (auto& group : state_.groups) { group.items.clear(); }
-    for (const auto* list : {&state_.report->official, &state_.report->community, &state_.report->manual}) {
-        for (const auto& item : *list) { state_.groups[impact(item.restart.level.value)].items.push_back(item); }
+    const std::array lists{&state_.report->official, &state_.report->community, &state_.report->manual};
+    for (std::size_t source = 0; source < lists.size(); ++source) {
+        for (std::size_t index = 0; index < lists[source]->size(); ++index) {
+            state_.groups[impact((*lists[source])[index].restart.level.value)].items.push_back({source, index});
+        }
     }
     call(rpc_, protocol::UpdatesOptionsParams{state_.report->report_id}, [this, generation = generation_](Reply<protocol::UpdatesOptionsResult> reply) {
         if (generation != generation_) { return; }
@@ -535,8 +615,27 @@ void Updates::request_plan(protocol::PlanSelection selection, std::optional<std:
         changed();
     }); changed();
 }
+Subscription bind_page_retention(Shell& shell, Details& details, Installed& installed) {
+    return shell.observe([&details, &installed, previous = shell.state().location](const auto& state) mutable {
+        const auto destination = state.location.destination;
+        if (previous.destination == destination && previous.id == state.location.id) { return; }
+        const auto leaving = previous.destination;
+        previous = state.location;
+        if (leaving == Destination::Details) { details.release(); }
+        if (leaving == Destination::Installed) { installed.release(); }
+        if (destination == Destination::Details && details.state().id != state.location.id) {
+            details.load(state.location.id); details.load_wiki(false);
+        }
+        if (destination == Destination::Installed) { installed.refresh(); }
+    });
+}
 Installed::Installed(Rpc& rpc) : rpc_(rpc) {}
-void Installed::view(InstalledView value) { state_.view = value; refresh(); }
+void Installed::release() {
+    ++generation_;
+    const auto view = state_.view; auto query = std::move(state_.query);
+    state_ = {}; state_.view = view; state_.query = std::move(query); changed();
+}
+void Installed::view(InstalledView value) { release(); state_.view = value; refresh(); }
 void Installed::query(std::string value) { bounded(value); state_.query = std::move(value); refresh(); }
 void Installed::refresh() {
     const auto generation = ++generation_; state_.loading = true; state_.error.reset();

@@ -26,6 +26,7 @@ public:
         }
         drain(); return done();
     }
+    std::size_t queued() { std::lock_guard lock(mutex_); return callbacks_.size(); }
     void drain() {
         std::deque<std::function<void()>> callbacks;
         { std::lock_guard lock(mutex_); callbacks.swap(callbacks_); }
@@ -67,7 +68,7 @@ public:
             if (::poll(&descriptor, 1, 10) <= 0) { continue; }
             std::array<std::byte, 8192> input{};
             const auto count = ::recv(socket_, input.data(), input.size(), 0);
-            if (count <= 0) { break; }
+            if (count <= 0) { disconnected.store(true); break; }
             decoder.feed(std::span(input.data(), static_cast<std::size_t>(count)));
             while (true) {
                 auto frame = decoder.next(); if (!frame || !*frame) { break; }
@@ -92,6 +93,7 @@ public:
         }
     }
     std::atomic<unsigned> received = 0;
+    std::atomic_bool disconnected = false;
 private:
     int socket_;
     std::mutex write_mutex_;
@@ -188,8 +190,11 @@ TEST(RpcClient, FinishedJobsDoNotExhaustTheEventTracker) {
     for (int index = 0; index < 1100; ++index) {
         frames += protocol::encode_frame(protocol::serialize_message(protocol::Notification{std::string(Event<protocol::JobStateNotification>::name),
             protocol::JobStateNotification{"job-" + std::to_string(index), 1, {"succeeded"}}}));
+        if (index % 100 == 99) {
+            server.send_bytes(frames); frames.clear();
+            ASSERT_TRUE(loop.until([&] { return states == static_cast<std::size_t>(index + 1); }));
+        }
     }
-    server.send_bytes(frames);
     ASSERT_TRUE(loop.until([&] { return states == 1100; }));
     bool completed = false;
     client.call<Method<protocol::StatusParams>>({}, [&](Reply<protocol::StatusResult> reply) { EXPECT_TRUE(reply); completed = true; });
@@ -216,6 +221,50 @@ TEST(RpcClient, ReconnectStartsFreshEventSequences) {
     bool completed = false;
     client.call<Method<protocol::StatusParams>>({}, [&](Reply<protocol::StatusResult> reply) { EXPECT_TRUE(reply); completed = true; });
     ASSERT_TRUE(loop.until([&] { return completed; }));
+}
+TEST(RpcClient, NotificationBacklogIsBoundedAndReconnects) {
+    MainLoop loop; auto pairs = std::make_shared<Pairs>();
+    FakeServer first(pairs->add()); FakeServer second(pairs->add()); RpcClient client(loop, options(), pairs);
+    bool connected = false; bool disconnected = false;
+    auto watch = client.connection_changed([&](bool value) { if (value) { connected = true; } else { disconnected = true; } });
+    ASSERT_TRUE(loop.until([&] { return connected; }));
+    std::size_t delivered = 0;
+    auto subscription = client.listen<protocol::CatalogChangedNotification>([&](const auto&) { ++delivered; });
+    const auto frame = protocol::encode_frame(protocol::serialize_message(protocol::Notification{
+        std::string(Event<protocol::CatalogChangedNotification>::name), protocol::CatalogChangedNotification{1}}));
+    std::string frames;
+    for (int index = 0; index < 1100; ++index) { frames += frame; }
+    first.send_bytes(frames);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!first.disconnected.load() && std::chrono::steady_clock::now() < deadline) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+    EXPECT_TRUE(first.disconnected.load()); EXPECT_LE(loop.queued(), 1024U);
+    ASSERT_TRUE(loop.until([&] { return disconnected && pairs->attempts.load() >= 2; }));
+    EXPECT_LE(delivered, 1024U); EXPECT_GT(delivered, 0U);
+    bool completed = false;
+    client.call<Method<protocol::StatusParams>>({}, [&](Reply<protocol::StatusResult> reply) { EXPECT_TRUE(reply); completed = true; });
+    ASSERT_TRUE(loop.until([&] { return completed; }));
+    const auto before = delivered; second.send_bytes(frame);
+    EXPECT_TRUE(loop.until([&] { return delivered == before + 1; }));
+}
+TEST(RpcClient, NotificationPayloadBytesAreBounded) {
+    MainLoop loop; auto pairs = std::make_shared<Pairs>(); FakeServer server(pairs->add()); RpcClient client(loop, options(), pairs);
+    bool connected = false;
+    auto watch = client.connection_changed([&](bool value) { if (value) { connected = true; } });
+    ASSERT_TRUE(loop.until([&] { return connected; }));
+    std::size_t delivered = 0;
+    auto subscription = client.listen<protocol::JobQuestionNotification>([&](const auto&) { ++delivered; });
+    auto event = payload("job.question", "params");
+    event["question"] = {{"question_id", "question"}, {"token", "token"}, {"expires_at", "2026-09-25T00:00:00Z"},
+        {"kind", "build_review"}, {"refs", nlohmann::json::array()}, {"pkgbuild", std::string(256 * 1024, 'x')}};
+    for (std::uint64_t sequence = 1; sequence <= 140; ++sequence) {
+        event["sequence"] = sequence;
+        server.send_bytes(protocol::encode_frame(protocol::serialize_message(protocol::Notification{
+            std::string(Event<protocol::JobQuestionNotification>::name), event})));
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!server.disconnected.load() && std::chrono::steady_clock::now() < deadline) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+    EXPECT_TRUE(server.disconnected.load()); EXPECT_LT(loop.queued(), 140U);
+    loop.drain(); EXPECT_GT(delivered, 0U); EXPECT_LE(delivered, 127U);
 }
 TEST(RpcClient, BoundsQueueAndRejectsUnknownMethods) {
     MainLoop loop; auto pairs = std::make_shared<Pairs>(); auto configuration = options(); configuration.queue_limit = 1;

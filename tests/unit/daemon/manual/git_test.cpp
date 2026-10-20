@@ -4,6 +4,10 @@
 #include <git2.h>
 #include <gtest/gtest.h>
 #include <cstdint>
+#include <array>
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -30,13 +34,14 @@ public:
     std::string requested;
     std::expected<GitReply, ManualError> request(std::string_view url, std::string_view, bool) override {
         requested = url;
-        return reply;
+        return std::move(reply);
     }
 };
 
 class FakeUploadPack final : public GitHttp {
 public:
     explicit FakeUploadPack(std::filesystem::path repo) : repo_(std::move(repo)) {}
+    std::size_t largest_response{};
     std::expected<GitReply, ManualError> request(std::string_view, std::string_view body, bool post) override {
         braurser::daemon::core::ProcessSpec spec;
         spec.executable = "/usr/bin/git-upload-pack";
@@ -50,7 +55,12 @@ public:
         auto result = runner_.run(spec);
         if (!result || result->exit_code != 0)
             return std::unexpected(ManualError{"fixture-upload-pack", result ? result->err : "spawn", {}, {}});
-        return GitReply{200, post ? result->out : "001e# service=git-upload-pack\n0000" + result->out, {}};
+        auto spool = GitReply::Body::create(repo_.parent_path());
+        if (!spool) return std::unexpected(spool.error());
+        auto stored = spool->append(post ? result->out : "001e# service=git-upload-pack\n0000" + result->out);
+        if (!stored) return std::unexpected(stored.error());
+        largest_response = std::max(largest_response, spool->size());
+        return GitReply{200, std::move(*spool), {}};
     }
 private:
     std::filesystem::path repo_;
@@ -59,7 +69,7 @@ private:
 
 std::string build_repo(const std::filesystem::path& path, std::string_view script,
                        std::string_view makefile = {}, std::string_view link = {}, bool gitlink = false,
-                       std::string_view pkgbuild = {}) {
+                       std::string_view pkgbuild = {}, std::size_t files = 0) {
     if (git_libgit2_init() < 0) return {};
     git_repository* raw = nullptr;
     if (git_repository_open_bare(&raw, path.c_str()) != 0 &&
@@ -73,6 +83,10 @@ std::string build_repo(const std::filesystem::path& path, std::string_view scrip
         if (git_blob_create_frombuffer(&oid, repo.get(), bytes.data(), bytes.size()) != 0) return -1;
         return git_treebuilder_insert(nullptr, tree.get(), name, &oid, mode);
     };
+    for (std::size_t index = 0; index < files; ++index) {
+        const auto name = "file-" + std::to_string(index);
+        if (insert(name.c_str(), "data", GIT_FILEMODE_BLOB) != 0) return {};
+    }
     if (!script.empty() && insert("install.sh", script, GIT_FILEMODE_BLOB) != 0) return {};
     if (!makefile.empty() && insert("Makefile", makefile, GIT_FILEMODE_BLOB) != 0) return {};
     if (!pkgbuild.empty() && insert("PKGBUILD", pkgbuild, GIT_FILEMODE_BLOB) != 0) return {};
@@ -102,6 +116,163 @@ std::string build_repo(const std::filesystem::path& path, std::string_view scrip
     char hex[GIT_OID_HEXSZ + 1]{};
     git_oid_tostr(hex, sizeof(hex), &commit);
     return hex;
+}
+
+TEST(GitSpool, ReadsExactBytesAcrossChunkBoundaries) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    auto spool = GitReply::Body::create(temp.path);
+    ASSERT_TRUE(spool) << spool.error().code;
+    std::string bytes(3 * GitReply::Body::kReadChunk + 17, '\0');
+    for (std::size_t index = 0; index < bytes.size(); ++index)
+        bytes[index] = static_cast<char>(index % 251);
+    ASSERT_TRUE(spool->append(std::string_view(bytes).substr(0, 65535)));
+    ASSERT_TRUE(spool->append(std::string_view(bytes).substr(65535)));
+    FakeHttp http;
+    http.reply = {200, std::move(*spool), {}};
+    GuardedGitTransport transport(http);
+    auto reader = transport.exchange("https://example.org/repo");
+    ASSERT_TRUE(reader) << reader.error().code;
+    EXPECT_EQ(reader->size(), bytes.size());
+    std::array<char, 2 * GitReply::Body::kReadChunk> buffer{};
+    std::string received;
+    while (received.size() < reader->size()) {
+        auto count = reader->read(buffer, received.size());
+        ASSERT_TRUE(count) << count.error().code;
+        ASSERT_GT(*count, 0U);
+        EXPECT_LE(*count, GitReply::Body::kReadChunk);
+        received.append(buffer.data(), *count);
+    }
+    EXPECT_EQ(received, bytes);
+    auto eof = reader->read(buffer, received.size());
+    ASSERT_TRUE(eof);
+    EXPECT_EQ(*eof, 0U);
+    auto crossing = reader->read(std::span<char>(buffer).first(9), 65533);
+    ASSERT_TRUE(crossing);
+    EXPECT_EQ(std::string_view(buffer.data(), *crossing), std::string_view(bytes).substr(65533, 9));
+    EXPECT_FALSE(reader->read(buffer, bytes.size() + 1));
+    EXPECT_TRUE(std::filesystem::is_empty(temp.path / "braurser/manual/spool"));
+}
+
+TEST(GitSpool, IsPrivateAnonymousCloseOnExecAndMoveOwned) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    int descriptor = -1;
+    {
+        auto spool = GitReply::Body::create(temp.path);
+        ASSERT_TRUE(spool);
+        descriptor = spool->native_handle();
+        struct stat file_info{};
+        ASSERT_EQ(fstat(descriptor, &file_info), 0);
+        EXPECT_EQ(file_info.st_nlink, 0U);
+        EXPECT_EQ(file_info.st_mode & 0777U, 0600U);
+        EXPECT_EQ(fcntl(descriptor, F_GETFD) & FD_CLOEXEC, FD_CLOEXEC);
+        struct stat directory_info{};
+        ASSERT_EQ(stat((temp.path / "braurser/manual/spool").c_str(), &directory_info), 0);
+        EXPECT_EQ(directory_info.st_mode & 0777U, 0700U);
+        ASSERT_TRUE(spool->append("response"));
+        GitReply::Body moved(std::move(*spool));
+        EXPECT_EQ(spool->native_handle(), -1);
+        EXPECT_EQ(spool->size(), 0U);
+        auto other = GitReply::Body::create(temp.path);
+        ASSERT_TRUE(other);
+        const auto previous = other->native_handle();
+        *other = std::move(moved);
+        EXPECT_EQ(fcntl(previous, F_GETFD), -1);
+        EXPECT_EQ(errno, EBADF);
+        EXPECT_EQ(other->native_handle(), descriptor);
+        EXPECT_EQ(other->size(), 8U);
+    }
+    EXPECT_EQ(fcntl(descriptor, F_GETFD), -1);
+    EXPECT_EQ(errno, EBADF);
+    EXPECT_TRUE(std::filesystem::is_empty(temp.path / "braurser/manual/spool"));
+}
+
+TEST(GitSpool, RejectsOversizedResponseAndClosesSpool) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    auto spool = GitReply::Body::create(temp.path, GitReply::Body::kReadChunk + 1);
+    ASSERT_TRUE(spool);
+    const auto descriptor = spool->native_handle();
+    ASSERT_TRUE(spool->append(std::string(GitReply::Body::kReadChunk, 'x')));
+    ASSERT_TRUE(spool->append("x"));
+    auto overflow = spool->append("x");
+    ASSERT_FALSE(overflow);
+    EXPECT_EQ(overflow.error().code, "git-size");
+    EXPECT_EQ(spool->native_handle(), -1);
+    EXPECT_EQ(fcntl(descriptor, F_GETFD), -1);
+    EXPECT_EQ(errno, EBADF);
+    EXPECT_TRUE(std::filesystem::is_empty(temp.path / "braurser/manual/spool"));
+}
+
+TEST(GitSpool, RejectsTruncatedResponseAndUnsafeDirectory) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    auto spool = GitReply::Body::create(temp.path);
+    ASSERT_TRUE(spool);
+    ASSERT_TRUE(spool->append("response"));
+    ASSERT_EQ(ftruncate(spool->native_handle(), 2), 0);
+    std::array<char, 8> buffer{};
+    auto read = spool->read(buffer, 0);
+    ASSERT_FALSE(read);
+    EXPECT_EQ(read.error().code, "git-spool-read");
+    std::filesystem::create_directory_symlink(temp.path, temp.path / "braurser/manual/unsafe");
+    EXPECT_FALSE(GitReply::Body::create(temp.path / "braurser/manual/unsafe"));
+    EXPECT_FALSE(GitReply::Body::create("relative"));
+}
+
+TEST(GitSpool, EnforcesInjectedHttpAggregateResponseBudget) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    auto spool = GitReply::Body::create(temp.path);
+    ASSERT_TRUE(spool);
+    ASSERT_TRUE(spool->append("response"));
+    const auto descriptor = spool->native_handle();
+    FakeHttp http;
+    http.reply = {200, std::move(*spool), {}};
+    auto result = http.request_bounded("https://example.org/repo", {}, false, 7);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, "git-size");
+    EXPECT_EQ(fcntl(descriptor, F_GETFD), -1);
+    EXPECT_EQ(errno, EBADF);
+    EXPECT_TRUE(std::filesystem::is_empty(temp.path / "braurser/manual/spool"));
+}
+
+TEST(GitFetch, StreamsLargePackThroughInjectedSmartHttp) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    std::string script(240 * 1024, ' ');
+    std::uint32_t state = 1;
+    for (auto& ch : script) {
+        state ^= state << 13U;
+        state ^= state >> 17U;
+        state ^= state << 5U;
+        ch = static_cast<char>(32U + state % 95U);
+    }
+    const auto commit = build_repo(temp.path / "source.git", script);
+    ASSERT_EQ(commit.size(), 40U);
+    FakeUploadPack http(temp.path / "source.git");
+    auto result = fetch_preview(http, "https://example.org/repo", temp.path / "cache", "large-pack");
+    ASSERT_TRUE(result) << result.error().code << " " << result.error().detail;
+    EXPECT_GT(http.largest_response, GitReply::Body::kReadChunk);
+    EXPECT_EQ(result->commit, commit);
+    EXPECT_EQ(result->selected_script_text, script);
+    EXPECT_TRUE(std::filesystem::is_empty(temp.path / "braurser/manual/spool"));
+}
+
+TEST(GitPreview, LargeTokenAndTreeSetsKeepSortedUniqueReferences) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    std::string script;
+    for (std::size_t index = 0; index < 100000; ++index) script += "x ";
+    script += "./file-9999 file-0 /file-9999 'install.sh' file-0 missing\n";
+    const auto repo = temp.path / "repo.git";
+    ASSERT_FALSE(build_repo(repo, script, {}, {}, false, {}, 10000).empty());
+    auto url = validate_git_url("https://example.org/owner/repo");
+    ASSERT_TRUE(url);
+    auto preview = preview_repository(repo, "HEAD", *url, "large-preview");
+    ASSERT_TRUE(preview) << preview.error().code;
+    EXPECT_EQ(preview->referenced_files, (std::vector<std::string>{"file-0", "file-9999", "install.sh"}));
 }
 
 TEST(GitUrl, RejectsUnsafeTargets) {
@@ -135,11 +306,14 @@ TEST(GitGuard, RefusesPrivateConnectionsBeforeTls) {
 }
 
 TEST(GitGuard, BlocksLocalhostAfterDnsBeforeTls) {
-    CurlGitHttp http;
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    CurlGitHttp http(temp.path);
     GuardedGitTransport transport(http);
     auto result = transport.exchange("https://localhost/repo");
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error().code, "git-connect");
+    EXPECT_TRUE(std::filesystem::is_empty(temp.path / "braurser/manual/spool"));
 }
 
 TEST(GitRedirect, RequiresExplicitCrossHostApproval) {

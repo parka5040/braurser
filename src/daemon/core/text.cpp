@@ -72,16 +72,36 @@ std::string redact(std::string_view text) {
                     break;
                 }
             }
-            if (!equal || (text[cursor + key.size()] != ':' && text[cursor + key.size()] != '=')) continue;
-            output.append(text.substr(cursor, key.size() + 1));
-            cursor += key.size() + 1;
-            while (cursor < text.size() && (text[cursor] == ' ' || text[cursor] == '\t')) {
-                output.push_back(text[cursor++]);
+            if (!equal) continue;
+            auto separator = cursor + key.size();
+            if (cursor > 0 && (text[cursor - 1] == '"' || text[cursor - 1] == '\'')) {
+                if (text[separator] != text[cursor - 1]) continue;
+                ++separator;
             }
+            while (separator < text.size() && (text[separator] == ' ' || text[separator] == '\t')) ++separator;
+            if (separator == text.size() || (text[separator] != ':' && text[separator] != '=')) continue;
+            ++separator;
+            while (separator < text.size() && (text[separator] == ' ' || text[separator] == '\t')) ++separator;
+            output.append(text.substr(cursor, separator - cursor));
+            cursor = separator;
             if (cursor < text.size() && text[cursor] != '\r' && text[cursor] != '\n') {
+                const char quote = text[cursor] == '"' || text[cursor] == '\'' ? text[cursor++] : '\0';
+                if (quote) output.push_back(quote);
                 output += "[REDACTED]";
-                while (cursor < text.size() && !std::isspace(static_cast<unsigned char>(text[cursor])) &&
-                       text[cursor] != '&' && text[cursor] != ';') ++cursor;
+                if (quote) {
+                    bool escaped = false;
+                    while (cursor < text.size() && text[cursor] != '\r' && text[cursor] != '\n') {
+                        const char c = text[cursor++];
+                        if (!escaped && c == quote) { output.push_back(quote); break; }
+                        if (!escaped && c == '\\') escaped = true;
+                        else escaped = false;
+                    }
+                } else if (key == "authorization") {
+                    while (cursor < text.size() && text[cursor] != '\r' && text[cursor] != '\n') ++cursor;
+                } else {
+                    while (cursor < text.size() && !std::isspace(static_cast<unsigned char>(text[cursor])) &&
+                           text[cursor] != '&' && text[cursor] != ';' && text[cursor] != ',' && text[cursor] != '}') ++cursor;
+                }
             }
             masked = true;
             break;

@@ -38,6 +38,10 @@ nlohmann::json fixture(std::string_view name) {
     std::ifstream input(std::string(BRAURSER_FIXTURES) + "/" + std::string(name) + ".result.json");
     return nlohmann::json::parse(input);
 }
+protocol::BuildFile build_file(std::string name, std::string text) {
+    const auto size = text.size();
+    return {std::move(name), std::move(text), "text", size, std::string(64, 'a')};
+}
 protocol::UpdateItem item(std::string level, std::string source = "official") {
     protocol::PackageRef package{{source}, {}, "sample"};
     return {package, "1", "2", {source}, {package, {std::move(level)}, "updates.reason_unknown", {}}};
@@ -158,6 +162,106 @@ TEST(Search, DebouncesDiscardsStaleAndPages) {
     EXPECT_EQ(rpc.requests.back().params.at("cursor"), "next"); page.erase("nextCursor"); rpc.reply(2, page);
     EXPECT_EQ(search.state().results.size(), first_size * 2); EXPECT_EQ(search.state().total, first_size * 2);
 }
+TEST(Search, WindowsResultsAndRefetchesPreviousPages) {
+    FakeRpc rpc; FakeTimer timer; Search search(rpc, timer);
+    const auto page = [](std::size_t number) {
+        protocol::SearchResult result;
+        for (std::size_t index = 0; index < 50; ++index) {
+            result.packages.push_back({{{"official"}, "extra", "package-" + std::to_string(number * 50 + index)}, "1", "App", false});
+        }
+        if (number < 5) { result.nextCursor = "page-" + std::to_string(number + 1); }
+        return result;
+    };
+    search.submit();
+    for (std::size_t number = 0; number < 6; ++number) {
+        if (number > 0) { search.next_page(); }
+        ASSERT_EQ(rpc.requests.size(), number + 1);
+        rpc.reply(number, page(number));
+        EXPECT_LE(search.state().results.size(), 200U);
+    }
+    EXPECT_EQ(search.state().visible_first, 101U); EXPECT_EQ(search.state().visible_last, 300U);
+    EXPECT_EQ(search.state().total, 300U);
+    EXPECT_TRUE(search.state().has_previous); EXPECT_FALSE(search.state().has_next);
+    search.previous_page();
+    EXPECT_EQ(rpc.requests.back().params.at("cursor"), "page-1");
+    rpc.reply(6, page(1));
+    EXPECT_EQ(search.state().visible_first, 51U); EXPECT_EQ(search.state().visible_last, 250U);
+    EXPECT_TRUE(search.state().has_next);
+    search.previous_page(); EXPECT_FALSE(rpc.requests.back().params.contains("cursor")); rpc.reply(7, page(0));
+    EXPECT_EQ(search.state().visible_first, 1U); EXPECT_EQ(search.state().visible_last, 200U);
+    EXPECT_FALSE(search.state().has_previous);
+    search.next_page(); EXPECT_EQ(rpc.requests.back().params.at("cursor"), "page-4"); rpc.reply(8, page(4));
+    EXPECT_EQ(search.state().results.front().package.name, "package-50");
+    EXPECT_EQ(search.state().results.back().package.name, "package-249");
+    search.next_page(); search.query("replacement"); rpc.reply(9, page(5));
+    EXPECT_TRUE(search.state().results.empty()); EXPECT_FALSE(search.state().has_previous); EXPECT_FALSE(search.state().has_next);
+}
+TEST(Search, CursorHistoryStaysBoundedAcrossEmptyPages) {
+    FakeRpc rpc; FakeTimer timer; Search search(rpc, timer); search.submit();
+    protocol::SearchResult page; page.nextCursor = "next";
+    for (std::size_t index = 0; index < 1030; ++index) {
+        rpc.reply(index, page);
+        EXPECT_TRUE(search.state().results.empty());
+        EXPECT_FALSE(search.state().has_previous);
+        if (index < 1029) { search.next_page(); }
+    }
+    page.packages.push_back({{{"official"}, "extra", "sample"}, "1", "App", false});
+    search.next_page(); rpc.reply(1030, page);
+    EXPECT_EQ(search.state().visible_first, 1U); EXPECT_EQ(search.state().visible_last, 1U);
+}
+TEST(Models, NotificationsCopyOnceAndShareAnImmutableSnapshot) {
+    struct Counted {
+        int* copies = nullptr;
+        int value = 0;
+        Counted() = default;
+        Counted(const Counted& other) : copies(other.copies), value(other.value) { ++*copies; }
+    };
+    struct Probe final : Model<Counted> {
+        void configure(int& copies) { state_.copies = &copies; }
+        void notify(int value) { state_.value = value; changed(); }
+    } probe;
+    int copies = 0; probe.configure(copies); probe.notify(1); EXPECT_EQ(copies, 0);
+    const Counted* first = nullptr;
+    auto one = probe.observe([&](const auto& snapshot) { first = &snapshot; EXPECT_EQ(snapshot.value, 2); });
+    auto two = probe.observe([&](const auto& snapshot) { EXPECT_EQ(first, &snapshot); EXPECT_EQ(snapshot.value, 2); });
+    probe.notify(2); EXPECT_EQ(copies, 1);
+}
+TEST(Models, ObserversCanSubscribeUnsubscribeAndReenter) {
+    struct Probe final : Model<int> { void notify(int value) { state_ = value; changed(); } } probe;
+    Subscription removed; Subscription added;
+    std::vector<int> seen;
+    auto first = probe.observe([&](int value) {
+        if (value != 1) { return; }
+        removed.reset();
+        added = probe.observe([&](int snapshot) { seen.push_back(snapshot * 10); });
+        probe.notify(2);
+    });
+    removed = probe.observe([](int) { FAIL() << "Removed observer was invoked"; });
+    auto last = probe.observe([&](int value) { seen.push_back(value); });
+    probe.notify(1);
+    EXPECT_EQ(seen, (std::vector<int>{2, 20, 1}));
+}
+TEST(Models, NavigationReleasesInactiveDataAndReloadsOnBack) {
+    FakeRpc rpc; Shell shell(rpc); Details details(rpc); Installed installed(rpc);
+    auto binding = bind_page_retention(shell, details, installed);
+    shell.navigate({Destination::Details, "sample", 0});
+    ASSERT_EQ(rpc.requests.size(), 2U);
+    rpc.reply(0, fixture("catalog.get")); rpc.reply(1, fixture("wiki.get"));
+    details.build({"https://example.org/build", std::string(40, 'a'), {{"PKGBUILD", "pkgname=sample"}}, false});
+    ASSERT_TRUE(details.state().wiki); ASSERT_TRUE(details.state().build);
+    details.load_wiki(true);
+    shell.navigate({Destination::Installed, {}, 0});
+    EXPECT_FALSE(details.state().wiki); EXPECT_FALSE(details.state().build);
+    rpc.reply(2, fixture("wiki.get")); EXPECT_FALSE(details.state().wiki);
+    rpc.reply(3, fixture("catalog.search")); ASSERT_FALSE(installed.state().packages.empty());
+    shell.navigate({Destination::Search, {}, 0}); EXPECT_TRUE(installed.state().packages.empty());
+    shell.back(); EXPECT_EQ(rpc.requests.back().method, "catalog.search");
+    shell.back(); EXPECT_EQ(rpc.requests.back().method, "wiki.get");
+    EXPECT_TRUE(details.state().loading); EXPECT_FALSE(details.state().wiki);
+    shell.navigate({Destination::Details, "other", 0});
+    EXPECT_EQ(details.state().id, "other");
+    shell.back(); EXPECT_EQ(details.state().id, "sample");
+}
 TEST(Models, DestroyedModelIgnoresOutstandingReply) {
     FakeRpc rpc; FakeTimer timer;
     { Search search(rpc, timer); search.submit(); }
@@ -195,12 +299,106 @@ TEST(Confirm, ReviewAcknowledgementStalenessAndSubmission) {
     FakeRpc rpc; Confirm confirm(rpc);
     auto plan = fixture("updates.plan").get<protocol::UpdatesPlanResult>().transactions.front();
     plan.kind.value = "install"; plan.requires_build_review = true; plan.build_review_refs = {{{"community"}, {}, "sample"}}; plan.blockers.clear(); plan.protected_blockers.clear(); plan.conflicts.clear();
-    confirm.plan(plan); rpc.reply(0, protocol::BuildFilesResult{"sample", {{"PKGBUILD", "pkgname=sample"}}, false}); EXPECT_FALSE(confirm.can_confirm()); confirm.acknowledge_build(true); EXPECT_TRUE(confirm.can_confirm());
+    confirm.plan(plan); rpc.reply(0, protocol::BuildFilesResult{"sample", {build_file("PKGBUILD", "pkgname=sample")}, false}); EXPECT_FALSE(confirm.can_confirm()); confirm.acknowledge_build(true); EXPECT_TRUE(confirm.can_confirm());
     confirm.invalidate(); EXPECT_FALSE(confirm.can_confirm());
-    confirm.plan(plan); rpc.reply(1, protocol::BuildFilesResult{"sample", {{"PKGBUILD", "pkgname=sample"}}, false}); confirm.acknowledge_build(true); confirm.busy(true); EXPECT_EQ(confirm.action().key, "confirm.add_queue");
+    confirm.plan(plan); rpc.reply(1, protocol::BuildFilesResult{"sample", {build_file("PKGBUILD", "pkgname=sample")}, false}); confirm.acknowledge_build(true); confirm.busy(true); EXPECT_EQ(confirm.action().key, "confirm.add_queue");
     confirm.submit(); ASSERT_EQ(rpc.requests.size(), 3U); EXPECT_FALSE(confirm.can_confirm());
     rpc.reply(2, fixture("jobs.install")); EXPECT_TRUE(confirm.state().job_id); EXPECT_TRUE(confirm.state().stale);
 }
+TEST(Confirm, RequiresFilesForEveryExactPinIncludingSplitPackageBases) {
+    FakeRpc rpc; Confirm confirm(rpc);
+    auto plan = fixture("updates.plan").get<protocol::UpdatesPlanResult>().transactions.front();
+    plan.requires_build_review = true;
+    plan.build_review_refs = {{{"community"}, {}, "widget"}, {{"community"}, {}, "widget-libs"}, {{"community"}, {}, "tool"}};
+    plan.build_pins = {{"widget-base", {"widget", "widget-libs"}, std::string(40, 'a')}, {"tool", {"tool"}, std::string(40, 'b')}};
+    confirm.plan(plan);
+    ASSERT_EQ(rpc.requests.size(), 2U);
+    EXPECT_EQ(rpc.requests[0].params["packageId"], "widget-base");
+    EXPECT_EQ(rpc.requests[0].params["commit"], std::string(40, 'a'));
+    EXPECT_EQ(rpc.requests[1].params["commit"], std::string(40, 'b'));
+    confirm.acknowledge_build(true);
+    rpc.reply(0, protocol::BuildFilesResult{"widget-base", {build_file("PKGBUILD", "build"), build_file("fix.patch", "reviewed")}, false});
+    EXPECT_FALSE(confirm.can_confirm());
+    rpc.reply(1, protocol::BuildFilesResult{"tool", {build_file("PKGBUILD", "build")}, false});
+    EXPECT_FALSE(confirm.can_confirm());
+    confirm.acknowledge_build(true);
+    EXPECT_TRUE(confirm.can_confirm());
+    confirm.plan(plan); confirm.acknowledge_build(true);
+    rpc.reply(2, protocol::BuildFilesResult{"widget-base", {build_file("PKGBUILD", "build")}, false});
+    rpc.reply(3, protocol::BuildFilesResult{"wrong-base", {build_file("PKGBUILD", "build")}, false});
+    EXPECT_FALSE(confirm.can_confirm());
+    confirm.plan(plan); confirm.acknowledge_build(true);
+    rpc.reply(4, protocol::BuildFilesResult{"widget-base", {build_file("PKGBUILD", "build")}, false});
+    rpc.reply(5, protocol::BuildFilesResult{"tool", {build_file("PKGBUILD", "build")}, true});
+    EXPECT_FALSE(confirm.can_confirm());
+}
+TEST(Confirm, FetchesEveryOmittedFileSequentiallyBeforeAcknowledgement) {
+    FakeRpc rpc; Confirm confirm(rpc);
+    auto plan = fixture("updates.plan").get<protocol::UpdatesPlanResult>().transactions.front();
+    plan.requires_build_review = true;
+    plan.build_review_refs = {{{"community"}, {}, "widget"}};
+    plan.build_pins = {{"widget", {"widget"}, std::string(40, 'a')}};
+    auto first = build_file("build.sh", std::string(300 * 1024, 'x'));
+    auto second = build_file("fix.patch", "reviewed");
+    auto omitted_first = first; omitted_first.kind = "omitted"; omitted_first.text.clear();
+    auto omitted_second = second; omitted_second.kind = "omitted"; omitted_second.text.clear();
+    confirm.plan(plan);
+    rpc.reply(0, protocol::BuildFilesResult{"widget", {build_file("PKGBUILD", "build"), omitted_first, omitted_second,
+        {"image", {}, "binary", 500 * 1024, std::string(64, 'b')}}, false});
+    ASSERT_EQ(rpc.requests.size(), 2U);
+    EXPECT_EQ(rpc.requests[1].params["path"], "build.sh");
+    EXPECT_EQ(rpc.requests[1].params["commit"], std::string(40, 'a'));
+    EXPECT_EQ(confirm.state().pending_build_files, 1U);
+    confirm.acknowledge_build(true);
+    EXPECT_FALSE(confirm.state().build_acknowledged);
+    EXPECT_FALSE(confirm.can_confirm());
+    rpc.reply(1, protocol::BuildFilesResult{"widget", {first}, false});
+    ASSERT_EQ(rpc.requests.size(), 3U);
+    EXPECT_EQ(rpc.requests[2].params["path"], "fix.patch");
+    EXPECT_FALSE(confirm.can_confirm());
+    EXPECT_TRUE(confirm.state().build_files.empty());
+    rpc.reply(2, protocol::BuildFilesResult{"widget", {second}, false});
+    EXPECT_EQ(confirm.state().pending_build_files, 0U);
+    ASSERT_EQ(confirm.state().build_files.size(), 1U);
+    EXPECT_EQ(confirm.state().build_files.front().files[1].text.size(), 300U * 1024);
+    EXPECT_EQ(confirm.state().build_files.front().files[3].kind, "binary");
+    EXPECT_FALSE(confirm.can_confirm());
+    confirm.acknowledge_build(true);
+    EXPECT_TRUE(confirm.can_confirm());
+}
+
+TEST(Confirm, MismatchedOmittedFilesAndObsoleteRepliesNeverOpenGate) {
+    FakeRpc rpc; Confirm confirm(rpc);
+    auto plan = fixture("updates.plan").get<protocol::UpdatesPlanResult>().transactions.front();
+    plan.requires_build_review = true;
+    plan.build_review_refs = {{{"community"}, {}, "widget"}};
+    plan.build_pins = {{"widget", {"widget"}, std::string(40, 'a')}};
+    const protocol::BuildFile omitted{"build.sh", {}, "omitted", 1, std::string(64, 'a')};
+    confirm.plan(plan);
+    rpc.reply(0, protocol::BuildFilesResult{"widget", {omitted}, false});
+    auto wrong = build_file("build.sh", "x"); wrong.sha256 = std::string(64, 'b');
+    rpc.reply(1, protocol::BuildFilesResult{"widget", {wrong}, false});
+    confirm.acknowledge_build(true);
+    EXPECT_FALSE(confirm.can_confirm());
+    EXPECT_TRUE(confirm.state().error);
+    confirm.plan(plan);
+    rpc.reply(2, protocol::BuildFilesResult{"widget", {omitted}, false});
+    confirm.plan(plan);
+    rpc.reply(3, protocol::BuildFilesResult{"widget", {build_file("build.sh", "x")}, false});
+    EXPECT_EQ(confirm.state().pending_build_files, 1U);
+    EXPECT_TRUE(confirm.state().build_files.empty());
+    EXPECT_FALSE(confirm.can_confirm());
+}
+
+TEST(Confirm, TooLargeReviewErrorUsesDedicatedCopy) {
+    FakeRpc rpc; Confirm confirm(rpc);
+    confirm.request({"install", "sample"});
+    rpc.requests[0].callback(std::unexpected(RpcError{protocol::kUntrustedInput, "detail.build_too_large"}));
+    ASSERT_TRUE(confirm.state().error);
+    EXPECT_EQ(confirm.state().error->key, "detail.build_too_large");
+    EXPECT_FALSE(confirm.can_confirm());
+}
+
 TEST(Confirm, StalePlanReplansWithoutSubmittingAgain) {
     FakeRpc rpc; Confirm confirm(rpc);
     confirm.request({"install", "sample"});
@@ -232,6 +430,8 @@ TEST(Updates, UnknownIsNeverNoneAndNewsBlocksActions) {
     updates.report(report);
     EXPECT_EQ(updates.state().groups[2].items.size(), 2U); EXPECT_EQ(updates.state().groups[3].items.size(), 1U);
     EXPECT_EQ(updates.state().groups[4].items.size(), 2U); EXPECT_TRUE(updates.state().groups[4].expanded);
+    EXPECT_EQ(updates.state().groups[4].items[0].source, 0U); EXPECT_EQ(updates.state().groups[4].items[0].item, 5U);
+    EXPECT_EQ(updates.state().groups[4].items[1].source, 1U); EXPECT_EQ(updates.state().groups[4].items[1].item, 0U);
     EXPECT_FALSE(updates.can_update()); updates.acknowledge_news(0, true); EXPECT_TRUE(updates.can_update());
     EXPECT_EQ(updates.item_blocker()->key, "updates.system_first");
     updates.news_available(false); EXPECT_FALSE(updates.can_update()); updates.acknowledge_missing_news(true); EXPECT_TRUE(updates.can_update());
@@ -253,8 +453,8 @@ TEST(Activity, BoundedRedactedLogsMeasuredProgressAndQuestions) {
 TEST(Installed, SwitchesOwnershipViewsWithoutInventingComponents) {
     FakeRpc rpc; Installed installed(rpc);
     installed.view(InstalledView::Git); rpc.reply(0, fixture("manual.list")); EXPECT_FALSE(installed.state().receipts.empty());
-    installed.view(InstalledView::Outside); rpc.reply(1, fixture("unmanaged.list")); EXPECT_FALSE(installed.state().outside.empty());
-    installed.view(InstalledView::Components); EXPECT_TRUE(installed.state().error);
+    installed.view(InstalledView::Outside); EXPECT_TRUE(installed.state().receipts.empty()); rpc.reply(1, fixture("unmanaged.list")); EXPECT_FALSE(installed.state().outside.empty());
+    installed.view(InstalledView::Components); EXPECT_TRUE(installed.state().outside.empty()); EXPECT_TRUE(installed.state().error);
     installed.view(InstalledView::Apps); EXPECT_TRUE(rpc.requests.back().params["filters"]["installed"].get<bool>());
 }
 TEST(Settings, ImmediateSerializedApplyAndUnavailableHelper) {

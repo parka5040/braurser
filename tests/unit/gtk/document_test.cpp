@@ -61,8 +61,8 @@ TEST(DocumentMarkup, DoesNotInterpretClosingTagsOrUriQuotes) {
 TEST(CodeText, AcceptsLargeReviewTextAndBoundsIt) {
     const std::string large(200 * 1024, 'x');
     EXPECT_EQ(safe_code(large), large);
-    EXPECT_EQ(safe_code(std::string(262144, 'y')).size(), 262144U);
-    EXPECT_THROW(safe_code(std::string(262145, 'x')), std::length_error);
+    EXPECT_EQ(safe_code(std::string(448 * 1024, 'y')).size(), 448U * 1024);
+    EXPECT_THROW(safe_code(std::string(448 * 1024 + 1, 'x')), std::length_error);
     EXPECT_THROW(safe_text(std::string(65537, 'x')), std::length_error);
 }
 

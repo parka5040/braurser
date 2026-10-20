@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 #include <gtest/gtest.h>
 #include <filesystem>
+#include <chrono>
 #include <string>
 
 namespace braurser::daemon::wiki {
@@ -80,6 +81,38 @@ TEST(Sanitizer, HostileMarkupBecomesSafeTextAndHttpsLinksOnly) {
     EXPECT_EQ(warnings, 1U);
     EXPECT_TRUE(relative_resolved);
     EXPECT_NE(text.find("grandchild"), std::string::npos);
+}
+
+TEST(Sanitizer, ManyStyledSiblingsAreLinear) {
+    std::string html = "<p>";
+    for (int i = 0; i < 30000; ++i) html += "<b>x</b><i>x</i>";
+    html += "</p>";
+    const auto started = std::chrono::steady_clock::now();
+    const auto doc = sanitize(html);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    ASSERT_EQ(doc.blocks.size(), 1U);
+    EXPECT_EQ(inline_text(std::get<Paragraph>(doc.blocks.front()).inlines), std::string(60000, 'x'));
+    EXPECT_LT(elapsed, std::chrono::seconds(1));
+}
+
+TEST(Sanitizer, RejectsDeepNestingBeforeBuildingTree) {
+    std::string html;
+    for (int i = 0; i < 100000; ++i) html += "<div>";
+    html += "<p>hidden</p>";
+    for (int i = 0; i < 100000; ++i) html += "</div>";
+    EXPECT_TRUE(sanitize(html).blocks.empty());
+}
+
+TEST(Sanitizer, NestingScanSkipsVoidQuotedAndRawMarkup) {
+    std::string html = "<!DOCTYPE html><!--";
+    for (int i = 0; i < 1500; ++i) html += "<div>";
+    html += "--><ScRiPt>";
+    for (int i = 0; i < 1500; ++i) html += "<div>";
+    html += "</sCrIpT><STYLE>";
+    for (int i = 0; i < 1500; ++i) html += "<div>";
+    html += "</style><div data-value='> <div>'><p>visible</p></div>";
+    for (int i = 0; i < 1500; ++i) html += "<br><img><input><hr/><wbr>";
+    EXPECT_NE(all_text(sanitize(html)).find("visible"), std::string::npos);
 }
 
 TEST(Sanitizer, MalformedAndOversizedInputsBounded) {

@@ -23,11 +23,24 @@ TEST(Text, RemovesRealHelperEscapeSequences) {
 }
 
 TEST(Text, RedactsCredentialFieldsAndUrlUserinfo) {
-    const auto sanitized = redact("password=hunter2 PASSWD: trustno1 token=abc authorization:Bearer secret=xyz "
-                                  "https://user:password@example.org/path?x=1");
-    EXPECT_EQ(sanitized, "password=[REDACTED] PASSWD: [REDACTED] token=[REDACTED] "
-                         "authorization:[REDACTED] secret=[REDACTED] "
-                         "https://[REDACTED]@example.org/path?x=1");
+    const auto sanitized = redact("password=hunter2 PASSWD: trustno1 token=abc secret=xyz "
+                                  "https://user:password@example.org/path?x=1\nauthorization:Bearer xyz");
+    EXPECT_EQ(sanitized, "password=[REDACTED] PASSWD: [REDACTED] token=[REDACTED] secret=[REDACTED] "
+                         "https://[REDACTED]@example.org/path?x=1\nauthorization:[REDACTED]");
+}
+
+TEST(Text, RedactsQuotedStructuredFieldsAndFullAuthorization) {
+    EXPECT_EQ(redact(R"({"password":"x", "token": "two words", "secret" : "x"})"),
+              R"({"password":"[REDACTED]", "token": "[REDACTED]", "secret" : "[REDACTED]"})");
+    EXPECT_EQ(redact(R"("Authorization": "Bearer private token")"),
+              R"("Authorization": "[REDACTED]")");
+    EXPECT_EQ(redact("Authorization: Bearer private token\r\nnext line"),
+              "Authorization: [REDACTED]\r\nnext line");
+    EXPECT_EQ(redact("Authorization : Basic abc def\n"), "Authorization : [REDACTED]\n");
+    EXPECT_EQ(redact("'passwd' = 'two words'"), "'passwd' = '[REDACTED]'");
+    EXPECT_EQ(redact(R"(token="escaped\"secret" safe=yes)"), R"(token="[REDACTED]" safe=yes)");
+    EXPECT_EQ(redact("secret=\"unterminated value\nnext"), "secret=\"[REDACTED]\nnext");
+    EXPECT_EQ(redact("notpassword=x tokenized=y"), "notpassword=x tokenized=y");
 }
 
 TEST(Text, TruncatesOnUtf8Boundary) {

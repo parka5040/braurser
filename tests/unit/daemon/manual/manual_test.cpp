@@ -337,8 +337,16 @@ TEST(ManualStaging, MakeInstallRunsOnlyTheReviewedMakefile) {
     const auto separator = std::ranges::find(args, "--");
     ASSERT_NE(separator, args.end());
     const std::vector<std::string> command(separator + 1, args.end());
-    EXPECT_EQ(command, (std::vector<std::string>{"/usr/bin/make", "-f", "Makefile", "install",
-                                                 "PREFIX=" + (home / ".local").string()}));
+    EXPECT_EQ(command, (std::vector<std::string>{"/usr/bin/prlimit", "--as=4294967296", "--nproc=512",
+        "--fsize=2147483648", "--cpu=1800", "--", "/usr/bin/make", "-f", "Makefile", "install",
+        "PREFIX=" + (home / ".local").string()}));
+    const auto size = std::ranges::find(args, "--size");
+    ASSERT_NE(size, args.end());
+    ASSERT_GE(args.end() - size, 4);
+    EXPECT_EQ(std::vector<std::string>(size, size + 4),
+              (std::vector<std::string>{"--size", "536870912", "--tmpfs", "/tmp"}));
+    EXPECT_NE(std::ranges::search(args, std::vector<std::string>{"--ro-bind", "/usr", "/usr"}).begin(), args.end());
+    EXPECT_FALSE(std::filesystem::exists(stage));
 }
 
 TEST(ManualStage, RefusesMalformedDesktopAndEntityXml) {
@@ -359,6 +367,156 @@ TEST(ManualStage, RefusesMalformedDesktopAndEntityXml) {
     auto xml = validate_stage(stage, Scope::User);
     ASSERT_FALSE(xml.has_value());
     EXPECT_EQ(xml.error().code, "stage-refused");
+}
+
+TEST(ManualInstall, RejectsTooManyFilesBeforeModifyingAnything) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    const auto home = temp.path / "home";
+    const auto state = temp.path / "state";
+    const auto stage = temp.path / "stage";
+    std::filesystem::create_directory(home);
+    std::filesystem::create_directory(state);
+    std::filesystem::create_directories(stage / "bin");
+    for (std::size_t i = 0; i <= kMaxReceiptFiles; ++i)
+        std::ofstream(stage / "bin" / ("file-" + std::to_string(i))) << "x";
+    CapturingRunner runner;
+    auto result = install_user(runner, stage, home, state, example_receipt());
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, "receipt-limit");
+    EXPECT_TRUE(std::filesystem::is_empty(home));
+    EXPECT_TRUE(std::filesystem::is_empty(state));
+}
+
+TEST(ManualInstall, RejectsSerializedReceiptOverflowBeforeModifyingAnything) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    const auto home = temp.path / "home";
+    const auto state = temp.path / "state";
+    const auto stage = temp.path / "stage";
+    std::filesystem::create_directory(home);
+    std::filesystem::create_directory(state);
+    std::filesystem::create_directories(stage / "bin");
+    for (std::size_t i = 0; i < 1600; ++i)
+        std::ofstream(stage / "bin" / (std::string(240, 'x') + std::to_string(i))) << "x";
+    CapturingRunner runner;
+    auto result = install_user(runner, stage, home, state, example_receipt());
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, "receipt-limit");
+    EXPECT_TRUE(std::filesystem::is_empty(home));
+    EXPECT_TRUE(std::filesystem::is_empty(state));
+}
+
+TEST(ManualInstall, IncludesPlannedBackupsInReceiptByteLimit) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    const auto home = temp.path / "home";
+    const auto state = temp.path / "state";
+    const auto stage = temp.path / "stage";
+    std::filesystem::create_directories(home / ".local/bin");
+    std::filesystem::create_directory(state);
+    std::filesystem::create_directories(stage / "bin");
+    for (std::size_t i = 0; i < 1000; ++i) {
+        const auto name = std::string(240, 'x') + std::to_string(i);
+        std::ofstream(stage / "bin" / name) << "new";
+        std::ofstream(home / ".local/bin" / name) << "original";
+    }
+    CapturingRunner runner;
+    auto result = install_user(runner, stage, home, state, example_receipt());
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, "receipt-limit");
+    EXPECT_TRUE(std::filesystem::is_empty(state));
+    std::ifstream input(home / ".local/bin" / (std::string(240, 'x') + "0"));
+    std::string value;
+    input >> value;
+    EXPECT_EQ(value, "original");
+}
+
+TEST(ManualInstall, RefusesAnotherReceiptsFilesWithoutChangingEitherInstall) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    const auto home = temp.path / "home";
+    const auto state = temp.path / "state";
+    const auto stage = temp.path / "stage";
+    std::filesystem::create_directory(home);
+    std::filesystem::create_directory(state);
+    std::filesystem::create_directories(stage / "bin");
+    std::ofstream(stage / "bin/demo") << "original";
+    CapturingRunner runner;
+    auto installed = install_user(runner, stage, home, state, example_receipt());
+    ASSERT_TRUE(installed);
+    std::ofstream(stage / "bin/demo") << "collision";
+    std::ofstream(stage / "bin/aaa") << "must not be installed";
+    auto other = example_receipt();
+    other.id = "other";
+    auto result = install_user(runner, stage, home, state, other);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, "install-owned-conflict");
+    std::ifstream input(home / ".local/bin/demo");
+    std::string value;
+    input >> value;
+    EXPECT_EQ(value, "original");
+    EXPECT_FALSE(std::filesystem::exists(home / ".local/bin/aaa"));
+    EXPECT_FALSE(std::filesystem::exists(state / "braurser/manual/receipts/other.json"));
+    auto removed = remove_user(runner, home, state, *installed);
+    ASSERT_TRUE(removed);
+    EXPECT_TRUE(removed->modified_files.empty());
+}
+
+TEST(ManualUpgrade, RefusesAnotherReceiptsFilesBeforeRemovingOldVersion) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    const auto home = temp.path / "home";
+    const auto state = temp.path / "state";
+    const auto stage = temp.path / "stage";
+    std::filesystem::create_directory(home);
+    std::filesystem::create_directory(state);
+    std::filesystem::create_directories(stage / "bin");
+    std::ofstream(stage / "bin/demo") << "original";
+    CapturingRunner runner;
+    auto first = install_user(runner, stage, home, state, example_receipt());
+    ASSERT_TRUE(first);
+    std::filesystem::remove(stage / "bin/demo");
+    std::ofstream(stage / "bin/other") << "other";
+    auto other = example_receipt();
+    other.id = "other";
+    auto second = install_user(runner, stage, home, state, other);
+    ASSERT_TRUE(second);
+    std::ofstream(stage / "bin/demo") << "upgrade";
+    auto next = example_receipt();
+    next.commit = std::string(40, 'b');
+    auto result = upgrade_user(runner, stage, home, state, *first, next);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, "install-owned-conflict");
+    std::ifstream input(home / ".local/bin/demo");
+    std::string value;
+    input >> value;
+    EXPECT_EQ(value, "original");
+    EXPECT_TRUE(std::filesystem::exists(state / "braurser/manual/receipts/test-receipt.json"));
+}
+
+TEST(ManualInstall, HashesMultipleChunksDuringUpgradeAndRemoval) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    const auto home = temp.path / "home";
+    const auto state = temp.path / "state";
+    const auto stage = temp.path / "stage";
+    std::filesystem::create_directory(home);
+    std::filesystem::create_directory(state);
+    std::filesystem::create_directories(stage / "bin");
+    std::ofstream(stage / "bin/demo") << std::string(3 * 65536 + 17, 'a');
+    CapturingRunner runner;
+    auto first = install_user(runner, stage, home, state, example_receipt());
+    ASSERT_TRUE(first);
+    std::ofstream(stage / "bin/demo") << std::string(2 * 65536 + 3, 'b');
+    auto next = example_receipt();
+    next.commit = std::string(40, 'b');
+    auto upgraded = upgrade_user(runner, stage, home, state, *first, next);
+    ASSERT_TRUE(upgraded);
+    auto removed = remove_user(runner, home, state, *upgraded);
+    ASSERT_TRUE(removed);
+    EXPECT_TRUE(removed->modified_files.empty());
+    EXPECT_FALSE(std::filesystem::exists(home / ".local/bin/demo"));
 }
 
 TEST(ManualInstall, RestoresPreexistingFileOnRemoval) {

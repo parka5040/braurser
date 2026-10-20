@@ -166,6 +166,7 @@ AppWindow::AppWindow(Models& models, const p::Copy& copy, Platform& platform, in
     shell_->set_vexpand(true);
     root_.append(*shell_);
     set_child(root_);
+    subscriptions_.push_back(p::bind_page_retention(models_.shell, models_.details, models_.installed));
     observe(models_.shell); observe(models_.discover); observe(models_.search); observe(models_.details);
     observe(models_.variants); observe(models_.confirm); observe(models_.activity); observe(models_.updates);
     observe(models_.installed); observe(models_.git); observe(models_.settings); observe(models_.first);
@@ -453,7 +454,9 @@ void AppWindow::search_page() {
     if (state.total) { label(body_, copy_.text("search.results", {{"count", static_cast<std::int64_t>(*state.total)}})); }
     if (!state.loading && !state.error && state.results.empty()) { empty(body_, p::empty_search(state.query.text)); button(body_, "filter.clear", [this] { models_.search.filters({}); }); }
     for (const auto& package : state.results) { package_card(body_, package); }
-    if (state.next_cursor) { button(body_, "action.next", [this] { models_.search.next_page(); }); }
+    if (!state.results.empty()) { label(body_, copy_.text("search.range", {{"first", static_cast<std::int64_t>(state.visible_first)}, {"last", static_cast<std::int64_t>(state.visible_last)}})); }
+    if (state.has_previous) { button(body_, "search.previous", [this] { models_.search.previous_page(); }, !state.loading); }
+    if (state.has_next) { button(body_, "search.next", [this] { models_.search.next_page(); }, !state.loading); }
 }
 
 void AppWindow::package_card(Gtk::Box& box, const wire::PackageSummary& package) {
@@ -521,7 +524,7 @@ void AppWindow::details_page() {
     auto* heading = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 12);
     const auto path = package.appMetadata && package.appMetadata->icon_path ? *package.appMetadata->icon_path :
         state.summary ? state.summary->iconPath.value_or("") : "";
-    if (const auto texture = kit::app_icon_texture(path)) {
+    if (const auto texture = kit::app_icon_texture(path, std::clamp(get_scale_factor(), 1, 4))) {
         auto* icon = Gtk::make_managed<Gtk::Image>(texture);
         icon->set_pixel_size(64); icon->set_size_request(64, 64);
         icon->property_accessible_role() = Gtk::Accessible::Role::PRESENTATION;
@@ -681,7 +684,9 @@ void AppWindow::updates_page() {
         body_.append(*heading);
         auto* rows = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::VERTICAL, 12);
         rows->add_css_class("card");
-        for (const auto& item : group.items) {
+        for (const auto& index : group.items) {
+            const std::array lists{&state.report->official, &state.report->community, &state.report->manual};
+            const auto& item = lists[index.source]->at(index.item);
             if (rows->get_first_child()) { rows->append(*Gtk::make_managed<Gtk::Separator>()); }
             auto* row = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 12);
             auto* details = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::VERTICAL, 4);
@@ -694,9 +699,9 @@ void AppWindow::updates_page() {
             if (item.source.value == "community" || item.source.value == "git") {
                 const auto blocker = models_.updates.item_blocker();
                 if (blocker) { label(*details, blocker->render(copy_)).add_css_class("secondary"); }
-                auto& update = button(*row, "updates.item_update", [this, item] {
-                    if (item.source.value == "git") { models_.git.upgrade(item.package.name); navigate(p::Destination::Git); }
-                    else { models_.updates.plan_item("community", item.package.name); update_plan_pending_ = true; }
+                auto& update = button(*row, "updates.item_update", [this, id = item.package.name, manual = item.source.value == "git"] {
+                    if (manual) { models_.git.upgrade(id); navigate(p::Destination::Git); }
+                    else { models_.updates.plan_item("community", id); update_plan_pending_ = true; }
                 }, models_.updates.can_update() && !blocker);
                 update.set_valign(Gtk::Align::CENTER);
             }
@@ -746,8 +751,17 @@ void AppWindow::show_confirm() {
     }, models_.confirm.can_confirm(), true);
     if (plan.requires_build_review) {
         label(box, copy_.text("detail.build_review"));
-        if (!state.build_files.empty() && state.build_files.size() == plan.build_review_refs.size()) {
-            for (const auto& build : state.build_files) { for (const auto& file : build.files) { label(box, file.name); code(box, file.text); } }
+        if (state.pending_build_files == 0 && !state.build_files.empty() && state.build_files.size() == (plan.build_pins.empty() ? plan.build_review_refs.size() : plan.build_pins.size())) {
+            for (const auto& build : state.build_files) {
+                label(box, build.packageBase);
+                for (const auto& file : build.files) { if (file.kind == "text") { label(box, file.name); code(box, file.text); } }
+                bool heading = false;
+                for (const auto& file : build.files) {
+                    if (file.kind != "binary") { continue; }
+                    if (!heading) { label(box, copy_.text("detail.build_binary")); heading = true; }
+                    label(box, copy_.text("detail.build_binary_file", {{"file", file.name}, {"size", copy_.size(file.size)}, {"sha256", file.sha256.substr(0, 12)}}));
+                }
+            }
             check(box, "confirm.build_ack", state.build_acknowledged, [this, target = &submit](bool value) { models_.confirm.acknowledge_build(value); target->set_sensitive(models_.confirm.can_confirm()); });
         } else { label(box, copy_.text("detail.build_unavailable")); }
     }

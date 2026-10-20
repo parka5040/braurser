@@ -3,6 +3,10 @@
 #include <gtest/gtest.h>
 #include <string>
 #include <vector>
+#include <arpa/inet.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 namespace braurser::daemon::core {
 namespace {
@@ -112,6 +116,33 @@ TEST(Http, RejectsOversizedFakeResponse) {
     auto input = request();
     input.max_bytes = 1;
     EXPECT_FALSE(client.get(input));
+}
+
+TEST(Http, DefaultGuardRefusesLoopbackUnlessExplicitlyAllowed) {
+    const int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (listener < 0) GTEST_SKIP() << "network sockets denied by sandbox";
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 || listen(listener, 4) != 0) {
+        close(listener);
+        GTEST_SKIP() << "loopback listening denied by sandbox";
+    }
+    socklen_t length = sizeof(address);
+    ASSERT_EQ(getsockname(listener, reinterpret_cast<sockaddr*>(&address), &length), 0);
+    auto input = request("https://127.0.0.1:" + std::to_string(ntohs(address.sin_port)) + "/");
+    input.allowed_hosts = {"127.0.0.1"};
+    input.timeout = std::chrono::milliseconds(100);
+    CurlHttpClient client;
+    EXPECT_FALSE(client.get(input));
+    pollfd entry{listener, POLLIN, 0};
+    EXPECT_EQ(poll(&entry, 1, 0), 0);
+    input.allow_private_addresses = true;
+    EXPECT_FALSE(client.get(input));
+    EXPECT_EQ(poll(&entry, 1, 0), 1);
+    const int accepted = accept4(listener, nullptr, nullptr, SOCK_CLOEXEC);
+    if (accepted >= 0) close(accepted);
+    close(listener);
 }
 
 TEST(Http, DISABLED_LiveArchWiki) {

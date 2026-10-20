@@ -1,3 +1,5 @@
 {
-  "packageId": "sample"
+  "packageId": "sample",
+  "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "path": "PKGBUILD"
 }

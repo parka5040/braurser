@@ -5,13 +5,74 @@
 #include <gtest/gtest.h>
 #include <array>
 #include <cstddef>
+#include <cstdlib>
+#include <cstdio>
+#include <new>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <variant>
 
+namespace {
+
+thread_local bool count_allocations = false;
+thread_local std::size_t allocation_count = 0;
+thread_local std::size_t large_allocation_count = 0;
+
+}
+
+[[gnu::noinline]] void* operator new(std::size_t size) {
+    if (count_allocations) {
+        ++allocation_count;
+        if (size >= 256 * 1024) ++large_allocation_count;
+    }
+    if (void* memory = std::malloc(size == 0 ? 1 : size)) return memory;
+    throw std::bad_alloc();
+}
+
+[[gnu::noinline]] void* operator new[](std::size_t size) { return ::operator new(size); }
+[[gnu::noinline]] void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+    try { return ::operator new(size); } catch (const std::bad_alloc&) { return nullptr; }
+}
+[[gnu::noinline]] void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
+    try { return ::operator new(size); } catch (const std::bad_alloc&) { return nullptr; }
+}
+[[gnu::noinline]] void operator delete(void* memory, const std::nothrow_t&) noexcept { std::free(memory); }
+[[gnu::noinline]] void operator delete[](void* memory, const std::nothrow_t&) noexcept { std::free(memory); }
+[[gnu::noinline]] void operator delete(void* memory) noexcept { std::free(memory); }
+[[gnu::noinline]] void operator delete[](void* memory) noexcept { std::free(memory); }
+[[gnu::noinline]] void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
+[[gnu::noinline]] void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
+
 namespace braurser::protocol {
 namespace {
+
+TEST(Protocol, LargeBuildFilesValidationAllocations) {
+    const nlohmann::json payload{{"packageBase", "demo"},
+        {"files", {{{"name", "PKGBUILD"}, {"text", std::string(448 * 1024, 'x')}, {"kind", "text"},
+                    {"size", 448 * 1024}, {"sha256", std::string(64, 'a')}}}}, {"truncated", false}};
+    allocation_count = 0;
+    large_allocation_count = 0;
+    count_allocations = true;
+    const bool accepted = accepts<BuildFilesResult>(payload);
+    count_allocations = false;
+    const auto allocations = allocation_count;
+    const auto copies = large_allocation_count;
+    EXPECT_TRUE(accepted);
+    EXPECT_EQ(allocations, 0U);
+    EXPECT_EQ(copies, 0U);
+    std::printf("BuildFilesResult validation: %zu allocations, %zu payload-sized copies\n", allocations, copies);
+    for (const auto& descriptor : kMethods) {
+        if (descriptor.result_type != "BuildFilesResult") continue;
+        allocation_count = 0;
+        count_allocations = true;
+        const bool result = descriptor.validate_result(payload);
+        count_allocations = false;
+        const auto descriptor_allocations = allocation_count;
+        EXPECT_TRUE(result);
+        EXPECT_EQ(descriptor_allocations, 0U);
+    }
+}
 
 nlohmann::json fixture(std::string_view name, std::string_view suffix) {
     const auto path = std::filesystem::path(PROTOCOL_FIXTURES) /
@@ -27,6 +88,100 @@ void check_fixture(std::string_view name, std::string_view suffix) {
     const auto typed = original.get<T>();
     const nlohmann::json encoded = typed;
     EXPECT_EQ(encoded, original);
+}
+
+template <class T>
+bool parser_accepts(const nlohmann::json& value) {
+    try {
+        static_cast<void>(value.get<T>());
+        return true;
+    } catch (const nlohmann::json::exception&) {
+        return false;
+    } catch (const std::invalid_argument&) {
+        return false;
+    }
+}
+
+template <class T>
+void check_validation(std::string_view name, std::string_view suffix) {
+    const auto original = fixture(name, suffix);
+    EXPECT_TRUE(accepts<T>(original));
+    auto unknown = original;
+    unknown["unexpected"] = false;
+    EXPECT_FALSE(accepts<T>(unknown));
+    auto over_limit = original;
+    for (unsigned index = 0; index <= 256; ++index) over_limit["field" + std::to_string(index)] = false;
+    EXPECT_FALSE(accepts<T>(over_limit));
+    for (auto field = original.begin(); field != original.end(); ++field) {
+        SCOPED_TRACE(field.key());
+        auto missing = original;
+        missing.erase(field.key());
+        EXPECT_EQ(accepts<T>(missing), parser_accepts<T>(missing));
+        const std::array<nlohmann::json, 12> replacements{{
+            nullptr, true, -1, 0, 201, 1.5, "unexpected", std::string(4097, 'x'),
+            nlohmann::json::array(), nlohmann::json::object(),
+            nlohmann::json::array_t(257, nullptr), std::string("bad\x01", 4)
+        }};
+        for (const auto& replacement : replacements) {
+            auto changed = original;
+            changed[field.key()] = replacement;
+            EXPECT_EQ(accepts<T>(changed), parser_accepts<T>(changed));
+        }
+    }
+}
+
+TEST(Protocol, EveryDescriptorRejectsUnknownFieldsAndLimitsAndMatchesParsing) {
+#define CHECK_VALIDATION(name, params, result) \
+    { SCOPED_TRACE(name); check_validation<params>(name, "params"); check_validation<result>(name, "result"); }
+    BRAURSER_PROTOCOL_METHODS(CHECK_VALIDATION)
+#undef CHECK_VALIDATION
+#define CHECK_VALIDATION(name, params) \
+    { SCOPED_TRACE(name); check_validation<params>(name, "params"); }
+    BRAURSER_PROTOCOL_NOTIFICATIONS(CHECK_VALIDATION)
+#undef CHECK_VALIDATION
+}
+
+TEST(Protocol, LargeBuildReviewSerializationOnlyAllocatesTheWireString) {
+    BuildReviewQuestion review;
+    review.pkgbuild = std::string(256 * 1024, 'x');
+    large_allocation_count = 0;
+    count_allocations = true;
+    const nlohmann::json encoded = review;
+    count_allocations = false;
+    const auto copies = large_allocation_count;
+    EXPECT_EQ(copies, 1U);
+    EXPECT_EQ(encoded.at("pkgbuild").get_ref<const std::string&>().size(), 256 * 1024U);
+    review.pkgbuild = std::string(256 * 1024 + 1, 'x');
+    EXPECT_THROW(static_cast<void>(nlohmann::json(review)), std::invalid_argument);
+}
+
+TEST(Protocol, TaggedValidationDoesNotCopyPayloadOrLeakEnvelopeKeys) {
+    auto payload = fixture("job.question", "params");
+    payload["question"] = {{"question_id", "question"}, {"token", "token"},
+        {"expires_at", "2026-09-25T00:00:00Z"}, {"kind", "build_review"},
+        {"refs", nlohmann::json::array()}, {"pkgbuild", std::string(256 * 1024, 'x')}};
+    allocation_count = 0;
+    count_allocations = true;
+    const bool accepted = accepts<JobQuestionNotification>(payload);
+    count_allocations = false;
+    const auto allocations = allocation_count;
+    EXPECT_TRUE(accepted);
+    EXPECT_EQ(allocations, 0U);
+    large_allocation_count = 0;
+    count_allocations = true;
+    const auto parsed = payload.get<JobQuestionNotification>();
+    count_allocations = false;
+    const auto copies = large_allocation_count;
+    EXPECT_EQ(copies, 1U);
+    EXPECT_EQ(std::get<BuildReviewQuestion>(parsed.question.choice.value).pkgbuild->size(), 256 * 1024U);
+    payload["question"]["unexpected"] = true;
+    EXPECT_FALSE(accepts<JobQuestionNotification>(payload));
+    payload["question"].erase("unexpected");
+    payload["question"]["pkgbuild"] = std::string(256 * 1024 + 1, 'x');
+    EXPECT_FALSE(accepts<JobQuestionNotification>(payload));
+    EXPECT_FALSE(accepts<BuildReviewQuestion>({{"refs", nlohmann::json::array()}, {"kind", "build_review"}}));
+    EXPECT_FALSE(accepts<Inline>({{"kind", "text"}, {"s", "text"}, {"question_id", "q"}}));
+    EXPECT_FALSE(accepts<QuestionChoice>(payload.at("question")));
 }
 
 TEST(Protocol, EveryMethodAndNotificationHasRoundTripFixture) {
@@ -69,6 +224,71 @@ TEST(Protocol, PlansRequireBoundApprovalAndRejectLooseMutationInputs) {
     search["sort"] = "name";
     search["category"] = "Utility";
     EXPECT_TRUE(accepts<SearchParams>(search));
+}
+
+TEST(Protocol, BuildPinsAndPinnedFileRequestsValidateExactly) {
+    for (const auto length : {40U, 64U}) {
+        const BuildPin pin{"widget", {"widget", "widget-libs"}, std::string(length, 'a')};
+        const nlohmann::json wire = pin;
+        EXPECT_EQ(wire.get<BuildPin>().commit, pin.commit);
+        EXPECT_TRUE(accepts<BuildFilesParams>(nlohmann::json(BuildFilesParams{"widget", pin.commit})));
+        auto plan = fixture("jobs.plan", "result");
+        plan["build_pins"] = nlohmann::json::array({wire});
+        EXPECT_TRUE(accepts<TransactionPlan>(plan));
+        plan["build_pins"] = nlohmann::json::array();
+        for (unsigned index = 0; index < 17; ++index)
+            plan["build_pins"].push_back(BuildPin{"widget" + std::to_string(index), {"widget"}, pin.commit});
+        EXPECT_FALSE(accepts<TransactionPlan>(plan));
+    }
+    for (const auto& commit : {std::string(39, 'a'), std::string(40, 'A'), std::string(64, 'g')}) {
+        const nlohmann::json wire{{"pkgbase", "widget"}, {"pkgnames", {"widget"}}, {"commit", commit}};
+        EXPECT_FALSE(accepts<BuildPin>(wire));
+        EXPECT_FALSE(accepts<BuildFilesParams>(nlohmann::json{{"packageId", "widget"}, {"commit", commit}}));
+    }
+    nlohmann::json wire{{"pkgbase", "../widget"}, {"pkgnames", {"widget"}}, {"commit", std::string(40, 'a')}};
+    EXPECT_FALSE(accepts<BuildPin>(wire));
+    wire["pkgbase"] = "widget";
+    wire["pkgnames"] = {"bad/name"};
+    EXPECT_FALSE(accepts<BuildPin>(wire));
+    EXPECT_TRUE(accepts<BuildFilesParams>(nlohmann::json{{"packageId", "widget"}}));
+}
+
+TEST(Protocol, BuildFileKindsPathsAndBudgetsFailClosed) {
+    const BuildFilesParams params{"widget", std::string(40, 'a'), "sub/build.sh"};
+    const nlohmann::json request = params;
+    EXPECT_EQ(request.get<BuildFilesParams>().path, params.path);
+    for (const auto* path : {"", "/absolute", "../escape", "sub/../escape", "sub//file", "sub/", "sub\\file"}) {
+        auto invalid = request;
+        invalid["path"] = path;
+        EXPECT_FALSE(accepts<BuildFilesParams>(invalid)) << path;
+    }
+    auto invalid = request;
+    invalid.erase("commit");
+    EXPECT_FALSE(accepts<BuildFilesParams>(invalid));
+    for (const auto* kind : {"text", "binary", "omitted"}) {
+        const BuildFile file{"sub/build.sh", std::string_view(kind) == "text" ? "x" : "", kind, 1, std::string(64, 'a')};
+        const nlohmann::json wire = file;
+        EXPECT_EQ(wire.get<BuildFile>().kind, kind);
+        EXPECT_TRUE(accepts<BuildFile>(wire));
+        for (const auto* field : {"kind", "size", "sha256"}) {
+            auto missing = wire; missing.erase(field);
+            EXPECT_FALSE(accepts<BuildFile>(missing));
+        }
+    }
+    auto file = nlohmann::json(BuildFile{"build.sh", "x", "text", 1, std::string(64, 'a')});
+    for (const auto* digest : {"", "abcd", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"}) {
+        auto bad = file; bad["sha256"] = digest; EXPECT_FALSE(accepts<BuildFile>(bad));
+    }
+    auto bad = file; bad["kind"] = "placeholder"; EXPECT_FALSE(accepts<BuildFile>(bad));
+    bad = file; bad["name"] = "../build.sh"; EXPECT_FALSE(accepts<BuildFile>(bad));
+    bad = file; bad["size"] = -1; EXPECT_FALSE(accepts<BuildFile>(bad));
+    bad = file; bad["size"] = 2; EXPECT_FALSE(accepts<BuildFile>(bad));
+    bad = file; bad["kind"] = "binary"; EXPECT_FALSE(accepts<BuildFile>(bad));
+    bad = file; bad["size"] = 448 * 1024 + 1; bad["text"] = std::string(448 * 1024 + 1, 'x');
+    EXPECT_FALSE(accepts<BuildFile>(bad));
+    EXPECT_THROW(validate_wire(nlohmann::json{{"text", std::string(512 * 1024, 'x')}}), std::invalid_argument);
+    const nlohmann::json duplicate{{"packageBase", "widget"}, {"files", {file, file}}, {"truncated", false}};
+    EXPECT_FALSE(accepts<BuildFilesResult>(duplicate));
 }
 
 TEST(Protocol, ShadowedRepositoriesAndRefreshStateRoundTrip) {
@@ -174,6 +394,29 @@ TEST(Protocol, EnvelopeDistinguishesRequestResponseAndNotification) {
     parsed = parse_message(serialize_message(Message(note)));
     ASSERT_TRUE(parsed.has_value());
     EXPECT_TRUE(std::holds_alternative<Notification>(*parsed));
+}
+
+TEST(Protocol, EnvelopePayloadsSurviveParsedDomDestruction) {
+    const Request request{std::string("request"), "catalog.search", fixture("catalog.search", "params")};
+    auto parsed = parse_message(serialize_message(request));
+    ASSERT_TRUE(parsed);
+    EXPECT_EQ(std::get<Request>(*parsed).params, request.params);
+    const Notification notification{"job.log", JobLogNotification{"job", 1, std::string(4000, 'x')}};
+    parsed = parse_message(serialize_message(notification));
+    ASSERT_TRUE(parsed);
+    EXPECT_EQ(std::get<Notification>(*parsed).params, notification.params);
+    nlohmann::json payload = nlohmann::json::array();
+    for (int i = 0; i < 64; ++i) payload.push_back({{"text", std::string(4000, 'x')}, {"index", i}});
+    parsed = parse_message(serialize_message(Response{std::string("response"), payload}));
+    ASSERT_TRUE(parsed);
+    EXPECT_EQ(std::get<nlohmann::json>(std::get<Response>(*parsed).outcome), payload);
+}
+
+TEST(Protocol, SerializationRevalidatesNodeAndStringBudgets) {
+    const Response excessive{1, nlohmann::json{{"body", std::string(512 * 1024 + 1, 'x')}}};
+    EXPECT_THROW(serialize_message(excessive), std::invalid_argument);
+    const Request unknown{1, "unknown.method", nlohmann::json::object()};
+    EXPECT_THROW(serialize_message(unknown), std::invalid_argument);
 }
 
 TEST(Protocol, EnvelopeRejectsMalformedOrUntrustedInputs) {

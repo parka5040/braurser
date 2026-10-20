@@ -14,6 +14,59 @@
 namespace braurser::daemon::wiki {
 namespace {
 
+bool tag_equal(std::string_view left, std::string_view right) {
+    return left.size() == right.size() && std::equal(left.begin(), left.end(), right.begin(), [](char a, char b) {
+        return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
+    });
+}
+
+bool bounded_nesting(std::string_view html) {
+    constexpr std::string_view void_tags[]{"area", "base", "br", "col", "embed", "hr", "img",
+                                           "input", "link", "meta", "source", "track", "wbr"};
+    std::vector<std::string_view> stack;
+    std::string_view raw_tag;
+    std::size_t cursor = 0;
+    while ((cursor = html.find('<', cursor)) != std::string_view::npos) {
+        const auto start = cursor++;
+        if (raw_tag.empty() && html.substr(start, 4) == "<!--") {
+            const auto end = html.find("-->", start + 4);
+            if (end == std::string_view::npos) break;
+            cursor = end + 3;
+            continue;
+        }
+        const bool closing = cursor < html.size() && html[cursor] == '/';
+        if (closing) ++cursor;
+        const auto name_start = cursor;
+        while (cursor < html.size() && (std::isalnum(static_cast<unsigned char>(html[cursor])) ||
+               html[cursor] == '-' || html[cursor] == ':')) ++cursor;
+        const auto name = html.substr(name_start, cursor - name_start);
+        if (!raw_tag.empty() && (!closing || !tag_equal(name, raw_tag))) continue;
+        if (name.empty() && (cursor == html.size() || (html[cursor] != '!' && html[cursor] != '?'))) continue;
+        char quote = '\0';
+        for (; cursor < html.size(); ++cursor) {
+            const char c = html[cursor];
+            if (quote) { if (c == quote) quote = '\0'; }
+            else if (c == '\'' || c == '"') quote = c;
+            else if (c == '>') break;
+        }
+        if (cursor == html.size()) break;
+        const bool self_closing = cursor > start && html[cursor - 1] == '/';
+        ++cursor;
+        if (name.empty()) continue;
+        if (closing) {
+            if (!stack.empty() && tag_equal(stack.back(), name)) stack.pop_back();
+            raw_tag = {};
+            continue;
+        }
+        if (self_closing || std::any_of(std::begin(void_tags), std::end(void_tags),
+                                        [name](auto tag) { return tag_equal(name, tag); })) continue;
+        stack.push_back(name);
+        if (stack.size() > 1024) return false;
+        if (tag_equal(name, "script") || tag_equal(name, "style")) raw_tag = name;
+    }
+    return true;
+}
+
 std::string clean(std::string_view input) {
     std::string result;
     result.reserve(std::min(input.size(), max_block_text));
@@ -114,18 +167,19 @@ std::optional<std::string> safe_link(std::string_view href) {
     return result;
 }
 
-void append_text(std::vector<Inline>& out, std::string_view raw, bool em, bool strong, bool code) {
+void append_text(std::vector<Inline>& out, std::size_t& bytes, std::string_view raw, bool em, bool strong, bool code) {
     const bool leading = !raw.empty() && std::isspace(static_cast<unsigned char>(raw.front()));
     const bool trailing = !raw.empty() && std::isspace(static_cast<unsigned char>(raw.back()));
     auto value = clean(raw);
     if (leading && !out.empty()) {
         auto& last = out.back();
         if (auto* text = std::get_if<Text>(&last)) {
-            if (!text->s.empty() && text->s.back() != ' ') text->s += ' ';
+            if (!text->s.empty() && text->s.back() != ' ') { text->s += ' '; ++bytes; }
         } else value.insert(value.begin(), ' ');
     }
     if (trailing && !value.empty() && value.back() != ' ') value += ' ';
     if (value.empty()) return;
+    bytes += value.size();
     if (!out.empty()) {
         if (auto* last = std::get_if<Text>(&out.back()); last && last->emphasis == em &&
             last->strong == strong && last->code == code) {
@@ -136,25 +190,27 @@ void append_text(std::vector<Inline>& out, std::string_view raw, bool em, bool s
     out.emplace_back(Text{std::move(value), em, strong, code});
 }
 
-void walk_inline(const GumboNode* node, std::vector<Inline>& out, unsigned depth,
+void walk_inline(const GumboNode* node, std::vector<Inline>& out, std::size_t& bytes, unsigned depth,
                  bool em = false, bool strong = false, bool code = false, bool include_lists = false) {
-    if (depth > 96 || excluded(node) || inline_text(out).size() >= max_block_text) return;
+    if (depth > 96 || excluded(node) || bytes >= max_block_text) return;
     if (node->type == GUMBO_NODE_TEXT || node->type == GUMBO_NODE_WHITESPACE || node->type == GUMBO_NODE_CDATA) {
-        append_text(out, node->v.text.text, em, strong, code);
+        append_text(out, bytes, node->v.text.text, em, strong, code);
         return;
     }
     if (node->type == GUMBO_NODE_ELEMENT) {
         const auto tag = node->v.element.tag;
         if (tag == GUMBO_TAG_A) {
             std::vector<Inline> label;
+            std::size_t label_bytes = 0;
             if (const auto* kids = children(node)) {
                 for (unsigned i = 0; i < kids->length; ++i)
-                    walk_inline(static_cast<GumboNode*>(kids->data[i]), label, depth + 1, em, strong, code, include_lists);
+                    walk_inline(static_cast<GumboNode*>(kids->data[i]), label, label_bytes, depth + 1, em, strong, code, include_lists);
             }
             auto text = clean(inline_text(label));
             if (auto link = safe_link(attribute(node, "href")); link && !text.empty()) {
+                bytes += text.size();
                 out.emplace_back(Link{std::move(text), std::move(*link)});
-            } else append_text(out, text, em, strong, code);
+            } else append_text(out, bytes, text, em, strong, code);
             return;
         }
         em |= tag == GUMBO_TAG_EM || tag == GUMBO_TAG_I;
@@ -162,22 +218,23 @@ void walk_inline(const GumboNode* node, std::vector<Inline>& out, unsigned depth
         code |= tag == GUMBO_TAG_CODE;
         if ((tag == GUMBO_TAG_UL || tag == GUMBO_TAG_OL) && !include_lists) return;
         if (tag == GUMBO_TAG_LI && include_lists && !out.empty())
-            append_text(out, " ", em, strong, code);
+            append_text(out, bytes, " ", em, strong, code);
     }
     if (const auto* kids = children(node)) {
-        for (unsigned i = 0; i < kids->length && inline_text(out).size() < max_block_text; ++i)
-            walk_inline(static_cast<GumboNode*>(kids->data[i]), out, depth + 1, em, strong, code, include_lists);
+        for (unsigned i = 0; i < kids->length && bytes < max_block_text; ++i)
+            walk_inline(static_cast<GumboNode*>(kids->data[i]), out, bytes, depth + 1, em, strong, code, include_lists);
     }
 }
 
 std::vector<Inline> bounded_inline(const GumboNode* node, unsigned depth, bool include_lists = false) {
     std::vector<Inline> raw;
-    walk_inline(node, raw, depth, false, false, false, include_lists);
+    std::size_t bytes = 0;
+    walk_inline(node, raw, bytes, depth, false, false, false, include_lists);
     std::vector<Inline> result;
     std::size_t used = 0;
     for (auto& part : raw) {
         if (used >= max_block_text) break;
-        const auto value = std::visit([](const auto& v) -> const std::string& {
+        const auto& value = std::visit([](const auto& v) -> const std::string& {
             if constexpr (requires { v.s; }) return v.s;
             else return v.label;
         }, part);
@@ -336,7 +393,7 @@ std::string inline_text(const std::vector<Inline>& inlines) {
 
 Document sanitize(std::string_view html) {
     Document result;
-    if (html.size() > 2 * 1024 * 1024) return result;
+    if (html.size() > 2 * 1024 * 1024 || !bounded_nesting(html)) return result;
     auto* raw = gumbo_parse_with_options(&kGumboDefaultOptions, html.data(), html.size());
     if (!raw) return result;
     auto tree = std::unique_ptr<GumboOutput, void(*)(GumboOutput*)>(raw, [](GumboOutput* output) {

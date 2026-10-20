@@ -125,6 +125,33 @@ TEST(GtkAppPolish, DiscoverCardsReflowAndSearchHasInlineControls) {
     EXPECT_EQ(contents(window).find(copy.text("source.foreign")), std::string::npos);
 }
 
+TEST(GtkAppPolish, SearchWindowShowsPreviousNextAndOnlyTwoHundredRows) {
+    if (!test::display_available()) { GTEST_SKIP() << "No GTK display"; }
+    const auto application = Gtk::Application::create({}, Gio::Application::Flags::NON_UNIQUE);
+    application->register_application();
+    MainDispatcher dispatcher; MainTimer timer; TestPlatform platform; p::Copy copy;
+    FakeServer server(dispatcher); Models models(server, timer);
+    protocol::SearchResult page;
+    page.packages.assign(50, p::fixtures::data().packages.front()); page.nextCursor = "next";
+    server.reply("catalog.search", page);
+    models.shell.navigate({p::Destination::Search, {}, 0}); models.search.submit(); dispatcher.drain();
+    AppWindow window(models, copy, platform); application->add_window(window);
+    for (int index = 0; index < 4; ++index) {
+        models.search.next_page(); dispatcher.drain(); window.render();
+    }
+    EXPECT_EQ(widgets<kit::AppCard>(window).size(), 200U);
+    EXPECT_EQ(buttons(window, copy.text("search.next")), 1U);
+    EXPECT_EQ(buttons(window, copy.text("search.previous")), 1U);
+    EXPECT_EQ(models.search.state().visible_first, 51U);
+    for (auto* button : widgets<Gtk::Button>(window)) {
+        if (contents(*button) == copy.text("search.previous") + '\n') { g_signal_emit_by_name(button->gobj(), "clicked"); break; }
+    }
+    dispatcher.drain(); window.render();
+    EXPECT_EQ(models.search.state().visible_first, 1U);
+    EXPECT_EQ(buttons(window, copy.text("search.previous")), 0U);
+    EXPECT_EQ(widgets<kit::AppCard>(window).size(), 200U);
+}
+
 TEST(GtkAppUpdates, OnlyCommunityAndGitHaveIndividualActions) {
     if (!test::display_available()) { GTEST_SKIP() << "No GTK display"; }
     const auto application = Gtk::Application::create({}, Gio::Application::Flags::NON_UNIQUE);

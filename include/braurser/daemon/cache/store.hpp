@@ -32,6 +32,15 @@ public:
     std::expected<void, catalog::CatalogError> add(const catalog::InstalledPackage& package) override;
     /// in: source contains validated refresh state.
     std::expected<void, catalog::CatalogError> add(const catalog::SourceState& source) override;
+    /// pre: begin succeeded; savepoints may not be nested.
+    /// out: marks a rollback boundary within the current snapshot.
+    std::expected<void, catalog::CatalogError> savepoint();
+    /// pre: a savepoint is active.
+    /// out: keeps records since the savepoint and removes the boundary.
+    std::expected<void, catalog::CatalogError> release_savepoint();
+    /// pre: a savepoint is active and no storage failure occurred.
+    /// out: removes records since the boundary, leaving it active.
+    std::expected<void, catalog::CatalogError> rollback_to_savepoint();
     /// out: validates and atomically replaces the active snapshot.
     std::expected<void, catalog::CatalogError> commit() override;
     /// out: discards the uncommitted snapshot.

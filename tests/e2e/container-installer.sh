@@ -45,4 +45,12 @@ test ! -e /usr/local/share/braurser/restart-rules.json
 test ! -e /usr/local/share/icons/hicolor/scalable/apps/braurser.svg
 test ! -e /home/builder/.config/autostart/braurser-notifier.desktop
 test "$(sha256sum /usr/local/share/applications/braurser.desktop)" = "$original"
-printf 'Installer, repeat install and uninstall passed.\n'
+runuser -u builder -- mkdir -p /home/builder/untrusted-prefix
+if refused=$(runuser -u builder -- ./install.sh --prefix /home/builder/untrusted-prefix/local --yes --skip-tests 2>&1); then
+    printf 'Installer accepted a prefix under a user-owned directory.\n' >&2
+    exit 1
+fi
+[[ $refused == *'A folder in this path is not root-owned:'* ]]
+test ! -e /home/builder/untrusted-prefix/local/bin/braurser
+test ! -e /var/lib/braurser/install-manifest.tsv
+printf 'Installer, repeat install, uninstall and untrusted prefix refusal passed.\n'

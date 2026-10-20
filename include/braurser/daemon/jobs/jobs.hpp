@@ -2,6 +2,8 @@
 #define BRAURSER_DAEMON_JOBS_JOBS_HPP
 
 #include <braurser/daemon/jobs/process.hpp>
+#include <braurser/daemon/jobs/srcinfo.hpp>
+#include <braurser/daemon/catalog/sources.hpp>
 #include <braurser/daemon/api/services.hpp>
 #include <braurser/daemon/core/files.hpp>
 #include <braurser/daemon/elevation/selector.hpp>
@@ -24,12 +26,28 @@ namespace braurser::daemon::jobs {
 using Error = protocol::ErrorObject;
 template<class T> using Result = std::expected<T, Error>;
 
+struct AurPin {
+    std::string pkgbase;
+    std::vector<std::string> pkgnames;
+    std::string commit;
+    std::string tree;
+    std::string srcinfo;
+    bool target{};
+    bool dynamic_version{};
+    std::vector<std::pair<std::string, Dependency>> constraints{};
+};
+
 struct Snapshot {
     protocol::TransactionPlan plan;
     std::string fingerprint;
     std::vector<std::string> targets;
     std::string planned_version;
     std::string helper{"auto"};
+    std::string expected_transaction;
+    std::vector<AurPin> aur_pins;
+    std::vector<std::string> official_deps;
+    std::vector<catalog::RepoPackage> aur_official;
+    std::vector<catalog::LocalRecord> aur_installed;
     protocol::PlanParams selection;
     std::optional<manual::Receipt> manual_receipt;
     std::optional<manual::Preview> manual_preview;
@@ -83,7 +101,7 @@ struct ElevationOptions {
 /// in: kind and validated targets identify one canonical privileged transaction.
 /// out: only helper-allowlisted argv and explicit environment, or an authorization error.
 Result<core::ProcessSpec> official_spec(std::string_view kind, const std::vector<std::string>& targets,
-                                        const ElevationOptions& elevation);
+                                        const ElevationOptions& elevation, std::string_view transaction = {});
 
 class ManualInstaller {
 public:
@@ -97,7 +115,9 @@ class JobRunner {
 public:
     using Factory = std::function<std::unique_ptr<StreamingProcess>()>;
     using Notify = std::function<void(std::string_view, const protocol::JobEvent&, api::ConnectionId)>;
-    using BuildSpec = std::function<Result<core::ProcessSpec>(const Snapshot&, std::string_view, const ElevationOptions&)>;
+    using Step = std::function<Result<core::ProcessSpec>()>;
+    struct Pipeline { std::vector<Step> steps; std::function<Result<void>(bool)> finish{}; };
+    using BuildSpec = std::function<Result<Pipeline>(const Snapshot&, std::string_view, const ElevationOptions&)>;
     using Verify = std::function<bool(const Snapshot&)>;
     using Classify = std::function<std::optional<helpers::PhaseEvent>(std::string_view)>;
     using Success = std::function<bool(const Snapshot&)>;
@@ -111,7 +131,7 @@ public:
     Result<protocol::JobIdResult> enqueue(std::string_view plan_id, std::string_view approval_token, api::ConnectionId owner,
                                           std::string_view requested_kind = {});
     /// in: job_id identifies a queued or running job on its owner connection.
-    /// out: cancellation refused once pacman has begun committing.
+    /// out: cancellation refused during pipeline root-helper steps or a single-step commit.
     Result<protocol::JobsCancelResult> cancel(std::string_view job_id, api::ConnectionId owner);
     /// in: job_id identifies a queued job belonging to owner.
     Result<protocol::JobsDequeueResult> dequeue(std::string_view job_id, api::ConnectionId owner);
@@ -136,9 +156,18 @@ private:
         std::deque<protocol::JobEvent> events;
         std::uint64_t next_sequence{};
         std::size_t log_count{};
+        std::size_t log_bytes{};
+        bool finished{};
+        bool enqueuing{};
         bool commit{};
+        bool privileged{};
+        bool mutated{};
         bool interrupted{};
         bool unexpected_prompt{};
+        bool missing_key{};
+        std::optional<Error> error;
+        Pipeline pipeline;
+        std::size_t step{};
         std::filesystem::path auth_marker;
         std::optional<protocol::Question> question;
         bool orphaned{};
@@ -160,17 +189,24 @@ private:
     std::map<std::string, Job, std::less<>> jobs_;
     std::deque<std::string> pending_;
     std::deque<std::string> finished_;
+    std::size_t finished_log_bytes_{};
     std::unique_ptr<StreamingProcess> process_;
     std::jthread manual_worker_;
     std::shared_ptr<int> lifetime_{std::make_shared<int>(0)};
     std::string active_;
     bool stopping_{};
+    bool pumping_{};
+    bool pump_again_{};
     void pump();
+    bool start_step(Job& job);
     void transition(Job& job, std::string_view state);
     void add_event(Job& job, std::string_view kind, nlohmann::json payload);
     void line(Job& job, std::string_view text);
     void complete(Job& job, const core::ProcessResult& result);
     void finish_job(Job& job);
+    void erase_event(Job& job, std::deque<protocol::JobEvent>::iterator event);
+    void trim_logs(Job& job, std::size_t budget);
+    void trim_finished_logs();
     void persist() const;
 };
 

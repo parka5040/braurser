@@ -26,10 +26,11 @@ public:
     Model(const Model&) = delete;
     Model& operator=(const Model&) = delete;
     const State& state() const { return state_; }
+    /// out: observes one immutable snapshot shared across callbacks; references last only for the call.
     Subscription observe(std::function<void(const State&)> callback) {
         if (!callback || observers_->callbacks.size() >= 128) { throw std::invalid_argument("invalid observer"); }
         const auto id = observers_->next++;
-        observers_->callbacks.emplace(id, std::move(callback));
+        observers_->callbacks.emplace(id, std::make_shared<std::function<void(const State&)>>(std::move(callback)));
         return Subscription([weak = std::weak_ptr<Observers>(observers_), id] {
             if (auto observers = weak.lock()) { observers->callbacks.erase(id); }
         });
@@ -37,10 +38,11 @@ public:
 protected:
     void changed() {
         const auto observers = observers_;
-        const auto snapshot = state_;
+        if (observers->callbacks.empty()) { return; }
+        const auto snapshot = std::make_shared<const State>(state_);
         const auto callbacks = observers->callbacks;
         for (const auto& [id, callback] : callbacks) {
-            if (observers->callbacks.contains(id)) { callback(snapshot); }
+            if (observers->callbacks.contains(id)) { (*callback)(*snapshot); }
         }
     }
     template<class Params, class Callback>
@@ -53,7 +55,7 @@ protected:
     std::shared_ptr<int> lifetime_;
 private:
     struct Observers {
-        std::map<std::uint64_t, std::function<void(const State&)>> callbacks;
+        std::map<std::uint64_t, std::shared_ptr<std::function<void(const State&)>>> callbacks;
         std::uint64_t next = 1;
     };
     std::shared_ptr<Observers> observers_;
@@ -155,6 +157,10 @@ struct SearchState {
     std::map<std::string, Text> source_errors;
     bool loading = false;
     bool stale = false;
+    bool has_previous = false;
+    bool has_next = false;
+    std::uint64_t visible_first = 0;
+    std::uint64_t visible_last = 0;
 };
 class Search final : public Model<SearchState> {
 public:
@@ -165,9 +171,15 @@ public:
     void sort(std::string value);
     void submit();
     void next_page();
+    /// out: re-fetches the page preceding the visible window, when available.
+    void previous_page();
     void facets();
 private:
-    void fetch(bool append);
+    void fetch(std::size_t page, bool prepend = false);
+    struct Page { std::optional<std::string> cursor; std::uint64_t start; std::size_t size; };
+    std::vector<Page> pages_;
+    std::size_t first_page_ = 0;
+    std::size_t last_page_ = 0;
     void invalidate();
     Rpc& rpc_;
     Timer& timer_;
@@ -206,6 +218,8 @@ class Details final : public Model<DetailsState> {
 public:
     explicit Details(Rpc& rpc);
     void load(std::string id);
+    /// out: releases inactive details and invalidates outstanding replies.
+    void release();
     void summary(protocol::PackageSummary value);
     void load_build_files();
     void load_wiki(bool refresh);
@@ -257,6 +271,7 @@ public:
     void request(protocol::PlanParams params);
     void submit();
 private:
+    void fetch_omitted(protocol::BuildFilesParams request, protocol::BuildFilesResult files, std::uint64_t generation);
     void completed(Reply<protocol::JobIdResult> reply);
     std::optional<protocol::PlanParams> request_;
     std::uint64_t generation_ = 0;
@@ -297,7 +312,8 @@ private:
     std::vector<Subscription> events_;
 };
 
-struct UpdateGroup { Text title; std::vector<protocol::UpdateItem> items; bool expanded = false; };
+struct UpdateIndex { std::size_t source; std::size_t item; };
+struct UpdateGroup { Text title; std::vector<UpdateIndex> items; bool expanded = false; };
 struct UpdatesState {
     std::optional<protocol::UpdateReport> report;
     std::array<UpdateGroup, 5> groups;
@@ -341,12 +357,18 @@ class Installed final : public Model<InstalledState> {
 public:
     explicit Installed(Rpc& rpc);
     void view(InstalledView view);
+    /// out: releases inactive lists and invalidates outstanding replies.
+    void release();
     void query(std::string query);
     void refresh();
 private:
     Rpc& rpc_;
     std::uint64_t generation_ = 0;
 };
+
+/// pre: shell, details and installed outlive the returned subscription
+/// out: releases inactive pages on navigation and reloads them on return
+Subscription bind_page_retention(Shell& shell, Details& details, Installed& installed);
 
 enum class GitStep { Url, Review, Scope, Progress };
 struct GitState {

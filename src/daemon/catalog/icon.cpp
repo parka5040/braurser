@@ -12,6 +12,12 @@
 namespace braurser::daemon::catalog {
 namespace {
 
+struct DecodeDirectory {
+    std::filesystem::path root;
+    std::filesystem::path path;
+    ~DecodeDirectory() { (void)core::remove_tree_confined(root, path); }
+};
+
 bool png(std::string_view bytes) {
     static constexpr unsigned char signature[8] = {137, 80, 78, 71, 13, 10, 26, 10};
     if (bytes.size() < 33 || std::memcmp(bytes.data(), signature, sizeof(signature)) != 0 ||
@@ -65,17 +71,20 @@ std::expected<std::filesystem::path, CatalogError> IconConverter::convert(const 
     }
     auto temporary = (directory / ".decode-XXXXXX").string();
     if (!mkdtemp(temporary.data())) return std::unexpected(CatalogError{"icon-temp", {}});
-    const auto output = std::filesystem::path(temporary) / "decoded.png";
+    const DecodeDirectory work{directory, temporary};
+    const auto snapshot = work.path / "input.jxl";
+    const auto output = work.path / "decoded.png";
+    if (!core::atomic_write(snapshot, *bytes, 0600)) return std::unexpected(CatalogError{"icon-temp", {}});
     core::ProcessSpec spec;
-    spec.executable = "/usr/bin/djxl";
-    spec.args = {input.string(), output.string()};
+    spec.executable = "/usr/bin/prlimit";
+    spec.args = {"--as=536870912", "--fsize=16777216", "--cpu=10", "--", "/usr/bin/djxl",
+                 snapshot.string(), output.string()};
     spec.timeout = std::chrono::seconds(10);
     spec.max_stdout = spec.max_stderr = 64 * 1024;
     auto process = runner_.run(spec);
     auto decoded = core::read_bounded(output, 8 * 1024 * 1024);
-    auto cleanup = core::remove_tree_confined(directory, temporary);
     if (!process || process->exit_code != 0 || process->timed_out || process->signaled ||
-        !decoded || !png(*decoded) || !cleanup || !core::atomic_write(destination, *decoded))
+        !decoded || !png(*decoded) || !core::atomic_write(destination, *decoded))
         return std::unexpected(CatalogError{"icon-decode", {}});
     return destination;
 }

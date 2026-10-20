@@ -172,7 +172,9 @@ void Window::search_page(QVBoxLayout& box) {
             kit::Action{text("filter.clear"), [this] { models_.search.filters({}); }}));
     }
     for (const auto& value : state.results) { package(box, value); }
-    if (state.next_cursor) { button(box, text("action.next"), [this] { models_.search.next_page(); }, !state.loading); }
+    if (!state.results.empty()) { label(box, text("search.range", {{"first", static_cast<std::int64_t>(state.visible_first)}, {"last", static_cast<std::int64_t>(state.visible_last)}})); }
+    if (state.has_previous) { button(box, text("search.previous"), [this] { models_.search.previous_page(); }, !state.loading); }
+    if (state.has_next) { button(box, text("search.next"), [this] { models_.search.next_page(); }, !state.loading); }
 }
 
 void Window::filters() {

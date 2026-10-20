@@ -25,9 +25,9 @@ std::string safe_text(std::string_view text);
 std::string safe_code(std::string_view text);
 
 Glib::RefPtr<Gdk::Texture> icon_texture(std::string_view icon, const Gdk::RGBA& color, int size, int scale = 1);
-/// in: absolute local PNG path, at most 1 MiB and 1024 pixels per side
-/// out: texture or empty for unavailable or invalid input
-Glib::RefPtr<Gdk::Texture> app_icon_texture(std::string_view path);
+/// in: absolute local PNG path, at most 1 MiB and 1024 pixels per side; scale from 1 to 4
+/// out: texture bounded to 64 pixels times scale per side, or empty for invalid input
+Glib::RefPtr<Gdk::Texture> app_icon_texture(std::string_view path, int scale = 1);
 
 class Icon final : public Gtk::Widget {
 public:

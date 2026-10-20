@@ -29,12 +29,17 @@ public:
     bool allowed(int fd, uid_t expected_uid) const override;
 };
 
+struct ServerOptions {
+    unsigned first_request_timeout_ms{30000};
+    unsigned frame_timeout_ms{30000};
+};
+
 class Server {
 public:
-    /// in: runtime is a private XDG runtime directory; socket_path defaults to runtime/braurser/core.sock.
+    /// in: runtime is private; socket_path defaults to runtime/braurser/core.sock; options bound request and frame deadlines.
     Server(HandlerRegistry& registry, std::filesystem::path runtime,
            std::filesystem::path socket_path = {}, const PeerCredentials* peers = nullptr,
-           DaemonLog* log = nullptr);
+           DaemonLog* log = nullptr, ServerOptions options = {});
     ~Server();
     Server(const Server&) = delete;
     Server& operator=(const Server&) = delete;
@@ -75,11 +80,16 @@ private:
     dev_t socket_dev_{};
     ino_t socket_ino_{};
     bool stopping_{};
+    ServerOptions options_;
+    std::shared_ptr<int> lifetime_{std::make_shared<int>(0)};
 
     bool accept_ready(Glib::IOCondition condition);
     void watch_listener();
     bool client_ready(const std::shared_ptr<Client>& client, Glib::IOCondition condition);
     void close_client(int fd);
+    void defer_close(const std::shared_ptr<Client>& client);
+    void watch_frame_deadline(const std::shared_ptr<Client>& client);
+    void queue_frame(const std::shared_ptr<Client>& client, std::shared_ptr<const std::string> frame);
     void queue(const std::shared_ptr<Client>& client, const protocol::Message& message);
     void process(const std::shared_ptr<Client>& client, std::string_view frame);
     void finish();

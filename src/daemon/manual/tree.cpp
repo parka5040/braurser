@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <set>
+#include <unordered_set>
 #include <sys/stat.h>
 
 namespace braurser::daemon::manual {
@@ -216,6 +217,9 @@ std::expected<Preview, ManualError> preview_repository(
         if (!text) return std::unexpected(text.error());
         result.selected_script_text = std::move(*text);
     } else result.selected_script_text = *make_text;
+    std::unordered_set<std::string_view> node_paths;
+    node_paths.reserve(source->nodes.size());
+    for (const auto& node : source->nodes) node_paths.insert(node.path);
     std::set<std::string> paths;
     std::set<std::string> urls;
     std::string_view text(result.selected_script_text);
@@ -225,9 +229,7 @@ std::expected<Preview, ManualError> preview_repository(
         auto token = text.substr(start, end - start);
         while (!token.empty() && (token.front() == '.' || token.front() == '/')) token.remove_prefix(1);
         if (token.starts_with("http://") || token.starts_with("https://")) urls.insert(std::string(token));
-        for (const auto& node : source->nodes) {
-            if (node.path == token) paths.insert(node.path);
-        }
+        if (node_paths.contains(token)) paths.insert(std::string(token));
         start = end + 1;
     }
     result.referenced_files.assign(paths.begin(), paths.end());
@@ -238,8 +240,8 @@ std::expected<Preview, ManualError> preview_repository(
 std::expected<void, ManualError> materialize_commit(
     const std::filesystem::path& repo, std::string_view commit,
     const std::filesystem::path& destination) {
-    if (commit.size() != 40 || !std::all_of(commit.begin(), commit.end(), [](unsigned char ch) {
-        return std::isxdigit(ch) != 0;
+    if ((commit.size() != 40 && commit.size() != 64) || !std::all_of(commit.begin(), commit.end(), [](unsigned char ch) {
+        return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
     }) || !destination.is_absolute() || std::filesystem::is_symlink(destination) ||
         !std::filesystem::is_directory(destination) || !std::filesystem::is_empty(destination))
         return std::unexpected(fail("materialize-input"));

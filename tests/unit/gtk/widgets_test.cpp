@@ -59,7 +59,10 @@ TEST_F(DisplayTest, LocalAppIconsAreBoundedAndFailClosed) {
     auto image = Gdk::Pixbuf::create(Gdk::Colorspace::RGB, true, 8, 128, 64);
     image->fill(0x123456ff); image->save(path, "png");
     const auto icon = app_icon_texture(path);
-    ASSERT_TRUE(icon); EXPECT_EQ(icon->get_width(), 128); EXPECT_EQ(icon->get_height(), 64);
+    ASSERT_TRUE(icon); EXPECT_EQ(icon->get_width(), 64); EXPECT_EQ(icon->get_height(), 32);
+    const auto scaled = app_icon_texture(path, 2);
+    ASSERT_TRUE(scaled); EXPECT_EQ(scaled->get_width(), 128); EXPECT_EQ(scaled->get_height(), 64);
+    EXPECT_FALSE(app_icon_texture(path, 0)); EXPECT_FALSE(app_icon_texture(path, 5));
     for (const auto* invalid : {"", "relative.png", "https://example.org/app.png", "/dev/null", "/missing/app.png"}) {
         EXPECT_FALSE(app_icon_texture(invalid));
     }

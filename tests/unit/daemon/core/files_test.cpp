@@ -95,6 +95,28 @@ TEST_F(Files, RefusesEscapeAndSymbolicRoot) {
     EXPECT_FALSE(remove_tree_confined(root / "link", "sub"));
 }
 
+TEST_F(Files, CacheListingAndTouchStayConfined) {
+    ASSERT_TRUE(ensure_private_dir(root / "cache"));
+    const auto path = root / "cache/entry";
+    ASSERT_TRUE(atomic_write(path, "bytes"));
+    std::filesystem::create_symlink(path, root / "cache/link");
+    auto entries = list_regular_files(root / "cache", 1);
+    ASSERT_TRUE(entries);
+    ASSERT_EQ(entries->size(), 1U);
+    EXPECT_EQ(entries->front().name, "entry");
+    EXPECT_EQ(entries->front().info.st_size, 5);
+    EXPECT_FALSE(list_regular_files(root / "cache", 0));
+    const auto old_time = std::filesystem::file_time_type::clock::now() - std::chrono::hours(24);
+    std::filesystem::last_write_time(path, old_time);
+    EXPECT_TRUE(touch_file(path));
+    EXPECT_GT(std::filesystem::last_write_time(path), old_time);
+    EXPECT_FALSE(touch_file(root / "cache/link"));
+    EXPECT_FALSE(touch_file(root / "cache"));
+    std::filesystem::create_directory_symlink(root / "cache", root / "symbolic");
+    EXPECT_FALSE(list_regular_files(root / "symbolic", 1));
+    EXPECT_FALSE(touch_file(root / "symbolic/entry"));
+}
+
 TEST_F(Files, RuntimeIsMandatory) {
     const auto* runtime = std::getenv("XDG_RUNTIME_DIR");
     const std::string old = runtime ? runtime : "";

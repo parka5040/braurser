@@ -3,6 +3,9 @@
 #include <braurser/presenter/rpc_client.hpp>
 #include <giomm/init.h>
 #include <glibmm/main.h>
+#include <glibmm/dispatcher.h>
+#include <deque>
+#include <mutex>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
@@ -14,9 +17,20 @@
 
 namespace {
 struct MainDispatcher final : braurser::presenter::Dispatcher {
-    void post(std::function<void()> callback) override {
-        Glib::MainContext::get_default()->invoke([callback = std::move(callback)] { callback(); return false; });
+    MainDispatcher() {
+        signal.connect([this] {
+            std::deque<std::function<void()>> ready;
+            { std::lock_guard lock(mutex); ready.swap(queue); }
+            for (auto& callback : ready) { callback(); }
+        });
     }
+    void post(std::function<void()> callback) override {
+        { std::lock_guard lock(mutex); queue.push_back(std::move(callback)); }
+        signal.emit();
+    }
+    std::mutex mutex;
+    std::deque<std::function<void()>> queue;
+    Glib::Dispatcher signal;
 };
 
 std::optional<braurser::protocol::Settings> load_settings(const std::filesystem::path& config) {
@@ -44,10 +58,10 @@ int main() {
         MainDispatcher dispatcher;
         braurser::presenter::RpcOptions options;
         options.daemon_path = (executable.parent_path() / "braurserd").string();
-        braurser::presenter::RpcClient client(dispatcher, options);
         const auto loop = Glib::MainLoop::create();
         sigc::connection pending;
         std::function<void(unsigned)> schedule;
+        braurser::presenter::RpcClient client(dispatcher, options);
         schedule = [&](unsigned seconds) {
             pending.disconnect();
             pending = Glib::signal_timeout().connect_seconds([&] {

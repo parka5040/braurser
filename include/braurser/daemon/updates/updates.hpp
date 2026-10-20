@@ -36,24 +36,31 @@ public:
     TempSyncDb& operator=(TempSyncDb&& other) noexcept;
     ~TempSyncDb();
 
-    /// in: real_db is pacman's absolute DBPath; runtime is XDG_RUNTIME_DIR; fakeroot is an absolute executable.
-    /// out: a privately refreshed sync snapshot without writing the real sync database.
-    /// err: Unavailable means fakeroot is missing or not executable.
+    /// in: real_db and cache are absolute; report_id matches [A-Za-z0-9_-]{1,128}.
+    /// out: a private disk-backed copy under cache/braurser/syncdb-check/report_id.
+    /// err: refresh requires executable fakeroot; failures remove the incomplete copy.
     static std::expected<TempSyncDb, UpdateError> create(core::ProcessRunner& runner,
-        const std::filesystem::path& real_db, const std::filesystem::path& runtime,
+        const std::filesystem::path& real_db, const std::filesystem::path& cache,
+        std::string_view report_id, bool refresh = true,
         const std::filesystem::path& fakeroot = "/usr/bin/fakeroot");
-    /// out: absolute database root valid for this object's lifetime.
+    /// out: retains the snapshot after this object's lifetime.
+    void retain() noexcept { retained_ = true; }
+    /// in: cache is absolute; keep is empty or a valid current report id.
+    /// out: removes older report directories without following symbolic links.
+    static void sweep(const std::filesystem::path& cache, std::string_view keep = {});
+    /// out: absolute database root valid until destruction, or the next sweep if retained.
     const std::filesystem::path& path() const noexcept { return path_; }
 private:
     TempSyncDb(std::filesystem::path root, std::filesystem::path path);
     std::filesystem::path root_;
     std::filesystem::path path_;
+    bool retained_{};
 };
 
 class OfficialUpdateChecker {
 public:
     explicit OfficialUpdateChecker(core::ProcessRunner& runner) : runner_(runner) {}
-    /// in: temp_db is a refreshed private database root.
+    /// in: temp_db is a private database root copied for this report, optionally refreshed.
     /// out: validated newer versions in package-name order, including ignored updates.
     std::expected<std::vector<PackageUpdate>, UpdateError> check(const std::filesystem::path& temp_db) const;
 private:
@@ -112,14 +119,13 @@ public:
     std::expected<std::vector<domain::RestartRule>, UpdateError> load(const std::filesystem::path& path) const;
 };
 
-struct RunningConsumer {
-    int pid{};
-    std::string comm;
+inline constexpr std::size_t kMaxConsumerAssociations = 65536;
+
+struct RunningConsumers {
     bool service{};
-    friend auto operator<=>(const RunningConsumer&, const RunningConsumer&) = default;
 };
 struct ConsumerScan {
-    std::map<std::string, std::set<RunningConsumer>> files;
+    std::map<std::string, RunningConsumers> files;
     std::size_t unreadable_processes{};
     bool coverage_complete{};
 };
@@ -132,8 +138,8 @@ public:
 class RunningConsumerScanner final : public ConsumerScanner {
 public:
     explicit RunningConsumerScanner(std::filesystem::path proc_root = "/proc");
-    /// out: maps executable and mapped files of current-uid processes to consumers.
-    /// err: unreadable processes increase unreadable_processes and clear coverage_complete.
+    /// out: maps executable and mapped files of stable current-uid processes to aggregate service flags.
+    /// err: unreadable or changed processes and exhausted association budgets clear coverage_complete.
     ConsumerScan scan() const override;
 private:
     std::filesystem::path proc_root_;

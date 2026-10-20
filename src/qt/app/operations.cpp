@@ -61,7 +61,9 @@ void Window::updates_page(QVBoxLayout& box) {
         content->setProperty("brRole", "card");
         auto& rows = *new QVBoxLayout(content);
         rows.setContentsMargins(16, 16, 16, 16); rows.setSpacing(12);
-        for (const auto& item : group.items) {
+        for (const auto& index : group.items) {
+            const std::array lists{&state.report->official, &state.report->community, &state.report->manual};
+            const auto& item = lists[index.source]->at(index.item);
             if (rows.count() != 0) {
                 auto* separator = new QFrame;
                 separator->setFrameShape(QFrame::HLine); separator->setProperty("brRole", "separator");
@@ -153,8 +155,17 @@ void Window::show_confirm() {
     button(*root, text("action.cancel"), [dialog] { dialog->reject(); });
     auto* submit = button(*root, models_.confirm.action().render(copy_), [this, dialog] { models_.confirm.submit(); dialog->accept(); navigate("activity"); }, models_.confirm.can_confirm(), true);
     if (plan.requires_build_review) {
-        if (!state.build_files.empty() && state.build_files.size() == plan.build_review_refs.size()) {
-            for (const auto& build : state.build_files) { for (const auto& file : build.files) { label(box, file.name); auto* code = new QPlainTextEdit(kit::safe_code(file.text)); code->setReadOnly(true); box.addWidget(code); } }
+        if (state.pending_build_files == 0 && !state.build_files.empty() && state.build_files.size() == (plan.build_pins.empty() ? plan.build_review_refs.size() : plan.build_pins.size())) {
+            for (const auto& build : state.build_files) {
+                label(box, build.packageBase);
+                for (const auto& file : build.files) { if (file.kind == "text") { label(box, file.name); auto* code = new QPlainTextEdit(kit::safe_code(file.text)); code->setReadOnly(true); box.addWidget(code); } }
+                bool heading = false;
+                for (const auto& file : build.files) {
+                    if (file.kind != "binary") { continue; }
+                    if (!heading) { label(box, text("detail.build_binary")); heading = true; }
+                    label(box, text("detail.build_binary_file", {{"file", file.name}, {"size", copy_.size(file.size)}, {"sha256", file.sha256.substr(0, 12)}}));
+                }
+            }
             check(box, text("confirm.build_ack"), state.build_acknowledged, [this, submit](bool value) { models_.confirm.acknowledge_build(value); submit->setEnabled(models_.confirm.can_confirm()); });
         } else { label(box, text("detail.build_unavailable")); }
     }

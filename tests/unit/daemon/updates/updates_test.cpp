@@ -118,7 +118,7 @@ TEST(Update, TempDbUsesPrivateSnapshotAndRemovesIt) {
     Runner runner;
     std::filesystem::path db;
     {
-        auto created = updates::TempSyncDb::create(runner, tree.path / "real", tree.path / "runtime", "/usr/bin/true");
+        auto created = updates::TempSyncDb::create(runner, tree.path / "real", tree.path / "cache", "report-1", true, "/usr/bin/true");
         ASSERT_TRUE(created) << created.error().detail;
         db = created->path();
         ASSERT_TRUE(std::filesystem::is_symlink(db / "local"));
@@ -130,37 +130,59 @@ TEST(Update, TempDbUsesPrivateSnapshotAndRemovesIt) {
         EXPECT_EQ(runner.recorded.timeout, std::chrono::minutes(5));
     }
     EXPECT_FALSE(std::filesystem::exists(db));
-    auto absent = updates::TempSyncDb::create(runner, tree.path / "real", tree.path / "runtime", tree.path / "missing");
+    auto absent = updates::TempSyncDb::create(runner, tree.path / "real", tree.path / "cache", "report-2", true, tree.path / "missing");
     ASSERT_FALSE(absent);
     EXPECT_EQ(absent.error().code, updates::UpdateErrorCode::Unavailable);
 }
 
-TEST(Update, TempDbSweepsStaleCopiesFromEarlierDaemons) {
+TEST(Update, TempDbRetainsCurrentReportAndSweepsOlderCopies) {
     Tree tree;
     write(tree.path / "real/local/demo-1/desc", "%NAME%\ndemo\n");
     write(tree.path / "real/sync/core.db", "original");
-    const auto root = tree.path / "runtime/braurser/checkdb";
-    write(root / "db-999999999-4/sync/core.db", "stale");
-    ASSERT_EQ(symlink((tree.path / "real/local").c_str(), (root / "db-999999999-4/local").c_str()), 0);
-    const auto own = root / ("db-" + std::to_string(getpid()) + "-99999");
-    write(own / "sync/core.db", "current");
-    write(root / "db-x-1/keep", "x");
-    write(root / "unrelated/keep", "x");
+    const auto cache = tree.path / "cache";
+    const auto root = cache / "braurser/syncdb-check";
+    write(root / "old-report/sync/core.db", "stale");
+    ASSERT_EQ(symlink((tree.path / "real/local").c_str(), (root / "old-report/local").c_str()), 0);
     Runner runner;
+    std::filesystem::path retained;
     {
-        auto created = updates::TempSyncDb::create(runner, tree.path / "real", tree.path / "runtime", "/usr/bin/true");
+        auto created = updates::TempSyncDb::create(runner, tree.path / "real", cache, "current_report-2", false, tree.path / "missing");
         ASSERT_TRUE(created) << created.error().detail;
+        retained = created->path();
+        EXPECT_EQ(retained, root / "current_report-2");
+        EXPECT_TRUE(runner.recorded.executable.empty());
+        struct stat info{};
+        ASSERT_EQ(lstat(retained.c_str(), &info), 0);
+        EXPECT_EQ(info.st_mode & 0777, 0700);
+        created->retain();
     }
-    EXPECT_FALSE(std::filesystem::exists(root / "db-999999999-4"));
+    EXPECT_TRUE(std::filesystem::exists(retained / "sync/core.db"));
+    updates::TempSyncDb::sweep(cache, "current_report-2");
+    EXPECT_FALSE(std::filesystem::exists(root / "old-report"));
+    EXPECT_TRUE(std::filesystem::exists(retained));
     EXPECT_TRUE(std::filesystem::exists(tree.path / "real/local/demo-1/desc"));
-    EXPECT_TRUE(std::filesystem::exists(own / "sync/core.db"));
-    EXPECT_TRUE(std::filesystem::exists(root / "db-x-1/keep"));
-    EXPECT_TRUE(std::filesystem::exists(root / "unrelated/keep"));
+    updates::TempSyncDb::sweep(cache);
+    EXPECT_FALSE(std::filesystem::exists(retained));
+}
+
+TEST(Update, TempDbRejectsUnsafeReportIdsAndExistingDirectories) {
+    Tree tree;
+    write(tree.path / "real/local/demo-1/desc", "%NAME%\ndemo\n");
+    write(tree.path / "real/sync/core.db", "original");
+    Runner runner;
+    for (const auto id : {"", "../escape", "a/b", "report.dot"}) {
+        auto created = updates::TempSyncDb::create(runner, tree.path / "real", tree.path / "cache", id, false);
+        ASSERT_FALSE(created);
+        EXPECT_EQ(created.error().code, updates::UpdateErrorCode::InvalidInput);
+    }
+    auto created = updates::TempSyncDb::create(runner, tree.path / "real", tree.path / "cache", "same", false);
+    ASSERT_TRUE(created);
+    EXPECT_FALSE(updates::TempSyncDb::create(runner, tree.path / "real", tree.path / "cache", "same", false));
 }
 
 TEST(Update, DISABLED_LiveTempDbCheck) {
     core::PosixProcessRunner real;
-    auto checked = updates::TempSyncDb::create(real, "/var/lib/pacman", std::filesystem::temp_directory_path());
+    auto checked = updates::TempSyncDb::create(real, "/var/lib/pacman", std::filesystem::temp_directory_path(), "live-test");
     ASSERT_TRUE(checked) << checked.error().detail;
     auto updates = updates::OfficialUpdateChecker(real).check(checked->path());
     ASSERT_TRUE(updates) << updates.error().detail;
@@ -251,7 +273,8 @@ void process(const std::filesystem::path& root, int pid, int parent, int session
         std::to_string(getuid()) + "\nPPid:\t" + std::to_string(parent) + "\n");
     write(dir / "comm", "item\n");
     write(dir / "stat", std::to_string(pid) + " (item) S " + std::to_string(parent) + " 2 " +
-        std::to_string(session) + " " + std::to_string(tty) + " 0\n");
+        std::to_string(session) + " " + std::to_string(tty) +
+        " 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12345\n");
     write(dir / "environ", env);
     write(dir / "maps", maps);
     std::filesystem::create_symlink(exe, dir / "exe");
@@ -270,17 +293,70 @@ TEST(Scanner, IdentifiesServicesAppsDeletedMapsAndIncompleteCoverage) {
     updates::RunningConsumerScanner scanner(tree.path);
     auto scan = scanner.scan();
     ASSERT_TRUE(scan.coverage_complete);
-    ASSERT_EQ(scan.files.at("/usr/lib/libdaemon.so").size(), 1);
-    EXPECT_TRUE(scan.files.at("/usr/lib/libdaemon.so").begin()->service);
-    EXPECT_FALSE(scan.files.at("/usr/lib/libapp.so").begin()->service);
-    EXPECT_FALSE(scan.files.at("/usr/bin/session-app").begin()->service);
+    EXPECT_TRUE(scan.files.at("/usr/lib/libdaemon.so").service);
+    EXPECT_FALSE(scan.files.at("/usr/lib/libapp.so").service);
+    EXPECT_FALSE(scan.files.at("/usr/bin/session-app").service);
     EXPECT_TRUE(scan.files.contains("/usr/bin/daemon"));
-    EXPECT_TRUE(scan.files.at("/usr/bin/service-child").begin()->service);
-    EXPECT_FALSE(scan.files.at("/usr/bin/app-child").begin()->service);
+    EXPECT_TRUE(scan.files.at("/usr/bin/service-child").service);
+    EXPECT_FALSE(scan.files.at("/usr/bin/app-child").service);
     ASSERT_TRUE(core::ensure_private_dir(tree.path / "15"));
     scan = scanner.scan();
     EXPECT_FALSE(scan.coverage_complete);
     EXPECT_EQ(scan.unreadable_processes, 1);
+}
+
+TEST(Scanner, AggregatesSharedPathsWithoutRetainingEveryConsumer) {
+    Tree tree;
+    for (int pid = 10; pid < 30; ++pid)
+        process(tree.path, pid, 1, pid, pid == 29 ? 0 : 1, "", "/usr/bin/shared",
+            "10-20 r-xp 0000 08:01 1 /usr/lib/shared.so\n");
+    updates::RunningConsumerScanner scanner(tree.path);
+    const auto scan = scanner.scan();
+    EXPECT_TRUE(scan.coverage_complete);
+    ASSERT_EQ(scan.files.size(), 2U);
+    EXPECT_TRUE(scan.files.at("/usr/bin/shared").service);
+    EXPECT_TRUE(scan.files.at("/usr/lib/shared.so").service);
+}
+
+TEST(Scanner, BoundsGlobalAssociationsAndMarksIncomplete) {
+    Tree tree;
+    std::string maps;
+    for (std::size_t index = 0; index <= updates::kMaxConsumerAssociations; ++index)
+        maps += "10-20 r-xp 0 00:00 1 /lib/file-" + std::to_string(index) + "\n";
+    process(tree.path, 10, 1, 10, 0, "", "/usr/bin/daemon", maps);
+    updates::RunningConsumerScanner scanner(tree.path);
+    const auto scan = scanner.scan();
+    EXPECT_FALSE(scan.coverage_complete);
+    EXPECT_EQ(scan.unreadable_processes, 1U);
+    EXPECT_EQ(scan.files.size(), updates::kMaxConsumerAssociations);
+}
+
+TEST(Scanner, RejectsSymlinkProcessDirectoriesAndMissingStartTimes) {
+    Tree tree;
+    process(tree.path, 10, 1, 10, 0, "", "/usr/bin/daemon", "");
+    std::filesystem::create_directory_symlink(tree.path / "10", tree.path / "11");
+    process(tree.path, 12, 1, 12, 0, "", "/usr/bin/incomplete", "");
+    write(tree.path / "12/stat", "12 (item) S 1 2 12 0 0\n");
+    updates::RunningConsumerScanner scanner(tree.path);
+    const auto scan = scanner.scan();
+    EXPECT_FALSE(scan.coverage_complete);
+    EXPECT_EQ(scan.unreadable_processes, 2U);
+    ASSERT_EQ(scan.files.size(), 1U);
+    EXPECT_TRUE(scan.files.contains("/usr/bin/daemon"));
+}
+
+TEST(Scanner, RejectsSymlinkInputsAndCyclicAncestry) {
+    Tree tree;
+    process(tree.path, 10, 11, 10, 0, "", "/usr/bin/first", "");
+    process(tree.path, 11, 10, 11, 0, "", "/usr/bin/second", "");
+    process(tree.path, 12, 1, 12, 0, "", "/usr/bin/symlink", "");
+    std::filesystem::remove(tree.path / "12/maps");
+    std::filesystem::create_symlink(tree.path / "10/maps", tree.path / "12/maps");
+    updates::RunningConsumerScanner scanner(tree.path);
+    const auto scan = scanner.scan();
+    EXPECT_FALSE(scan.coverage_complete);
+    EXPECT_EQ(scan.unreadable_processes, 3U);
+    EXPECT_TRUE(scan.files.empty());
 }
 
 namespace {
@@ -292,7 +368,7 @@ struct FakeFiles : updates::InstalledFilesSource {
 };
 struct FakeScanner : updates::ConsumerScanner {
     updates::ConsumerScan scan() const override {
-        return {{{"/usr/bin/demo", {{100, "demo", true}}}}, 0, true};
+        return {{{"/usr/bin/demo", {true}}}, 0, true};
     }
 };
 }

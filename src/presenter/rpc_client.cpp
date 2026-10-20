@@ -114,18 +114,42 @@ struct RpcClient::Impl : std::enable_shared_from_this<RpcClient::Impl> {
     std::int64_t next_id = 1;
     std::uint64_t next_listener = 1;
     std::size_t bytes = 0;
+    std::size_t posted_count = 0;
+    std::size_t posted_bytes = 0;
+    std::deque<Callback> deferred_failures;
+    std::atomic_bool inbound_overflow = false;
     std::jthread worker;
     int socket = -1;
     pid_t child = -1;
     bool launched = false;
+    bool notify_disconnected = false;
     protocol::FrameDecoder decoder;
     protocol::EventSequenceTracker sequences;
     Impl(Dispatcher& dispatch, RpcOptions configuration, std::shared_ptr<SocketConnector> connect)
         : dispatcher(dispatch), options(std::move(configuration)), connector(std::move(connect)) {}
-    void deliver(Callback callback, Reply<nlohmann::json> reply) {
-        dispatcher.post([callback = std::move(callback), reply = std::move(reply)]() mutable { callback(std::move(reply)); });
+    bool reserve(std::size_t size) {
+        std::lock_guard lock(mutex);
+        if (posted_count >= 1024 || size > 32 * 1024 * 1024 - posted_bytes) {
+            inbound_overflow.store(true); return false;
+        }
+        ++posted_count; posted_bytes += size; return true;
     }
-    void publish(std::string_view method, const nlohmann::json& params) {
+    void post(std::size_t size, std::function<void()> callback) {
+        dispatcher.post([weak = weak_from_this(), size, callback = std::move(callback)]() mutable {
+            if (auto owner = weak.lock()) {
+                { std::lock_guard lock(owner->mutex); --owner->posted_count; owner->posted_bytes -= size; }
+                callback();
+            }
+        });
+    }
+    void deliver(Callback callback, Reply<nlohmann::json> reply) {
+        const auto size = reply ? reply->dump().size() : reply.error().args.dump().size() + reply.error().message_key.size() + sizeof(RpcError);
+        if (!reserve(size)) {
+            std::lock_guard lock(mutex); deferred_failures.push_back(std::move(callback)); return;
+        }
+        post(size, [callback = std::move(callback), reply = std::move(reply)]() mutable { callback(std::move(reply)); });
+    }
+    bool publish(std::string_view method, const nlohmann::json& params) {
         std::vector<Listener> targets;
         {
             std::lock_guard lock(mutex);
@@ -134,9 +158,14 @@ struct RpcClient::Impl : std::enable_shared_from_this<RpcClient::Impl> {
                 if (listener.method == method) { targets.push_back(listener); }
             }
         }
+        if (targets.empty()) { return true; }
+        const auto size = params.dump().size();
+        auto snapshot = std::make_shared<const nlohmann::json>(params);
         for (const auto& listener : targets) {
-            dispatcher.post([listener, params] { if (listener.alive->load()) { listener.callback(params); } });
+            if (!reserve(size)) { return false; }
+            post(size, [listener, snapshot] { if (listener.alive->load()) { listener.callback(*snapshot); } });
         }
+        return true;
     }
     void disconnect() {
         if (socket < 0) { return; }
@@ -156,7 +185,7 @@ struct RpcClient::Impl : std::enable_shared_from_this<RpcClient::Impl> {
             }
         }
         for (auto& callback : failed) { deliver(std::move(callback), std::unexpected(failure())); }
-        publish("", false);
+        notify_disconnected = !publish("", false);
     }
     void expire() {
         std::vector<Callback> expired;
@@ -178,7 +207,7 @@ struct RpcClient::Impl : std::enable_shared_from_this<RpcClient::Impl> {
     bool receive(std::string_view text) {
         auto message = protocol::parse_message(text);
         if (!message) { return false; }
-        if (const auto* response = std::get_if<protocol::Response>(&*message)) {
+        if (auto* response = std::get_if<protocol::Response>(&*message)) {
             const auto* id = std::get_if<std::int64_t>(&response->id);
             if (!id) { return false; }
             Callback callback;
@@ -193,16 +222,16 @@ struct RpcClient::Impl : std::enable_shared_from_this<RpcClient::Impl> {
                 bytes -= it->frame.size();
                 pending.erase(it);
             }
-            if (const auto* error = std::get_if<protocol::ErrorObject>(&response->outcome)) {
-                deliver(std::move(callback), std::unexpected(*error));
+            if (auto* error = std::get_if<protocol::ErrorObject>(&response->outcome)) {
+                deliver(std::move(callback), std::unexpected(std::move(*error)));
             } else {
-                const auto& result = std::get<nlohmann::json>(response->outcome);
+                auto& result = std::get<nlohmann::json>(response->outcome);
                 const auto descriptor = std::ranges::find(protocol::kMethods, method, &protocol::MethodDescriptor::name);
                 if (descriptor == protocol::kMethods.end() || !descriptor->validate_result(result)) {
                     deliver(std::move(callback), std::unexpected(failure(protocol::kInvalidRequest)));
                     return false;
                 }
-                deliver(std::move(callback), result);
+                deliver(std::move(callback), std::move(result));
             }
             return true;
         }
@@ -212,12 +241,11 @@ struct RpcClient::Impl : std::enable_shared_from_this<RpcClient::Impl> {
             if (event->params.contains("jobId") && event->params.contains("sequence")) {
                 const auto job = event->params.at("jobId").get<std::string>();
                 if (!sequences.observe(job, event->params.at("sequence").get<std::uint64_t>())) { return false; }
-                publish(event->method, event->params);
+                if (!publish(event->method, event->params)) { return false; }
                 if (event->method == Event<protocol::JobStateNotification>::name && finished_job(event->params)) { sequences.forget(job); }
                 return true;
             }
-            publish(event->method, event->params);
-            return true;
+            return publish(event->method, event->params);
         }
         return false;
     }
@@ -226,6 +254,14 @@ struct RpcClient::Impl : std::enable_shared_from_this<RpcClient::Impl> {
         auto retry = Clock::now();
         while (!stop.stop_requested()) {
             if (child > 0 && ::waitpid(child, nullptr, WNOHANG) == child) { child = -1; }
+            if (inbound_overflow.exchange(false)) { disconnect(); }
+            if (notify_disconnected) {
+                notify_disconnected = !publish("", false);
+                if (notify_disconnected) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue; }
+            }
+            std::deque<Callback> deferred;
+            { std::lock_guard lock(mutex); deferred.swap(deferred_failures); }
+            for (auto& callback : deferred) { deliver(std::move(callback), std::unexpected(failure())); }
             expire();
             if (socket < 0 && Clock::now() >= retry) {
                 auto connection = connector->connect();

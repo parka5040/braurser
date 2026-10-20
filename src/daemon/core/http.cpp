@@ -167,9 +167,12 @@ public:
         curl_easy_setopt(handle.get(), CURLOPT_WRITEDATA, &state);
         curl_easy_setopt(handle.get(), CURLOPT_HEADERFUNCTION, capture_header);
         curl_easy_setopt(handle.get(), CURLOPT_HEADERDATA, &state);
-        if (request.guard) {
+        const PublicOnlyGuard default_guard;
+        const ConnectGuard* guard = request.guard;
+        if (!guard && !request.allow_private_addresses) guard = &default_guard;
+        if (guard) {
             curl_easy_setopt(handle.get(), CURLOPT_OPENSOCKETFUNCTION, open_guarded);
-            curl_easy_setopt(handle.get(), CURLOPT_OPENSOCKETDATA, request.guard);
+            curl_easy_setopt(handle.get(), CURLOPT_OPENSOCKETDATA, guard);
         }
         const auto status = curl_easy_perform(handle.get());
         if (status != CURLE_OK) {
@@ -178,7 +181,7 @@ public:
         }
         curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &state.transfer.response.status);
         state.transfer.response.not_modified = state.transfer.response.status == 304;
-        return state.transfer;
+        return std::move(state.transfer);
     }
 };
 

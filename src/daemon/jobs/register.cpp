@@ -1,6 +1,9 @@
 #include <braurser/daemon/jobs/register.hpp>
 #include <braurser/daemon/core/process.hpp>
 #include <braurser/domain/vercmp.hpp>
+#include <braurser/daemon/jobs/aur.hpp>
+#include <braurser/daemon/core/text.hpp>
+#include <sys/utsname.h>
 #include "selection.hpp"
 #include <array>
 #include <atomic>
@@ -267,32 +270,104 @@ private:
         env.askpass = std::filesystem::path(BRAURSER_LIBEXEC_DIR) / ("braurser-askpass-" + ui());
         return {selector_.select(env).method, BRAURSER_LIBEXEC_DIR, ui(), "install"};
     }
-    Result<core::ProcessSpec> build_spec(const Snapshot& snapshot, std::string_view id,
-                                         const ElevationOptions& configured) {
+    bool build_containment() {
+        core::ProcessSpec probe;
+        probe.executable = "/usr/bin/bwrap";
+        probe.args = {"--unshare-pid", "--die-with-parent", "--new-session", "--dev-bind", "/", "/",
+                      "--proc", "/proc", "--", "/usr/bin/true"};
+        probe.env = {{"PATH", "/usr/bin"}};
+        probe.timeout = std::chrono::seconds(10);
+        probe.max_stdout = probe.max_stderr = 4096;
+        const auto result = read_runner_.run(probe);
+        return result && result->exit_code == 0 && !result->signaled && !result->timed_out;
+    }
+    Result<JobRunner::Pipeline> build_spec(const Snapshot& snapshot, std::string_view id,
+                                          const ElevationOptions& configured) {
         auto selection = configured;
         selection.ui = ui();
-        if (snapshot.helper == "auto" || snapshot.plan.kind.value == "remove")
-            return official_spec(snapshot.plan.kind.value, snapshot.targets, selection);
-        if (selection.method == elevation::Method::Unavailable)
-            return std::unexpected(unavailable());
-        if (snapshot.targets.size() != 1) return std::unexpected(Error{protocol::kInvalidParams, "error.generic_title"});
-        auto name = domain::PackageName::make(snapshot.targets.front());
-        if (!name) return std::unexpected(Error{protocol::kInvalidParams, "error.generic_title"});
-        auto environment = helper_environment(paths_);
-        std::unique_ptr<helpers::AURHelper> helper;
-        if (snapshot.helper == "paru") helper = std::make_unique<helpers::ParuHelper>(environment, read_runner_);
-        else if (snapshot.helper == "yay") helper = std::make_unique<helpers::YayHelper>(environment, read_runner_);
-        else return std::unexpected(Error{protocol::kUnsupportedCapability, "error.generic_title"});
-        const auto root = environment.home / ".cache/braurser/build" / snapshot.helper / std::string(id);
-        helpers::CommunityRequest request{*name, root, selection.libexec / "braurser-elevate",
-            selection.method == elevation::Method::Pkexec ? "pkexec" : "sudo-askpass",
-            selection.method == elevation::Method::SudoAskpass ?
-                std::optional(selection.libexec / ("braurser-askpass-" + selection.ui)) : std::nullopt,
-            environment.home};
-        auto spec = helper->build_install_spec(request);
-        if (!spec) return std::unexpected(Error{protocol::kUntrustedInput, "error.generic_title"});
-        spec->env.emplace_back("BRAURSER_AUTH_ACTION", "install");
-        return *spec;
+        JobRunner::Pipeline pipeline;
+        if (snapshot.aur_pins.empty()) {
+            if (snapshot.helper != "auto" && snapshot.plan.kind.value != "remove")
+                return std::unexpected(Error{protocol::kUntrustedInput, "error.generic_title"});
+            pipeline.steps.push_back([snapshot, selection] {
+                return official_spec(snapshot.plan.kind.value, snapshot.targets, selection, snapshot.expected_transaction);
+            });
+            return pipeline;
+        }
+        if (selection.method == elevation::Method::Unavailable) return std::unexpected(unavailable());
+        if (snapshot.aur_pins.size() > 16 || id.empty() || id.size() > 128 ||
+            !std::ranges::all_of(id, [](unsigned char ch) { return std::isalnum(ch) || ch == '-'; }))
+            return std::unexpected(Error{protocol::kUntrustedInput, "error.generic_title"});
+        const auto environment = helper_environment(paths_);
+        const auto job_root = environment.home / ".cache/braurser/build/manual" / std::string(id);
+        auto refused = []() -> Result<JobRunner::Pipeline> {
+            return std::unexpected(Error{protocol::kUntrustedInput, "error.generic_title"});
+        };
+        struct WorkspaceGuard {
+            std::filesystem::path path;
+            bool released{};
+            ~WorkspaceGuard() {
+                if (!released) {
+                    try { static_cast<void>(finish_aur_workspace(path.parent_path(), path, false)); }
+                    catch (const std::exception&) {}
+                }
+            }
+        };
+        auto workspace = std::make_shared<WorkspaceGuard>();
+        workspace->path = job_root;
+        pipeline.finish = [workspace](bool success) -> Result<void> {
+            const auto cleaned = finish_aur_workspace(workspace->path.parent_path(), workspace->path, success);
+            workspace->released = cleaned.has_value();
+            if (!cleaned) return std::unexpected(Error{protocol::kUnsafeTransaction, "job.build_cleanup"});
+            return {};
+        };
+        for (const auto& path : {environment.home / ".cache/braurser", environment.home / ".cache/braurser/build",
+                                 environment.home / ".cache/braurser/build/manual", job_root,
+                                 job_root / "packages", job_root / "sources", job_root / "build"})
+            if (!core::ensure_private_dir(path)) return refused();
+        utsname machine{};
+        if (uname(&machine) != 0) return refused();
+        const std::string architecture(machine.machine);
+        for (const auto& pin : snapshot.aur_pins) {
+            if (!br_valid_pkgname(pin.pkgbase.data(), pin.pkgbase.size())) return refused();
+            const auto root = job_root / pin.pkgbase;
+            const auto bare = paths_.cache / "braurser/manual" / ("aur-" + pin.pkgbase) / "repo.git";
+            const auto checked = manual::read_build_tree(bare, pin.commit);
+            if (!checked || checked->tree != pin.tree || checked->srcinfo != pin.srcinfo ||
+                !core::ensure_private_dir(root) || !manual::materialize_commit(bare, pin.commit, root)) return refused();
+            const auto srcinfo = core::read_bounded(root / ".SRCINFO", 256 * 1024);
+            if (!srcinfo || *srcinfo != pin.srcinfo) return refused();
+        }
+        if (!snapshot.official_deps.empty()) {
+            pipeline.steps.push_back([snapshot, selection] {
+                return official_spec("install-deps", snapshot.official_deps, selection, snapshot.expected_transaction);
+            });
+        }
+        const auto dependencies = aur_dependency_names(snapshot);
+        const auto approved = std::make_shared<const Snapshot>(snapshot);
+        for (const auto& pin : snapshot.aur_pins) {
+            const auto root = job_root / pin.pkgbase;
+            pipeline.steps.push_back([this, root, job_root, home = environment.home]() -> Result<core::ProcessSpec> {
+                const auto space = aur_build_space(job_root);
+                if (!space) return std::unexpected(space.error());
+                return aur_build_spec(root, job_root, home, build_containment());
+            });
+            pipeline.steps.push_back([this, approved, pin, job_root, architecture, selection]() -> Result<core::ProcessSpec> {
+                auto archives = aur_archives(pin, job_root / "packages", architecture);
+                if (!archives) return std::unexpected(archives.error());
+                const auto validated = validate_aur_archives(*approved, pin, *archives, architecture, read_runner_);
+                if (!validated) return std::unexpected(validated.error());
+                const auto unchanged = recheck_aur_archives(*validated);
+                if (!unchanged) return std::unexpected(unchanged.error());
+                return official_spec("install-archives", *archives, selection, approved->expected_transaction);
+            });
+        }
+        if (!dependencies.empty()) {
+            pipeline.steps.push_back([dependencies, selection, transaction = snapshot.expected_transaction] {
+                return official_spec("mark-deps", dependencies, selection, transaction);
+            });
+        }
+        return pipeline;
     }
     bool verify(const Snapshot& snapshot) {
         if (snapshot.plan.kind.value == "manual-remove" && snapshot.manual_receipt) {
@@ -326,6 +401,18 @@ private:
         if (!config) return false;
         auto installed = catalog::LocalDbReader{}.read(config->db_path);
         if (!installed) return false;
+        utsname machine{};
+        if (!snapshot.aur_pins.empty() && uname(&machine) != 0) return false;
+        for (const auto& pin : snapshot.aur_pins) {
+            const auto info = parse_srcinfo(pin.srcinfo, machine.machine);
+            if (!info) return false;
+            for (const auto& name : pin.pkgnames) {
+                const auto package = std::ranges::find_if(info->packages, [&](const auto& item) { return item.name == name; });
+                const auto found = std::ranges::find_if(*installed, [&](const auto& item) { return item.package.name == name; });
+                if (package == info->packages.end() || found == installed->end()) return false;
+                if (!aur_version_matches(pin, *package, found->package.version)) return false;
+            }
+        }
         for (const auto& target : snapshot.targets) {
             const auto slash = target.find('/');
             const auto name = slash == std::string::npos ? target : target.substr(slash + 1);

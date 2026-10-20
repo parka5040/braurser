@@ -101,10 +101,10 @@ LookupResult WikiClient::lookup(std::string_view display_name, std::string_view 
     bool failure = false;
     std::optional<Document> stale;
     for (const auto& candidate : names) {
-        const auto cached = cache_ ? cache_->read(candidate, package_name) : std::nullopt;
-        if (cached && cached->document && !cached->stale) return {LookupStatus::Found, cached->document, false};
-        if (cached && cached->document && !online) return {LookupStatus::Found, cached->document, true};
-        if (cached && cached->document && !stale) stale = cached->document;
+        auto cached = cache_ ? cache_->read(candidate, package_name) : std::nullopt;
+        if (cached && cached->document && !cached->stale) return {LookupStatus::Found, std::move(cached->document), false};
+        if (cached && cached->document && !online) return {LookupStatus::Found, std::move(cached->document), true};
+        if (cached && cached->document && !stale) stale = std::move(cached->document);
         if (!online) continue;
         if (cached && !cached->document) continue;
         core::HttpRequest request;
@@ -123,13 +123,13 @@ LookupResult WikiClient::lookup(std::string_view display_name, std::string_view 
             const auto data = nlohmann::json::parse(response->body);
             if (data.contains("error")) {
                 if (data.at("error").at("code") == "missingtitle") {
-                    if (cache_) cache_->write(candidate, std::nullopt, package_name);
+                    if (cache_) cache_->write(candidate, nullptr, package_name);
                 } else failure = true;
                 continue;
             }
             const auto& page = data.at("parse");
             const auto title = page.at("title").get<std::string>();
-            const auto html = page.at("text").get<std::string>();
+            const auto& html = page.at("text").get_ref<const std::string&>();
             if (!valid_title(title) || html.size() > request.max_bytes) { failure = true; continue; }
             bool matched = normalize(title) == normalize(candidate);
             if (page.contains("redirects") && page.at("redirects").is_array()) {
@@ -140,13 +140,13 @@ LookupResult WikiClient::lookup(std::string_view display_name, std::string_view 
             auto doc = sanitize(html);
             if (!matched) matched = has_package_link(doc, package_name);
             if (!matched) {
-                if (cache_) cache_->write(candidate, std::nullopt, package_name);
+                if (cache_) cache_->write(candidate, nullptr, package_name);
                 continue;
             }
             doc.title = title;
             doc.source_url = "https://wiki.archlinux.org/title/" + percent_encode(title);
             doc.fetched_at = clock_.now();
-            if (cache_) cache_->write(candidate, doc, package_name);
+            if (cache_) cache_->write(candidate, &doc, package_name);
             return {LookupStatus::Found, std::move(doc), false};
         } catch (const nlohmann::json::exception&) { failure = true; }
     }

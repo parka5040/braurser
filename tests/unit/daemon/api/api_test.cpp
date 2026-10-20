@@ -9,6 +9,7 @@
 #include <braurser/protocol/frame.hpp>
 #include <braurser/protocol/rpc.hpp>
 #include <gtest/gtest.h>
+#include <git2.h>
 #include <giomm/init.h>
 #include <array>
 #include <cerrno>
@@ -320,6 +321,72 @@ TEST(DaemonSocket, ConnectionIdentitiesAreMonotonicAndNotificationsStayPrivate) 
     EXPECT_EQ(poll(&entry, 1, 50), 0);
     close(replacement);
     close(other);
+}
+
+TEST(DaemonCatalog, PinnedBuildListingFetchesCompleteLargeFilesAndDisclosesBinary) {
+    Gio::init();
+    Runtime runtime;
+    ASSERT_FALSE(runtime.path.empty());
+    const auto cache = runtime.path / "cache";
+    ASSERT_TRUE(braurser::daemon::core::ensure_private_dir(cache));
+    api::HandlerRegistry registry;
+    api::Server server(registry, runtime.path);
+    api::Broadcaster broadcaster(server);
+    braurser::daemon::app::RealServices services({cache, runtime.path / "state", runtime.path / "config", runtime.path}, broadcaster);
+    const auto bare = cache / "braurser/manual/aur-widget/repo.git";
+    ASSERT_TRUE(braurser::daemon::core::ensure_private_dir(bare.parent_path()));
+    ASSERT_GE(git_libgit2_init(), 0);
+    git_repository* raw_repo = nullptr;
+    ASSERT_EQ(git_repository_init(&raw_repo, bare.c_str(), 1), 0);
+    std::unique_ptr<git_repository, decltype(&git_repository_free)> repo(raw_repo, git_repository_free);
+    git_treebuilder* raw_builder = nullptr;
+    ASSERT_EQ(git_treebuilder_new(&raw_builder, repo.get(), nullptr), 0);
+    std::unique_ptr<git_treebuilder, decltype(&git_treebuilder_free)> builder(raw_builder, git_treebuilder_free);
+    const std::vector<std::pair<std::string, std::string>> files{
+        {"PKGBUILD", "pkgname=widget\n"}, {".SRCINFO", "pkgbase = widget\n"},
+        {"build.sh", std::string(300 * 1024, 'x')}, {"large.sh", std::string(448 * 1024, '\n')},
+        {"image", std::string("a\0b", 3)}};
+    for (const auto& [name, bytes] : files) {
+        git_oid oid{};
+        ASSERT_EQ(git_blob_create_frombuffer(&oid, repo.get(), bytes.data(), bytes.size()), 0);
+        ASSERT_EQ(git_treebuilder_insert(nullptr, builder.get(), name.c_str(), &oid, GIT_FILEMODE_BLOB), 0);
+    }
+    git_oid tree_id{};
+    ASSERT_EQ(git_treebuilder_write(&tree_id, builder.get()), 0);
+    git_tree* raw_tree = nullptr;
+    ASSERT_EQ(git_tree_lookup(&raw_tree, repo.get(), &tree_id), 0);
+    std::unique_ptr<git_tree, decltype(&git_tree_free)> tree(raw_tree, git_tree_free);
+    git_signature* raw_signature = nullptr;
+    ASSERT_EQ(git_signature_new(&raw_signature, "Test", "test@example.org", 0, 0), 0);
+    std::unique_ptr<git_signature, decltype(&git_signature_free)> signature(raw_signature, git_signature_free);
+    git_oid id{};
+    ASSERT_EQ(git_commit_create(&id, repo.get(), nullptr, signature.get(), signature.get(), nullptr, "review", tree.get(), 0, nullptr), 0);
+    std::array<char, GIT_OID_MAX_HEXSIZE + 1> hex{};
+    git_oid_tostr(hex.data(), hex.size(), &id);
+    protocol::BuildFilesParams request{"widget", hex.data()};
+    const auto listing = services.build_files(request);
+    ASSERT_TRUE(listing);
+    EXPECT_FALSE(listing->truncated);
+    ASSERT_EQ(listing->files.size(), files.size());
+    std::size_t omitted = 0;
+    for (const auto& file : listing->files) {
+        if (file.name == "image") { EXPECT_EQ(file.kind, "binary"); EXPECT_TRUE(file.text.empty()); EXPECT_EQ(file.size, 3U); }
+        if (file.kind == "omitted") { ++omitted; EXPECT_TRUE(file.text.empty()); }
+    }
+    EXPECT_EQ(omitted, 1U);
+    for (const auto* path : {"build.sh", "large.sh"}) {
+        request.path = path;
+        const auto result = services.build_files(request);
+        ASSERT_TRUE(result);
+        ASSERT_EQ(result->files.size(), 1U);
+        EXPECT_EQ(result->files.front().kind, "text");
+        EXPECT_EQ(result->files.front().name, path);
+        EXPECT_EQ(result->files.front().text.size(), std::string_view(path) == "build.sh" ? 300U * 1024 : 448U * 1024);
+        const auto wire = protocol::serialize_message(protocol::Response{1, nlohmann::json(*result)});
+        EXPECT_LE(wire.size(), protocol::kMaxFrameBytes);
+    }
+    request.path = "missing";
+    EXPECT_FALSE(services.build_files(request));
 }
 
 TEST(DaemonStartup, ConstructsRealServiceContainerAfterGioInitialization) {
@@ -710,6 +777,10 @@ TEST(SocketLimits, NestedBroadcastFromDisconnectDoesNotReuseErasedClients) {
     std::promise<void> flooded;
     Glib::MainContext::get_default()->invoke([&] {
         for (int round = 0; round < 1300; ++round) server.broadcast(line);
+        EXPECT_EQ(disconnected.load(), 0U);
+        EXPECT_FALSE(nested);
+        server.broadcast(line);
+        EXPECT_EQ(disconnected.load(), 0U);
         flooded.set_value();
         return false;
     });
@@ -723,6 +794,126 @@ TEST(SocketLimits, NestedBroadcastFromDisconnectDoesNotReuseErasedClients) {
     ASSERT_GE(after, 0);
     EXPECT_TRUE(hello(after, 10));
     close(after);
+}
+
+TEST(SocketLimits, SerializationFailureDisconnectsOnlyAfterBroadcastReturns) {
+    Gio::init();
+    Runtime runtime;
+    api::HandlerRegistry registry;
+    register_hello(registry);
+    api::Server server(registry, runtime.path);
+    std::atomic<unsigned> disconnected{};
+    server.on_disconnect([&](api::ConnectionId) { ++disconnected; });
+    auto started = server.start();
+    if (!started && started.error() == "cannot create listener: 1") GTEST_SKIP() << "AF_UNIX denied by sandbox";
+    ASSERT_TRUE(started) << started.error();
+    RunningServer running(server);
+    const int fd = connect_client(runtime.path / "braurser/core.sock");
+    ASSERT_GE(fd, 0);
+    ASSERT_TRUE(hello(fd, 1));
+    std::promise<void> broadcasted;
+    Glib::MainContext::get_default()->invoke([&] {
+        server.broadcast({"unknown.event", nlohmann::json::object()});
+        EXPECT_EQ(disconnected.load(), 0U);
+        server.broadcast({"job.log", protocol::JobLogNotification{"job", 1, "ignored"}});
+        EXPECT_EQ(disconnected.load(), 0U);
+        broadcasted.set_value();
+        return false;
+    });
+    broadcasted.get_future().wait();
+    EXPECT_TRUE(closed_by_peer(fd));
+    EXPECT_EQ(disconnected.load(), 1U);
+    close(fd);
+}
+
+TEST(SocketLimits, FirstRequestAndPartialFramesHaveDeadlines) {
+    Gio::init();
+    Runtime runtime;
+    api::HandlerRegistry registry;
+    register_hello(registry);
+    api::Server server(registry, runtime.path, {}, nullptr, nullptr, {200, 80});
+    auto started = server.start();
+    if (!started && started.error() == "cannot create listener: 1") GTEST_SKIP() << "AF_UNIX denied by sandbox";
+    ASSERT_TRUE(started) << started.error();
+    RunningServer running(server);
+    const auto path = runtime.path / "braurser/core.sock";
+    const int silent = connect_client(path);
+    ASSERT_GE(silent, 0);
+    EXPECT_TRUE(closed_by_peer(silent));
+    close(silent);
+    const int fd = connect_client(path);
+    ASSERT_GE(fd, 0);
+    ASSERT_TRUE(hello(fd, 1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    ASSERT_TRUE(hello(fd, 2));
+    const auto frame = protocol::encode_frame(protocol::serialize_message(
+        protocol::Request{3, "system.hello", protocol::HelloParams{protocol::kApiVersion}}));
+    ASSERT_EQ(send(fd, frame.data(), 2, MSG_NOSIGNAL), 2);
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    ASSERT_EQ(send(fd, frame.data() + 2, 3, MSG_NOSIGNAL), 3);
+    EXPECT_TRUE(closed_by_peer(fd));
+    close(fd);
+}
+
+TEST(SocketLimits, CompletedFramesResetOnlyThePartialFrameDeadline) {
+    Gio::init();
+    Runtime runtime;
+    api::HandlerRegistry registry;
+    register_hello(registry);
+    api::Server server(registry, runtime.path, {}, nullptr, nullptr, {500, 100});
+    auto started = server.start();
+    if (!started && started.error() == "cannot create listener: 1") GTEST_SKIP() << "AF_UNIX denied by sandbox";
+    ASSERT_TRUE(started) << started.error();
+    RunningServer running(server);
+    const int fd = connect_client(runtime.path / "braurser/core.sock");
+    ASSERT_GE(fd, 0);
+    const auto frame = protocol::encode_frame(protocol::serialize_message(
+        protocol::Request{1, "system.hello", protocol::HelloParams{protocol::kApiVersion}}));
+    ASSERT_EQ(send(fd, frame.data(), 5, MSG_NOSIGNAL), 5);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    ASSERT_EQ(send(fd, frame.data() + 5, frame.size() - 5, MSG_NOSIGNAL), static_cast<ssize_t>(frame.size() - 5));
+    ASSERT_TRUE(receive(fd));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    EXPECT_TRUE(hello(fd, 2));
+    close(fd);
+}
+
+TEST(DaemonSocket, PublicBroadcastBacklogsHaveIdenticalFramesPerRecipient) {
+    Gio::init();
+    Runtime runtime;
+    api::HandlerRegistry registry;
+    register_hello(registry);
+    api::Server server(registry, runtime.path);
+    auto started = server.start();
+    if (!started && started.error() == "cannot create listener: 1") GTEST_SKIP() << "AF_UNIX denied by sandbox";
+    ASSERT_TRUE(started) << started.error();
+    RunningServer running(server);
+    std::vector<int> clients;
+    for (int i = 0; i < 4; ++i) {
+        const int fd = connect_client(runtime.path / "braurser/core.sock");
+        ASSERT_GE(fd, 0);
+        ASSERT_TRUE(hello(fd, i + 1));
+        clients.push_back(fd);
+    }
+    std::promise<void> queued;
+    Glib::MainContext::get_default()->invoke([&] {
+        for (std::uint64_t sequence = 1; sequence <= 100; ++sequence)
+            server.broadcast({"job.log", protocol::JobLogNotification{"job", sequence, std::string(4000, 'x')}});
+        queued.set_value();
+        return false;
+    });
+    queued.get_future().wait();
+    for (const int fd : clients) {
+        for (std::uint64_t sequence = 1; sequence <= 100; ++sequence) {
+            const auto message = receive(fd);
+            ASSERT_TRUE(message);
+            const auto* notification = std::get_if<protocol::Notification>(&*message);
+            ASSERT_NE(notification, nullptr);
+            EXPECT_EQ(notification->method, "job.log");
+            EXPECT_EQ(notification->params, nlohmann::json(protocol::JobLogNotification{"job", sequence, std::string(4000, 'x')}));
+        }
+        close(fd);
+    }
 }
 
 TEST(SocketLimits, AcceptRecoversAfterDescriptorExhaustion) {

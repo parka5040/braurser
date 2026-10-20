@@ -11,6 +11,8 @@
 namespace braurser::daemon::manual {
 namespace {
 
+constexpr std::size_t kMaxOwnershipEntries = 2000000;
+
 ManualError fail(std::string code) { return {std::move(code), {}, {}, {}}; }
 
 std::string display_exec(std::string_view text) {
@@ -24,12 +26,21 @@ std::string display_exec(std::string_view text) {
     return core::bounded_line(core::strip_terminal_controls(result), 256);
 }
 
-std::expected<std::set<std::filesystem::path>, ManualError> owned_files(const std::filesystem::path& db) {
+bool launcher_path(const std::filesystem::path& path, const std::vector<std::filesystem::path>& roots) {
+    if (path.extension() != ".desktop") return false;
+    for (const auto& root : roots) {
+        const auto prefix = (root / "applications").string() + "/";
+        if (path.native().starts_with(prefix)) return true;
+    }
+    return false;
+}
+
+std::expected<std::set<std::filesystem::path>, ManualError> owned_files(
+    const std::filesystem::path& db, const std::vector<std::filesystem::path>& roots, std::size_t& seen) {
     std::set<std::filesystem::path> owned;
     catalog::LocalDbReader reader;
     auto records = reader.read(db);
     if (!records) return std::unexpected(fail("launcher-local-db"));
-    std::size_t seen = 0;
     for (const auto& record : *records) {
         auto files = reader.files(db, record.package.name + "-" + record.package.version);
         if (!files || files->size() > 8 * 1024 * 1024)
@@ -41,11 +52,13 @@ std::expected<std::set<std::filesystem::path>, ManualError> owned_files(const st
             auto line = std::string_view(*files).substr(start, end - start);
             if (line == "%FILES%") in_files = true;
             else if (!line.empty() && line.front() == '%') in_files = false;
-            else if (in_files && !line.empty() && line.front() != '/' &&
-                     line.find("..") == line.npos && line.find('\0') == line.npos &&
-                     line.size() <= 4096) {
-                if (++seen > 2000000) return std::unexpected(fail("launcher-owned-limit"));
-                owned.insert(std::filesystem::path("/") / line);
+            else if (in_files && !line.empty()) {
+                if (++seen > kMaxOwnershipEntries) return std::unexpected(fail("launcher-coverage-incomplete"));
+                if (line.front() != '/' && line.find("..") == line.npos &&
+                    line.find('\0') == line.npos && line.size() <= 4096) {
+                    const auto path = std::filesystem::path("/") / line;
+                    if (launcher_path(path, roots)) owned.insert(path);
+                }
             }
             start = end + 1;
         }
@@ -117,10 +130,16 @@ std::expected<std::vector<LauncherEntry>, ManualError> UnmanagedLauncherScanner:
         dirs.emplace_back(paths.substr(start, end - start));
         start = end + 1;
     }
+    std::vector<std::filesystem::path> roots{data_home};
+    roots.insert(roots.end(), dirs.begin(), dirs.end());
+    if (roots.size() > 128) return std::unexpected(fail("launcher-limit"));
+    for (const auto& root : roots)
+        if (!root.is_absolute() || root.lexically_normal() != root) return std::unexpected(fail("launcher-path"));
+    std::size_t seen = 0;
     catalog::PacmanConfig config(runner);
     auto repositories = config.read();
     if (!repositories) return std::unexpected(fail("launcher-pacman"));
-    auto owned = owned_files(repositories->db_path);
+    auto owned = owned_files(repositories->db_path, roots, seen);
     if (!owned) return std::unexpected(owned.error());
     auto receipt_dir = state / "braurser/manual/receipts";
     std::error_code ec;
@@ -136,17 +155,20 @@ std::expected<std::vector<LauncherEntry>, ManualError> UnmanagedLauncherScanner:
             if (!data || !nlohmann::json::accept(*data)) return std::unexpected(fail("launcher-receipt"));
             auto record = nlohmann::json::parse(*data);
             if (!record.is_object() || !record.contains("files") || !record["files"].is_array() ||
-                !record.contains("scope") || !record["scope"].is_string())
+                !record.contains("scope") || !record["scope"].is_string() ||
+                (record["scope"] != "user" && record["scope"] != "system"))
                 return std::unexpected(fail("launcher-receipt"));
             auto prefix = record["scope"] == "system" ? std::filesystem::path("/usr/local") :
                 std::filesystem::path(home) / ".local";
             for (const auto& file : record["files"]) {
+                if (++seen > kMaxOwnershipEntries) return std::unexpected(fail("launcher-coverage-incomplete"));
                 if (!file.is_object() || !file.contains("path") || !file["path"].is_string())
                     return std::unexpected(fail("launcher-receipt"));
                 auto relative = std::filesystem::path(file["path"].get<std::string>());
                 if (relative.is_absolute() || relative.empty() || relative.string().find("..") != std::string::npos)
                     return std::unexpected(fail("launcher-receipt"));
-                owned->insert(prefix / relative);
+                const auto path = prefix / relative;
+                if (launcher_path(path, roots)) owned->insert(path);
             }
         }
     }
