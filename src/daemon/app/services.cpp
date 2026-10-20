@@ -54,6 +54,53 @@ protocol::PackageSummary summary(const catalog::SearchHit& hit) {
     return result;
 }
 
+std::optional<catalog::PackageDetails> catalog_package(cache::Store& store, std::string_view id) {
+    std::size_t slash = 0;
+    if (!br_split_target(id.data(), id.size(), &slash)) return std::nullopt;
+    const std::optional<std::string_view> repo = slash < id.size() ?
+        std::optional(id.substr(0, slash)) : std::nullopt;
+    const bool community = repo && (*repo == "aur" || *repo == "community");
+    const auto name = repo ? id.substr(slash + 1) : id;
+    catalog::SearchQuery query{std::string(name), {}, catalog::SortOrder::Relevance, {}, 200};
+    if (repo && !community) query.filters.repos.push_back(std::string(*repo));
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        auto page = store.search(query);
+        if (!page) return std::nullopt;
+        bool moved = false;
+        for (const auto& hit : page->hits) {
+            if (hit.name != name || (community && hit.source != domain::SourceKind::Community) ||
+                (repo && !community && (!hit.repo || *hit.repo != *repo))) continue;
+            auto detail = store.package(hit.id);
+            if (detail && *detail && (*detail)->summary.name == hit.name &&
+                (*detail)->summary.source == hit.source && (*detail)->summary.repo == hit.repo)
+                return std::move(**detail);
+            moved = true;
+            break;
+        }
+        if (!moved) return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+protocol::GetResult catalog_result(const catalog::PackageDetails& item) {
+    protocol::GetResult result;
+    const auto& url = item.repo_record ? item.repo_record->url : item.community_record->url;
+    std::optional<std::string> safe_url;
+    try {
+        protocol::validate_wire(nlohmann::json{{"url", url}});
+        safe_url = url;
+    } catch (const std::invalid_argument&) {}
+    result.details = {ref(item.summary), item.summary.version, item.summary.description,
+                      item.repo_record ? item.repo_record->depends : item.community_record->depends, safe_url};
+    if (item.repo_record) {
+        result.details.alsoIn = item.also_in;
+        result.details.shadowed = item.shadowed;
+    }
+    result.installedState = item.installed ? "installed" : "not-installed";
+    result.source = result.details.package.source;
+    return result;
+}
+
 std::string iso_time(std::chrono::system_clock::time_point time) {
     return std::format("{:%FT%TZ}", std::chrono::floor<std::chrono::seconds>(time));
 }
@@ -388,51 +435,13 @@ api::ServiceResult<protocol::BuildFilesResult> RealServices::build_files(const p
 }
 
 std::optional<catalog::PackageDetails> RealServices::package(std::string_view id) {
-    std::size_t slash = 0;
-    if (!br_split_target(id.data(), id.size(), &slash)) return std::nullopt;
-    const std::optional<std::string_view> repo = slash < id.size() ?
-        std::optional(id.substr(0, slash)) : std::nullopt;
-    const bool community = repo && (*repo == "aur" || *repo == "community");
-    const auto name = repo ? id.substr(slash + 1) : id;
-    catalog::SearchQuery query{std::string(name), {}, catalog::SortOrder::Relevance, {}, 200};
-    if (repo && !community) query.filters.repos.push_back(std::string(*repo));
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        auto page = store_.search(query);
-        if (!page) return std::nullopt;
-        bool moved = false;
-        for (const auto& hit : page->hits) {
-            if (hit.name != name || (community && hit.source != domain::SourceKind::Community) ||
-                (repo && !community && (!hit.repo || *hit.repo != *repo))) continue;
-            auto detail = store_.package(hit.id);
-            if (detail && *detail && (*detail)->summary.name == hit.name &&
-                (*detail)->summary.source == hit.source && (*detail)->summary.repo == hit.repo)
-                return std::move(**detail);
-            moved = true;
-            break;
-        }
-        if (!moved) return std::nullopt;
-    }
-    return std::nullopt;
+    return catalog_package(store_, id);
 }
 
 api::ServiceResult<protocol::GetResult> RealServices::get(const protocol::GetParams& params) {
     auto item = package(params.packageId);
     if (!item) return std::unexpected(failure(protocol::kInvalidParams));
-    protocol::GetResult result;
-    const auto& url = item->repo_record ? item->repo_record->url : item->community_record->url;
-    std::optional<std::string> safe_url;
-    try {
-        protocol::validate_wire(nlohmann::json{{"url", url}});
-        safe_url = url;
-    } catch (const std::invalid_argument&) {}
-    result.details = {ref(item->summary), item->summary.version, item->summary.description,
-                      item->repo_record ? item->repo_record->depends : item->community_record->depends, safe_url};
-    if (item->repo_record) {
-        result.details.alsoIn = item->also_in;
-        result.details.shadowed = item->shadowed;
-    }
-    result.installedState = item->installed ? "installed" : "not-installed";
-    result.source = result.details.package.source;
+    auto result = catalog_result(*item);
     if (item->app) {
         const auto& app = *item->app;
         protocol::AppMetadata metadata;
@@ -829,6 +838,15 @@ std::optional<manual::Preview> RealServices::preview_result(std::string_view id)
 }
 
 std::optional<protocol::UpdateReport> RealServices::latest_report() const { return report_; }
+
+api::ServiceResult<protocol::GetResult> RealServices::catalog_detail(const protocol::GetParams& params) const {
+    try {
+        cache::Store store(paths_.cache);
+        auto item = catalog_package(store, params.packageId);
+        if (!item) return std::unexpected(failure(protocol::kInvalidParams));
+        return catalog_result(*item);
+    } catch (const std::exception&) { return std::unexpected(failure()); }
+}
 
 api::ServiceResult<protocol::JobIdResult> RealServices::preview(const protocol::ManualPreviewParams& params) {
     if (!manual::validate_git_url(params.httpsUrl) ||

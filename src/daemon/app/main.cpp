@@ -62,7 +62,8 @@ int main(int argc, char** argv) {
     braurser::daemon::api::register_handlers(registry, *services);
     const auto stop_jobs = braurser::daemon::jobs::register_handlers(registry, *services, *paths, broadcaster,
         [&services] { return services->latest_report(); }, server,
-        [&services](std::string_view id) { return services->preview_result(id); });
+        [&services](std::string_view id) { return services->preview_result(id); },
+        [&services](const braurser::protocol::GetParams& params) { return services->catalog_detail(params); });
     braurser::daemon::notifications::register_service(registry, *services, paths->state, std::filesystem::read_symlink("/proc/self/exe").parent_path() / "braurser");
     services->start_monitors();
     services->startup_refresh();

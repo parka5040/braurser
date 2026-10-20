@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cctype>
+#include <cerrno>
 #include <set>
 #include <sys/stat.h>
 #include <sstream>
@@ -20,6 +21,21 @@
 namespace braurser::daemon::jobs {
 namespace {
 Error failure(int code) { return {code, "error.generic_title"}; }
+
+class CancellableRunner final : public core::ProcessRunner {
+public:
+    CancellableRunner(core::ProcessRunner& runner, const std::atomic<bool>& cancelled)
+        : runner_(runner), cancelled_(cancelled) {}
+    std::expected<core::ProcessResult, core::ProcessError> run(const core::ProcessSpec& spec) override {
+        if (cancelled_) return std::unexpected(core::ProcessError{ECANCELED, "cancelled"});
+        auto copy = spec;
+        copy.cancel = &cancelled_;
+        return runner_.run(copy);
+    }
+private:
+    core::ProcessRunner& runner_;
+    const std::atomic<bool>& cancelled_;
+};
 
 std::vector<std::string> words(std::string_view line) {
     std::istringstream stream{std::string(line)};
@@ -274,11 +290,60 @@ std::vector<manual::Receipt> recorded_receipts(const std::filesystem::path& stat
 }
 
 LivePlanSource::LivePlanSource(api::Services& services, core::ProcessRunner& runner, Report report,
-                               std::filesystem::path state, std::filesystem::path cache, PreviewLookup preview)
+                               std::filesystem::path state, std::filesystem::path cache, PreviewLookup preview,
+                               Detail detail)
     : services_(services), runner_(runner), report_(std::move(report)),
-      state_(std::move(state)), cache_(std::move(cache)), preview_(std::move(preview)), config_(runner) {}
+      state_(std::move(state)), cache_(std::move(cache)), preview_(std::move(preview)), detail_(std::move(detail)) {}
 
 Result<Snapshot> LivePlanSource::snapshot(const protocol::PlanParams& selection) {
+    const std::atomic<bool> cancelled{false};
+    return prepare(selection)(cancelled);
+}
+
+std::string LivePlanSource::inputs(const protocol::PlanParams& selection) {
+    const auto report = report_ ? report_() : std::nullopt;
+    auto fields = nlohmann::json::array({report ? nlohmann::json(*report) : nlohmann::json("no-report")});
+    if ((selection.kind == "manual-install" || selection.kind == "manual-upgrade") && selection.previewId) {
+        const auto preview = preview_ ? preview_(*selection.previewId) : std::nullopt;
+        if (preview) {
+            auto entries = nlohmann::json::array();
+            for (const auto& entry : preview->entry_points)
+                entries.push_back(nlohmann::json::array({entry.path, static_cast<int>(entry.kind)}));
+            fields.push_back(nlohmann::json::array({preview->preview_id, preview->host, preview->owner_repo,
+                preview->commit, preview->selected_script_text, preview->staging_supported, std::move(entries)}));
+        } else fields.push_back("no-preview");
+    }
+    const auto bytes = fields.dump();
+    gchar* hash = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
+        reinterpret_cast<const guchar*>(bytes.data()), bytes.size());
+    std::string result(hash);
+    g_free(hash);
+    return result;
+}
+
+PlanTask LivePlanSource::prepare(const protocol::PlanParams& selection) {
+    Inputs inputs;
+    inputs.report = report_ ? report_() : std::nullopt;
+    if (selection.kind == "manual-install" || selection.kind == "manual-upgrade") {
+        if (!preview_) return [](const std::atomic<bool>& cancelled) -> Result<Snapshot> {
+            return std::unexpected(failure(cancelled ? protocol::kCancelled : protocol::kInvalidParams));
+        };
+        if (selection.previewId) inputs.preview = preview_(*selection.previewId);
+    }
+    return [this, selection, inputs = std::move(inputs)](const std::atomic<bool>& cancelled) {
+        return compute(selection, inputs, cancelled);
+    };
+}
+
+Result<Snapshot> LivePlanSource::compute(const protocol::PlanParams& selection, const Inputs& inputs,
+                                       const std::atomic<bool>& cancelled) {
+    if (cancelled) return std::unexpected(failure(protocol::kCancelled));
+    CancellableRunner cancellable(runner_, cancelled);
+    catalog::PacmanConfig config(cancellable);
+    manual::CurlGitHttp git(cache_, &cancelled);
+    const auto lookup = [this](const protocol::GetParams& params) {
+        return detail_ ? detail_(params) : services_.get(params);
+    };
     if (selection.kind == "manual-remove") {
         if (!selection.receiptId || !selection.scope ||
             selection.packageId || selection.previewId || selection.variantId || selection.helper)
@@ -295,7 +360,8 @@ Result<Snapshot> LivePlanSource::snapshot(const protocol::PlanParams& selection)
             selection.scope || selection.variantId) return std::unexpected(failure(protocol::kInvalidParams));
         const std::string pkgname = selection.helper->value == "yay" ? "yay-bin" : "paru";
         const auto url = "https://aur.archlinux.org/" + pkgname + ".git";
-        auto fetched = manual::fetch_build_repository(git_http_, url, cache_, "setup-" + selection.helper->value);
+        if (cancelled) return std::unexpected(failure(protocol::kCancelled));
+        auto fetched = manual::fetch_build_repository(git, url, cache_, "setup-" + selection.helper->value);
         if (!fetched) return std::unexpected(failure(protocol::kUntrustedInput));
         Snapshot result;
         result.plan.kind = {"setup-helper"};
@@ -308,11 +374,11 @@ Result<Snapshot> LivePlanSource::snapshot(const protocol::PlanParams& selection)
         return result;
     }
     if (selection.kind == "manual-install" || selection.kind == "manual-upgrade") {
-        if (!selection.previewId || !selection.scope || !preview_ || !cache_.is_absolute() ||
+        if (!selection.previewId || !selection.scope || !cache_.is_absolute() ||
             selection.packageId || selection.helper || selection.variantId ||
             (selection.kind == "manual-install" && selection.receiptId))
             return std::unexpected(failure(protocol::kInvalidParams));
-        auto preview = preview_(*selection.previewId);
+        const auto& preview = inputs.preview;
         if (!preview || preview->preview_id != *selection.previewId ||
             preview->commit.size() != 40 || preview->entry_points.empty() ||
             preview->selected_script_text.empty() || !preview->staging_supported)
@@ -323,7 +389,7 @@ Result<Snapshot> LivePlanSource::snapshot(const protocol::PlanParams& selection)
         if (selection.kind == "manual-install" && selection.scope->value == "system") {
             auto pkgname = manual::system_package_name(url->url);
             if (!pkgname) return std::unexpected(failure(protocol::kUntrustedInput));
-            auto repositories = config_.read();
+            auto repositories = config.read();
             if (!repositories) return std::unexpected(failure(protocol::kBusy));
             auto installed = local_.read(repositories->db_path);
             if (!installed) return std::unexpected(failure(protocol::kBusy));
@@ -364,11 +430,11 @@ Result<Snapshot> LivePlanSource::snapshot(const protocol::PlanParams& selection)
         return result;
     }
     Snapshot result;
-    auto repositories = config_.read();
+    auto repositories = config.read();
     if (!repositories) return std::unexpected(failure(protocol::kBusy));
     auto local = local_.read(repositories->db_path);
     if (!local) return std::unexpected(failure(protocol::kBusy));
-    const auto report = report_ ? report_() : std::nullopt;
+    const auto& report = inputs.report;
     const auto kind = selection.kind;
     result.plan.kind = {kind};
     if (kind == "update-system" || kind == "upgrade-system") {
@@ -378,7 +444,7 @@ Result<Snapshot> LivePlanSource::snapshot(const protocol::PlanParams& selection)
             result.plan.upgrades.push_back(item.package);
             result.plan.restart.push_back(item.restart);
         }
-        auto bound = bind_transaction(result, *report, cache_, runner_);
+        auto bound = bind_transaction(result, *report, cache_, cancellable);
         if (!bound) return std::unexpected(bound.error());
         result.fingerprint = nlohmann::json(*report).dump() + result.fingerprint;
     } else if (kind == "install" || kind == "remove" || kind == "update-community" ||
@@ -388,7 +454,7 @@ Result<Snapshot> LivePlanSource::snapshot(const protocol::PlanParams& selection)
         const auto& id = *selection.packageId;
         if (!br_split_target(id.data(), id.size(), &slash)) return std::unexpected(failure(protocol::kInvalidParams));
         const auto name = id.substr(slash == id.size() ? 0 : slash + 1);
-        auto detail = services_.get(protocol::GetParams{id});
+        auto detail = lookup(protocol::GetParams{id});
         if (!detail) return std::unexpected(detail.error());
         result.fingerprint = nlohmann::json(*detail).dump();
         const bool community = detail->details.package.source.value == "community";
@@ -420,7 +486,7 @@ Result<Snapshot> LivePlanSource::snapshot(const protocol::PlanParams& selection)
             cache::Store store(cache_);
             std::optional<std::vector<catalog::RepoPackage>> official_packages;
             auto resolved = resolve_aur(result, name, machine.machine, *local,
-                [&](std::string_view package) { return services_.get(protocol::GetParams{std::string(package)}); },
+                [&](std::string_view package) { return lookup(protocol::GetParams{std::string(package)}); },
                 [&](std::string_view package) -> std::optional<std::string> {
                     catalog::SearchQuery query{std::string(package), {}, catalog::SortOrder::Relevance, {}, 200};
                     query.filters.aur_only = true;
@@ -442,7 +508,8 @@ Result<Snapshot> LivePlanSource::snapshot(const protocol::PlanParams& selection)
                     return std::nullopt;
                 },
                 [&](std::string_view base) -> Result<manual::BuildTree> {
-                    auto fetched = manual::fetch_build_tree(git_http_, base, cache_);
+                    if (cancelled) return std::unexpected(failure(protocol::kCancelled));
+                    auto fetched = manual::fetch_build_tree(git, base, cache_);
                     if (!fetched) return std::unexpected(Error{protocol::kUntrustedInput, fetched.error().code == "build-text-too-large" ? "detail.build_too_large" : "error.generic_title"});
                     return std::move(*fetched);
                 },
@@ -473,7 +540,7 @@ Result<Snapshot> LivePlanSource::snapshot(const protocol::PlanParams& selection)
                     return std::nullopt;
                 }, report && !report->official.empty());
             if (!resolved) return std::unexpected(resolved.error());
-            auto transaction = plan_aur_official(result, runner_);
+            auto transaction = plan_aur_official(result, cancellable);
             if (!transaction) return std::unexpected(transaction.error());
         } else {
             if (!community && detail->details.package.source.value != "official")
@@ -491,7 +558,7 @@ Result<Snapshot> LivePlanSource::snapshot(const protocol::PlanParams& selection)
                         result.plan.upgrades.push_back(update.package);
                         result.plan.restart.push_back(update.restart);
                     }
-                    auto bound = bind_transaction(result, *report, cache_, runner_);
+                    auto bound = bind_transaction(result, *report, cache_, cancellable);
                     if (!bound) return std::unexpected(bound.error());
                     result.fingerprint += nlohmann::json(*report).dump();
                 }
@@ -506,14 +573,14 @@ Result<Snapshot> LivePlanSource::snapshot(const protocol::PlanParams& selection)
             spec.max_stdout = 4 * 1024 * 1024;
             spec.max_stderr = 64 * 1024;
             if (result.plan.kind.value != "update-and-install") {
-                auto preview = runner_.run(spec);
+                auto preview = cancellable.run(spec);
                 if (!preview || preview->exit_code != 0 || preview->out_truncated || preview->err_truncated ||
                     !parse_print(preview->out, result, kind, *local))
                     return std::unexpected(failure(protocol::kUnsafeTransaction));
                 result.fingerprint += preview->out;
             }
             if (kind == "remove") {
-                auto guarded = protected_names(config_, local_, repositories->db_path, result.plan.removals, *local);
+                auto guarded = protected_names(config, local_, repositories->db_path, result.plan.removals, *local);
                 if (!guarded) return std::unexpected(failure(protocol::kBusy));
                 for (auto& blocked : *guarded)
                     result.plan.protected_blockers.push_back({{"official"}, {}, std::move(blocked)});

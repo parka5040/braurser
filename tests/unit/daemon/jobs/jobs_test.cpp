@@ -9,14 +9,44 @@
 #include <glib.h>
 #include <fstream>
 #include <memory>
+#include <set>
 #include <unistd.h>
 
 namespace braurser::daemon::jobs {
 namespace {
 
+template<class T, class Start>
+Result<T> inline_result(Start start) {
+    std::optional<Result<T>> result;
+    start([&result](Result<T> value) { result = std::move(value); });
+    EXPECT_TRUE(result.has_value());
+    if (!result) throw std::runtime_error("inline completion was deferred");
+    return std::move(*result);
+}
+
+Result<protocol::TransactionPlan> create_now(PlanManager& plans, const protocol::PlanParams& selection,
+                                             api::ConnectionId owner) {
+    return inline_result<protocol::TransactionPlan>([&](auto done) { plans.create(selection, owner, std::move(done)); });
+}
+
+Result<Snapshot> approve_now(PlanManager& plans, std::string_view id, std::string_view token, api::ConnectionId owner) {
+    return inline_result<Snapshot>([&](auto done) { plans.approve(id, token, owner, std::move(done)); });
+}
+
+Result<protocol::JobIdResult> enqueue_now(JobRunner& runner, std::string_view id, std::string_view token,
+                                         api::ConnectionId owner, std::string_view kind = {}) {
+    return inline_result<protocol::JobIdResult>([&](auto done) { runner.enqueue(id, token, owner, kind, std::move(done)); });
+}
+
 class Source final : public PlanSource {
 public:
     std::string fingerprint{"unchanged"};
+    std::string inputs_token;
+    bool inputs_throw{};
+    std::string inputs(const protocol::PlanParams&) override {
+        if (inputs_throw) throw std::runtime_error("inputs unavailable");
+        return inputs_token;
+    }
     std::string kind{"install"};
     std::string helper{"auto"};
     std::vector<std::string> review;
@@ -102,16 +132,447 @@ protected:
         std::filesystem::remove_all(state, error);
     }
     protocol::TransactionPlan plan(std::string name = "tree") {
-        auto result = plans.create(protocol::PlanParams{.kind = source.kind, .packageId = std::move(name)}, 11);
+        auto result = create_now(plans, protocol::PlanParams{.kind = source.kind, .packageId = std::move(name)}, 11);
         EXPECT_TRUE(result.has_value());
         return result.value();
     }
     std::string enqueue(const protocol::TransactionPlan& approved) {
-        auto result = runner->enqueue(approved.plan_id, approved.approval_token, 11);
+        auto result = enqueue_now(*runner, approved.plan_id, approved.approval_token, 11);
         EXPECT_TRUE(result.has_value());
         return result->jobId;
     }
 };
+
+class DeferredPlanExecutor final : public PlanExecutor {
+public:
+    struct Pending {
+        Ticket ticket;
+        PlanLane lane;
+        PlanTask task;
+        Done done;
+        bool cancelled{};
+    };
+    std::deque<Pending> pending;
+    std::size_t cancellations{};
+    bool refuse{};
+    Ticket submit(PlanLane lane, PlanTask task, Done done) override {
+        if (stopped_ || refuse) return 0;
+        const auto ticket = ++next_;
+        pending.push_back({ticket, lane, std::move(task), std::move(done), false});
+        return ticket;
+    }
+    void cancel(Ticket ticket) override {
+        for (auto& item : pending) {
+            if (item.ticket != ticket) continue;
+            item.cancelled = true;
+            ++cancellations;
+        }
+    }
+    void stop() override { stopped_ = true; pending.clear(); }
+    void run_next(std::optional<int> error = {}) {
+        ASSERT_FALSE(pending.empty());
+        auto it = std::ranges::find_if(pending, [](const auto& item) { return item.lane == PlanLane::Approval; });
+        if (it == pending.end()) it = pending.begin();
+        auto item = std::move(*it);
+        pending.erase(it);
+        const std::atomic<bool> cancelled{item.cancelled};
+        if (item.cancelled) item.done(std::unexpected(Error{protocol::kCancelled, "error.generic_title"}));
+        else if (error) item.done(std::unexpected(Error{*error, "error.generic_title"}));
+        else item.done(item.task(cancelled));
+    }
+    void run_all() { while (!pending.empty()) run_next(); }
+private:
+    Ticket next_{};
+    bool stopped_{};
+};
+
+class JobsAsyncFixture : public JobsFixture {
+protected:
+    DeferredPlanExecutor executor;
+    std::set<api::ConnectionId> closing;
+    PlanManager async_plans{source, [this] { return now; }, &executor,
+        [this](api::ConnectionId owner) { return !closing.contains(owner); }};
+    using PlanResult = std::optional<Result<protocol::TransactionPlan>>;
+    using JobResult = std::shared_ptr<std::optional<Result<protocol::JobIdResult>>>;
+
+    void SetUp() override {
+        JobsFixture::SetUp();
+        runner = std::make_unique<JobRunner>(async_plans, [this] {
+            auto process = std::make_shared<ProcessState>();
+            processes.push_back(process);
+            return std::make_unique<FakeProcess>(process);
+        }, JobRunner::Notify{}, state, ElevationOptions{elevation::Method::Pkexec, "/usr/local/libexec/braurser"},
+        JobRunner::BuildSpec{}, JobRunner::Verify{}, JobRunner::Classify{}, [this] { return now; });
+    }
+    void TearDown() override {
+        executor.stop();
+        JobsFixture::TearDown();
+    }
+    protocol::TransactionPlan prepare(std::string name = "tree", api::ConnectionId owner = 11) {
+        PlanResult result;
+        async_plans.create({.kind = "install", .packageId = std::move(name)}, owner,
+            [&result](auto value) { result = std::move(value); });
+        executor.run_all();
+        EXPECT_TRUE(result && result->has_value());
+        return result->value();
+    }
+    JobResult submit(const protocol::TransactionPlan& value, api::ConnectionId owner = 11) {
+        auto result = std::make_shared<std::optional<Result<protocol::JobIdResult>>>();
+        runner->enqueue(value.plan_id, value.approval_token, owner, "install",
+            [result](auto value_result) { *result = std::move(value_result); });
+        return result;
+    }
+};
+
+TEST_F(JobsAsyncFixture, ClosingOwnerCancelsCreateBeforeDisconnectCallback) {
+    PlanResult result;
+    int completions = 0;
+    async_plans.create({.kind = "install", .packageId = "tree"}, 11, [&](auto value) {
+        ++completions;
+        result = std::move(value);
+    });
+    closing.insert(11);
+    executor.run_all();
+    ASSERT_TRUE(result);
+    ASSERT_FALSE(result->has_value());
+    EXPECT_EQ(result->error().code, protocol::kCancelled);
+    EXPECT_EQ(completions, 1);
+    EXPECT_EQ(approve_now(async_plans, "any-plan", "any-token", 11).error().code, protocol::kStalePlan);
+    EXPECT_TRUE(processes.empty());
+    EXPECT_FALSE(prepare("nano", 12).approval_token.empty());
+}
+
+TEST_F(JobsAsyncFixture, ClosingOwnerCancelsApprovalBeforeDisconnectCallback) {
+    const auto value = prepare();
+    const auto result = submit(value);
+    closing.insert(11);
+    executor.run_all();
+    ASSERT_TRUE(*result);
+    ASSERT_FALSE(result->value().has_value());
+    EXPECT_EQ(result->value().error().code, protocol::kCancelled);
+    EXPECT_TRUE(runner->list({.limit = 100}, 11)->jobs.empty());
+    EXPECT_TRUE(processes.empty());
+    EXPECT_EQ(approve_now(async_plans, value.plan_id, value.approval_token, 11).error().code, protocol::kStalePlan);
+    const auto live = submit(prepare("nano", 12), 12);
+    executor.run_all();
+    ASSERT_TRUE(*live && live->value().has_value());
+    EXPECT_EQ(runner->get({live->value()->jobId}, 12)->state.value, "running");
+    EXPECT_EQ(processes.size(), 1U);
+}
+
+TEST_F(JobsAsyncFixture, ChangedInputsRejectCreateWithoutStoringAnEntry) {
+    PlanResult result;
+    async_plans.create({.kind = "install", .packageId = "tree"}, 11,
+        [&](auto value) { result = std::move(value); });
+    source.inputs_token = "replacement";
+    executor.run_all();
+    ASSERT_TRUE(result);
+    ASSERT_FALSE(result->has_value());
+    EXPECT_EQ(result->error().code, protocol::kStalePlan);
+    EXPECT_EQ(approve_now(async_plans, "any-plan", "any-token", 11).error().code, protocol::kStalePlan);
+    EXPECT_TRUE(processes.empty());
+    EXPECT_FALSE(prepare().approval_token.empty());
+}
+
+TEST_F(JobsAsyncFixture, ChangedInputsRejectApprovalWithoutCreatingJob) {
+    const auto value = prepare();
+    const auto result = submit(value);
+    source.inputs_token = "replacement";
+    executor.run_all();
+    ASSERT_TRUE(*result);
+    ASSERT_FALSE(result->value().has_value());
+    EXPECT_EQ(result->value().error().code, protocol::kStalePlan);
+    EXPECT_TRUE(runner->list({.limit = 100}, 11)->jobs.empty());
+    EXPECT_TRUE(processes.empty());
+    EXPECT_EQ(approve_now(async_plans, value.plan_id, value.approval_token, 11).error().code, protocol::kStalePlan);
+}
+
+TEST_F(JobsAsyncFixture, ChangedHeadInputsReleaseNextJobWithoutStartingStaleJob) {
+    const auto first = prepare("tree");
+    const auto second = prepare("nano");
+    const auto one = submit(first);
+    const auto two = submit(second);
+    executor.run_next();
+    executor.run_next();
+    ASSERT_TRUE(*one && one->value().has_value());
+    ASSERT_TRUE(*two && two->value().has_value());
+    EXPECT_TRUE(processes.empty());
+    source.inputs_token = "replacement";
+    executor.run_next();
+    EXPECT_EQ(runner->get({one->value()->jobId}, 11)->state.value, "needs-attention");
+    EXPECT_TRUE(processes.empty());
+    executor.run_all();
+    EXPECT_EQ(runner->get({two->value()->jobId}, 11)->state.value, "running");
+    ASSERT_EQ(processes.size(), 1U);
+    EXPECT_EQ(processes.front()->spec.args.back(), "nano");
+}
+
+TEST_F(JobsAsyncFixture, InputExceptionsRejectSuccessfulCompletions) {
+    const auto approved = prepare();
+    const auto queued = prepare("nano");
+    const auto head = submit(queued);
+    executor.run_next();
+    ASSERT_TRUE(*head && head->value().has_value());
+    const auto approval = submit(approved);
+    PlanResult created;
+    async_plans.create({.kind = "install", .packageId = "htop"}, 11,
+        [&](auto value) { created = std::move(value); });
+    source.inputs_throw = true;
+    executor.run_all();
+    ASSERT_TRUE(created);
+    ASSERT_FALSE(created->has_value());
+    EXPECT_EQ(created->error().code, protocol::kStalePlan);
+    ASSERT_TRUE(*approval);
+    ASSERT_FALSE(approval->value().has_value());
+    EXPECT_EQ(approval->value().error().code, protocol::kStalePlan);
+    EXPECT_EQ(runner->get({head->value()->jobId}, 11)->state.value, "needs-attention");
+    EXPECT_TRUE(processes.empty());
+}
+
+TEST_F(JobsAsyncFixture, InputExceptionsBeforePrepareFailClosed) {
+    const auto value = prepare();
+    source.inputs_throw = true;
+    EXPECT_EQ(create_now(async_plans, {.kind = "install", .packageId = "tree"}, 11).error().code,
+        protocol::kStalePlan);
+    EXPECT_EQ(approve_now(async_plans, value.plan_id, value.approval_token, 11).error().code, protocol::kStalePlan);
+    bool checked = true;
+    EXPECT_EQ(async_plans.unchanged({}, {.kind = "install", .packageId = "tree"},
+        [&](bool matches) { checked = matches; }), 0U);
+    EXPECT_FALSE(checked);
+    EXPECT_TRUE(executor.pending.empty());
+}
+
+TEST_F(JobsAsyncFixture, DisconnectCancelsCreateAndNeverStoresAnEntry) {
+    PlanResult result;
+    int completions = 0;
+    async_plans.create({.kind = "install", .packageId = "tree"}, 11, [&](auto value) {
+        ++completions;
+        result = std::move(value);
+    });
+    EXPECT_FALSE(result);
+    async_plans.disconnect(11);
+    EXPECT_FALSE(result);
+    executor.run_all();
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->error().code, protocol::kCancelled);
+    EXPECT_EQ(completions, 1);
+    EXPECT_EQ(approve_now(async_plans, "any-plan", "any-token", 11).error().code, protocol::kStalePlan);
+    EXPECT_TRUE(processes.empty());
+}
+
+TEST_F(JobsAsyncFixture, DisconnectCancelsApprovalAndReleasesCapacity) {
+    std::vector<protocol::TransactionPlan> values;
+    for (api::ConnectionId index = 0; index < 256; ++index)
+        values.push_back(prepare("pkg" + std::to_string(index), 11 + index));
+    std::vector<JobResult> results;
+    for (std::size_t index = 0; index < values.size(); ++index)
+        results.push_back(submit(values[index], 11 + static_cast<api::ConnectionId>(index)));
+    EXPECT_EQ(executor.pending.size(), 256U);
+    for (api::ConnectionId owner = 11; owner < 267; ++owner) {
+        async_plans.disconnect(owner);
+        runner->disconnect(owner);
+    }
+    executor.run_all();
+    for (const auto& result : results) {
+        ASSERT_TRUE(*result);
+        EXPECT_EQ(result->value().error().code, protocol::kCancelled);
+    }
+    for (api::ConnectionId owner = 11; owner < 267; ++owner) EXPECT_TRUE(runner->list({.limit = 100}, owner)->jobs.empty());
+    EXPECT_TRUE(processes.empty());
+    const auto next = submit(prepare("other", 900), 900);
+    executor.run_all();
+    ASSERT_TRUE(*next && next->value().has_value());
+    EXPECT_EQ(runner->get({next->value()->jobId}, 900)->state.value, "running");
+    EXPECT_EQ(processes.size(), 1U);
+}
+
+TEST_F(JobsAsyncFixture, PerOwnerLimitIncludesCreatesAndApprovals) {
+    const auto first = prepare();
+    const auto approval = submit(first);
+    std::vector<PlanResult> results(5);
+    for (std::size_t index = 0; index < 4; ++index)
+        async_plans.create({.kind = "install", .packageId = "nano"}, 11,
+            [&, index](auto result) { results[index] = std::move(result); });
+    ASSERT_TRUE(results[3]);
+    EXPECT_EQ(results[3]->error().code, protocol::kBusy);
+    async_plans.create({.kind = "install", .packageId = "htop"}, 12,
+        [&](auto result) { results[4] = std::move(result); });
+    EXPECT_FALSE(results[4]);
+    executor.run_all();
+    EXPECT_TRUE(*approval && approval->value().has_value());
+    for (std::size_t index = 0; index < 3; ++index) EXPECT_TRUE(results[index] && results[index]->has_value());
+    EXPECT_TRUE(results[4] && results[4]->has_value());
+}
+
+TEST_F(JobsAsyncFixture, FifthConcurrentCreateIsBusyButAnotherOwnerSucceeds) {
+    std::vector<PlanResult> results(6);
+    for (std::size_t index = 0; index < 6; ++index)
+        async_plans.create({.kind = "install", .packageId = "tree"}, index == 5 ? 12 : 11,
+            [&, index](auto result) { results[index] = std::move(result); });
+    ASSERT_TRUE(results[4]);
+    EXPECT_EQ(results[4]->error().code, protocol::kBusy);
+    EXPECT_FALSE(results[5]);
+    executor.run_all();
+    EXPECT_TRUE(results[5] && results[5]->has_value());
+}
+
+TEST_F(JobsAsyncFixture, ApprovalSpendsTokenBeforeItsRecheck) {
+    const auto value = prepare();
+    std::optional<Result<Snapshot>> first;
+    async_plans.approve(value.plan_id, value.approval_token, 11, [&](auto result) { first = std::move(result); });
+    EXPECT_FALSE(first);
+    EXPECT_EQ(approve_now(async_plans, value.plan_id, value.approval_token, 11).error().code, protocol::kStalePlan);
+    executor.run_all();
+    ASSERT_TRUE(first);
+    EXPECT_TRUE(first->has_value());
+}
+
+TEST_F(JobsAsyncFixture, HeadRecheckWaitsThenStaleHeadReleasesNextCheck) {
+    const auto first = prepare("tree");
+    const auto second = prepare("nano");
+    const auto one = submit(first);
+    const auto two = submit(second);
+    executor.run_next();
+    ASSERT_TRUE(*one && one->value().has_value());
+    const auto first_id = one->value()->jobId;
+    EXPECT_EQ(runner->get({first_id}, 11)->state.value, "queued");
+    EXPECT_TRUE(processes.empty());
+    executor.run_next();
+    ASSERT_TRUE(*two && two->value().has_value());
+    executor.run_next(protocol::kBusy);
+    EXPECT_EQ(runner->get({first_id}, 11)->state.value, "needs-attention");
+    EXPECT_TRUE(processes.empty());
+    const auto second_id = two->value()->jobId;
+    EXPECT_EQ(runner->get({second_id}, 11)->state.value, "queued");
+    EXPECT_TRUE(processes.empty());
+    executor.run_next();
+    EXPECT_EQ(runner->get({second_id}, 11)->state.value, "running");
+    ASSERT_EQ(processes.size(), 1U);
+    EXPECT_EQ(processes.front()->spec.args.back(), "nano");
+}
+
+TEST_F(JobsAsyncFixture, CancelDuringHeadCheckNeverStartsCancelledJob) {
+    const auto first = prepare("tree");
+    const auto second = prepare("nano");
+    const auto one = submit(first);
+    const auto two = submit(second);
+    executor.run_next();
+    ASSERT_TRUE(*one && one->value().has_value());
+    const auto id = one->value()->jobId;
+    EXPECT_TRUE(runner->cancel(id, 11)->accepted);
+    EXPECT_EQ(executor.cancellations, 1U);
+    EXPECT_EQ(runner->get({id}, 11)->state.value, "cancelled");
+    EXPECT_TRUE(processes.empty());
+    executor.run_all();
+    EXPECT_EQ(runner->get({id}, 11)->state.value, "cancelled");
+    ASSERT_TRUE(*two && two->value().has_value());
+    EXPECT_EQ(runner->get({two->value()->jobId}, 11)->state.value, "running");
+    ASSERT_EQ(processes.size(), 1U);
+    EXPECT_EQ(processes.front()->spec.args.back(), "nano");
+}
+
+TEST_F(JobsAsyncFixture, ApprovalsAndChecksPreserveFifo) {
+    const auto first = prepare("tree");
+    const auto second = prepare("nano");
+    const auto one = submit(first);
+    const auto two = submit(second);
+    executor.run_all();
+    ASSERT_TRUE(*one && one->value().has_value());
+    ASSERT_TRUE(*two && two->value().has_value());
+    EXPECT_EQ(runner->get({one->value()->jobId}, 11)->state.value, "running");
+    EXPECT_EQ(runner->get({two->value()->jobId}, 11)->state.value, "queued");
+    ASSERT_EQ(processes.size(), 1U);
+    EXPECT_EQ(processes.front()->spec.args.back(), "tree");
+    processes.front()->finish(0);
+    EXPECT_EQ(processes.size(), 1U);
+    EXPECT_EQ(runner->get({two->value()->jobId}, 11)->state.value, "queued");
+    executor.run_all();
+    ASSERT_EQ(processes.size(), 2U);
+    EXPECT_EQ(processes.back()->spec.args.back(), "nano");
+}
+
+TEST_F(JobsAsyncFixture, StopIgnoresLateApprovalAndHeadCheckCompletions) {
+    const auto first = prepare("tree");
+    const auto second = prepare("nano");
+    const auto one = submit(first);
+    executor.run_next();
+    ASSERT_TRUE(*one && one->value().has_value());
+    const auto two = submit(second);
+    EXPECT_EQ(executor.pending.size(), 2U);
+    runner->stop();
+    executor.run_next();
+    EXPECT_FALSE(*two);
+    EXPECT_TRUE(processes.empty());
+    EXPECT_EQ(runner->get({one->value()->jobId}, 11)->state.value, "queued");
+    runner.reset();
+    executor.run_all();
+    EXPECT_FALSE(*two);
+    EXPECT_TRUE(processes.empty());
+}
+
+TEST_F(JobsAsyncFixture, HeadFingerprintChangeFailsClosed) {
+    const auto value = prepare();
+    const auto result = submit(value);
+    executor.run_next();
+    ASSERT_TRUE(*result && result->value().has_value());
+    const auto id = result->value()->jobId;
+    source.fingerprint = "changed";
+    executor.run_next();
+    EXPECT_EQ(runner->get({id}, 11)->state.value, "needs-attention");
+    EXPECT_TRUE(processes.empty());
+}
+
+TEST_F(JobsAsyncFixture, RefusedHeadCheckDoesNotStartAProcess) {
+    const auto value = prepare();
+    const auto result = submit(value);
+    executor.refuse = true;
+    executor.run_next();
+    ASSERT_TRUE(*result && result->value().has_value());
+    EXPECT_EQ(runner->get({result->value()->jobId}, 11)->state.value, "needs-attention");
+    EXPECT_TRUE(processes.empty());
+}
+
+TEST_F(JobsAsyncFixture, PurgingUsedEntryDoesNotInvalidateApprovalSnapshot) {
+    const auto value = prepare();
+    std::optional<Result<Snapshot>> approved;
+    async_plans.approve(value.plan_id, value.approval_token, 11, [&](auto result) { approved = std::move(result); });
+    PlanResult created;
+    async_plans.create({.kind = "install", .packageId = "nano"}, 12, [&](auto result) { created = std::move(result); });
+    executor.run_all();
+    ASSERT_TRUE(approved && approved->has_value());
+    EXPECT_EQ(approved->value().targets, std::vector<std::string>{"tree"});
+    EXPECT_TRUE(created && created->has_value());
+}
+
+TEST_F(JobsAsyncFixture, DisconnectDropsOnlyItsOwnersUnapprovedEntries) {
+    const auto first = prepare();
+    const auto second = prepare("nano", 12);
+    async_plans.disconnect(11);
+    EXPECT_EQ(approve_now(async_plans, first.plan_id, first.approval_token, 11).error().code, protocol::kStalePlan);
+    const auto other = submit(second, 12);
+    executor.run_all();
+    ASSERT_TRUE(*other && other->value().has_value());
+    EXPECT_EQ(processes.size(), 1U);
+}
+
+TEST_F(JobsAsyncFixture, RefusedSubmissionCompletesOnceAndReleasesFlight) {
+    executor.refuse = true;
+    for (int index = 0; index < 5; ++index) {
+        int completions = 0;
+        async_plans.create({.kind = "install", .packageId = "tree"}, 11, [&](auto result) {
+            ++completions;
+            EXPECT_EQ(result.error().code, protocol::kBusy);
+        });
+        EXPECT_EQ(completions, 1);
+    }
+    executor.refuse = false;
+    const auto value = prepare();
+    executor.refuse = true;
+    const auto result = submit(value);
+    ASSERT_TRUE(*result);
+    EXPECT_EQ(result->value().error().code, protocol::kBusy);
+    EXPECT_TRUE(processes.empty());
+}
 
 TEST(JobsSpec, CanonicalOfficialTransactionsForBothElevationMethods) {
     ElevationOptions auth{elevation::Method::Pkexec, "/usr/local/libexec/braurser"};
@@ -369,22 +830,22 @@ TEST(PlanApproval, ConnectionBindingSingleUseExpiryAndFreshness) {
     auto now = std::chrono::steady_clock::now();
     PlanManager plans(source, [&] { return now; });
     const protocol::PlanParams request{.kind = "install", .packageId = "tree"};
-    auto plan = plans.create(request, 18);
+    auto plan = create_now(plans, request, 18);
     ASSERT_TRUE(plan);
     EXPECT_EQ(plan->approval_token.size(), 32);
-    EXPECT_EQ(plans.approve(plan->plan_id, plan->approval_token, 19).error().code, protocol::kStalePlan);
-    EXPECT_EQ(plans.approve(plan->plan_id, "wrong", 18).error().code, protocol::kStalePlan);
+    EXPECT_EQ(approve_now(plans, plan->plan_id, plan->approval_token, 19).error().code, protocol::kStalePlan);
+    EXPECT_EQ(approve_now(plans, plan->plan_id, "wrong", 18).error().code, protocol::kStalePlan);
     source.fingerprint = "changed";
-    EXPECT_EQ(plans.approve(plan->plan_id, plan->approval_token, 18).error().code, protocol::kStalePlan);
+    EXPECT_EQ(approve_now(plans, plan->plan_id, plan->approval_token, 18).error().code, protocol::kStalePlan);
     source.fingerprint = "unchanged";
-    EXPECT_EQ(plans.approve(plan->plan_id, plan->approval_token, 18).error().code, protocol::kStalePlan);
-    auto other = plans.create(request, 18);
+    EXPECT_EQ(approve_now(plans, plan->plan_id, plan->approval_token, 18).error().code, protocol::kStalePlan);
+    auto other = create_now(plans, request, 18);
     ASSERT_TRUE(other);
-    ASSERT_TRUE(plans.approve(other->plan_id, other->approval_token, 18));
-    EXPECT_EQ(plans.approve(other->plan_id, other->approval_token, 18).error().code, protocol::kStalePlan);
-    other = plans.create(request, 18);
+    ASSERT_TRUE(approve_now(plans, other->plan_id, other->approval_token, 18));
+    EXPECT_EQ(approve_now(plans, other->plan_id, other->approval_token, 18).error().code, protocol::kStalePlan);
+    other = create_now(plans, request, 18);
     now += std::chrono::minutes(10);
-    EXPECT_EQ(plans.approve(other->plan_id, other->approval_token, 18).error().code, protocol::kStalePlan);
+    EXPECT_EQ(approve_now(plans, other->plan_id, other->approval_token, 18).error().code, protocol::kStalePlan);
 }
 
 TEST(PlanApproval, ReclaimsUsedAndExpiredEntries) {
@@ -392,23 +853,23 @@ TEST(PlanApproval, ReclaimsUsedAndExpiredEntries) {
     auto now = std::chrono::steady_clock::now();
     PlanManager plans(source, [&] { return now; });
     const protocol::PlanParams selection{.kind = "install", .packageId = "tree"};
-    auto first = plans.create(selection, 11);
+    auto first = create_now(plans, selection, 11);
     ASSERT_TRUE(first);
-    ASSERT_TRUE(plans.approve(first->plan_id, first->approval_token, 11));
-    for (int count = 0; count < 256; ++count) ASSERT_TRUE(plans.create(selection, 11));
-    EXPECT_EQ(plans.create(selection, 11).error().code, protocol::kBusy);
+    ASSERT_TRUE(approve_now(plans, first->plan_id, first->approval_token, 11));
+    for (int count = 0; count < 256; ++count) ASSERT_TRUE(create_now(plans, selection, 11));
+    EXPECT_EQ(create_now(plans, selection, 11).error().code, protocol::kBusy);
     now += std::chrono::minutes(10);
-    EXPECT_TRUE(plans.create(selection, 11));
+    EXPECT_TRUE(create_now(plans, selection, 11));
 }
 
 TEST_F(JobsFixture, MutationEndpointMustMatchApprovedKind) {
     auto approved = plan("tree");
-    auto rejected = runner->enqueue(approved.plan_id, approved.approval_token, 11, "remove");
+    auto rejected = enqueue_now(*runner, approved.plan_id, approved.approval_token, 11, "remove");
     ASSERT_FALSE(rejected);
     EXPECT_EQ(rejected.error().code, protocol::kInvalidParams);
     EXPECT_TRUE(processes.empty());
     approved = plan("nano");
-    ASSERT_TRUE(runner->enqueue(approved.plan_id, approved.approval_token, 11, "install"));
+    ASSERT_TRUE(enqueue_now(*runner, approved.plan_id, approved.approval_token, 11, "install"));
     ASSERT_EQ(processes.size(), 1);
 }
 
@@ -428,12 +889,12 @@ TEST_F(JobsFixture, UserRemovalRunsWithoutElevation) {
     JobRunner::BuildSpec{}, JobRunner::Verify{}, JobRunner::Classify{}, [this] { return now; },
     JobRunner::Success{}, &installer);
     source.kind = "install";
-    auto first = plans.create({.kind = "install", .packageId = "tree"}, 11);
+    auto first = create_now(plans, {.kind = "install", .packageId = "tree"}, 11);
     ASSERT_TRUE(first);
     auto first_id = enqueue(*first);
     ASSERT_EQ(runner->get({first_id}, 11)->state.value, "failed");
     source.kind = "manual-remove";
-    auto removal = plans.create({.kind = "manual-remove", .receiptId = "receipt-a", .scope = protocol::ReceiptScope{"user"}}, 11);
+    auto removal = create_now(plans, {.kind = "manual-remove", .receiptId = "receipt-a", .scope = protocol::ReceiptScope{"user"}}, 11);
     ASSERT_TRUE(removal);
     Gio::init();
     const auto id = enqueue(*removal);
@@ -466,7 +927,7 @@ TEST_F(JobsFixture, UserRemovalWaitsForActiveProcess) {
     JobRunner::BuildSpec{}, JobRunner::Verify{}, JobRunner::Classify{}, [this] { return now; },
     JobRunner::Success{}, &installer);
     const auto first = enqueue(plan());
-    const auto removal = plans.create({.kind = "manual-remove", .receiptId = "receipt-a",
+    const auto removal = create_now(plans, {.kind = "manual-remove", .receiptId = "receipt-a",
         .scope = protocol::ReceiptScope{"user"}}, 11);
     ASSERT_TRUE(removal);
     const auto second = enqueue(*removal);
@@ -663,20 +1124,20 @@ TEST_F(JobsFixture, ProtectedBlockersAndConflictsAreRefusedBeforeQueueing) {
     source.kind = "remove";
     source.protected_blockers = {{{"official"}, {}, "linux"}};
     auto blocked = plan("linux");
-    auto refused = runner->enqueue(blocked.plan_id, blocked.approval_token, 11, "remove");
+    auto refused = enqueue_now(*runner, blocked.plan_id, blocked.approval_token, 11, "remove");
     ASSERT_FALSE(refused);
     EXPECT_EQ(refused.error().code, protocol::kUnsafeTransaction);
     source.protected_blockers.clear();
     source.conflicts = {"sudo"};
     auto conflicting = plan("sudo-rs");
-    refused = runner->enqueue(conflicting.plan_id, conflicting.approval_token, 11, "remove");
+    refused = enqueue_now(*runner, conflicting.plan_id, conflicting.approval_token, 11, "remove");
     ASSERT_FALSE(refused);
     EXPECT_EQ(refused.error().code, protocol::kUnsafeTransaction);
     EXPECT_TRUE(processes.empty());
     EXPECT_TRUE(runner->list({.limit = 100}, 11)->jobs.empty());
     source.conflicts.clear();
     auto allowed = plan("tree");
-    ASSERT_TRUE(runner->enqueue(allowed.plan_id, allowed.approval_token, 11, "remove"));
+    ASSERT_TRUE(enqueue_now(*runner, allowed.plan_id, allowed.approval_token, 11, "remove"));
     EXPECT_EQ(processes.size(), 1U);
 }
 
@@ -843,7 +1304,7 @@ TEST_F(JobsFixture, StopStartsNoFurtherJobsAndRefusesNewOnes) {
     EXPECT_EQ(runner->get({second}, 11)->state.value, "queued");
     EXPECT_EQ(processes.size(), 1U);
     auto late = plan("htop");
-    auto refused = runner->enqueue(late.plan_id, late.approval_token, 11);
+    auto refused = enqueue_now(*runner, late.plan_id, late.approval_token, 11);
     ASSERT_FALSE(refused);
     EXPECT_EQ(refused.error().code, protocol::kBusy);
     runner->disconnect(11);
@@ -1185,10 +1646,12 @@ TEST_F(JobsFixture, FinishedLogsStayWithinAggregateBudgetAndEvictOldSummaries) {
 
 class LivePlanServices final : public api::Services {
 public:
+    int get_calls{};
     api::ServiceResult<protocol::HelloResult> hello(const protocol::HelloParams&) override { return {}; }
     api::ServiceResult<protocol::StatusResult> status(const protocol::StatusParams&) override { return {}; }
     api::ServiceResult<protocol::SearchResult> search(const protocol::SearchParams&) override { return {}; }
     api::ServiceResult<protocol::GetResult> get(const protocol::GetParams&) override {
+        ++get_calls;
         protocol::GetResult result;
         result.details.package = {{"official"}, "extra", "target"};
         result.details.version = "1-1";
@@ -1260,6 +1723,144 @@ protected:
         std::filesystem::remove_all(root, error);
     }
 };
+
+TEST_F(JobsLivePlan, InputsAreStableAndBindTheCurrentReport) {
+    const protocol::PlanParams selection{.kind = "install", .packageId = "target"};
+    const auto original = source->inputs(selection);
+    EXPECT_EQ(original.size(), 64U);
+    EXPECT_EQ(source->inputs(selection), original);
+    report.official.clear();
+    const auto replacement = source->inputs(selection);
+    EXPECT_NE(replacement, original);
+    EXPECT_EQ(source->inputs(selection), replacement);
+    source = std::make_unique<LivePlanSource>(services, process, [] { return std::nullopt; }, root, root);
+    const auto missing = source->inputs(selection);
+    EXPECT_NE(missing, replacement);
+    EXPECT_EQ(source->inputs(selection), missing);
+    EXPECT_TRUE(process.specs.empty());
+}
+
+TEST_F(JobsLivePlan, ManualInputsBindEveryCapturedPreviewField) {
+    manual::Preview preview;
+    preview.preview_id = "preview-1";
+    preview.host = "example.org";
+    preview.owner_repo = "owner/project";
+    preview.commit = std::string(40, 'a');
+    preview.selected_script_text = "install";
+    preview.entry_points = {{"install.sh", manual::EntryKind::Script}};
+    source = std::make_unique<LivePlanSource>(services, process, [this] { return report; }, root, root,
+        [&](std::string_view id) -> std::optional<manual::Preview> {
+            EXPECT_EQ(id, "preview-1");
+            return preview;
+        });
+    for (const auto* kind : {"manual-install", "manual-upgrade"}) {
+        const protocol::PlanParams selection{.kind = kind, .previewId = "preview-1"};
+        auto previous = source->inputs(selection);
+        EXPECT_EQ(source->inputs(selection), previous);
+        const auto changed = [&] {
+            const auto current = source->inputs(selection);
+            EXPECT_NE(current, previous);
+            EXPECT_EQ(source->inputs(selection), current);
+            previous = current;
+        };
+        preview.commit = std::string(40, preview.commit.front() == 'a' ? 'b' : 'a');
+        changed();
+        preview.preview_id += "x";
+        changed();
+        preview.host += "x";
+        changed();
+        preview.owner_repo += "x";
+        changed();
+        preview.selected_script_text += "x";
+        changed();
+        preview.staging_supported = !preview.staging_supported;
+        changed();
+        preview.entry_points.front().path += "x";
+        changed();
+        preview.entry_points.front().kind = preview.entry_points.front().kind == manual::EntryKind::Script ?
+            manual::EntryKind::MakeInstall : manual::EntryKind::Script;
+        changed();
+        preview.entry_points.push_back({"other.sh", manual::EntryKind::Script});
+        changed();
+    }
+    const protocol::PlanParams official{.kind = "install", .packageId = "target"};
+    const auto before = source->inputs(official);
+    preview.commit = "different";
+    EXPECT_EQ(source->inputs(official), before);
+    EXPECT_TRUE(process.specs.empty());
+}
+
+TEST_F(JobsLivePlan, PrepareCapturesReportWithoutCallingItFromTask) {
+    int report_calls = 0;
+    bool report_valid = true;
+    source = std::make_unique<LivePlanSource>(services, process, [&] {
+        ++report_calls;
+        EXPECT_TRUE(report_valid);
+        return report;
+    }, root, root);
+    const auto expected = source->snapshot({.kind = "update-system"});
+    ASSERT_TRUE(expected);
+    auto task = source->prepare({.kind = "update-system"});
+    EXPECT_EQ(report_calls, 2);
+    report.report_id = "missing";
+    report.official.clear();
+    report_valid = false;
+    const std::atomic<bool> cancelled{false};
+    const auto snapshot = task(cancelled);
+    ASSERT_TRUE(snapshot);
+    EXPECT_EQ(report_calls, 2);
+    EXPECT_EQ(snapshot->fingerprint, expected->fingerprint);
+    EXPECT_EQ(snapshot->expected_transaction, expected->expected_transaction);
+    EXPECT_EQ(snapshot->plan.kind.value, expected->plan.kind.value);
+    EXPECT_EQ(nlohmann::json(snapshot->plan.upgrades), nlohmann::json(expected->plan.upgrades));
+    EXPECT_EQ(nlohmann::json(snapshot->plan.installs), nlohmann::json(expected->plan.installs));
+}
+
+TEST_F(JobsLivePlan, TaskUsesProvidedDetailInsteadOfServices) {
+    int detail_calls = 0;
+    source = std::make_unique<LivePlanSource>(services, process, [this] { return report; }, root, root,
+        LivePlanSource::PreviewLookup{}, [&](const protocol::GetParams& params) -> api::ServiceResult<protocol::GetResult> {
+            ++detail_calls;
+            EXPECT_EQ(params.packageId, "target");
+            protocol::GetResult detail;
+            detail.details.package = {{"official"}, "extra", "target"};
+            detail.details.version = "3-1";
+            detail.source = {"official"};
+            return detail;
+        });
+    auto task = source->prepare({.kind = "install", .packageId = "target"});
+    const std::atomic<bool> cancelled{false};
+    const auto snapshot = task(cancelled);
+    ASSERT_TRUE(snapshot);
+    EXPECT_EQ(detail_calls, 1);
+    EXPECT_EQ(services.get_calls, 0);
+    EXPECT_EQ(snapshot->planned_version, "3-1");
+}
+
+TEST_F(JobsLivePlan, CancelledTaskStartsNoProcesses) {
+    auto task = source->prepare({.kind = "update-system"});
+    const std::atomic<bool> cancelled{true};
+    const auto snapshot = task(cancelled);
+    ASSERT_FALSE(snapshot);
+    EXPECT_EQ(snapshot.error().code, protocol::kCancelled);
+    EXPECT_TRUE(process.specs.empty());
+    EXPECT_EQ(services.get_calls, 0);
+}
+
+TEST_F(JobsLivePlan, EveryTaskProcessReceivesItsCancelFlag) {
+    const std::atomic<bool> cancelled{false};
+    auto task = source->prepare({.kind = "update-system"});
+    ASSERT_TRUE(task(cancelled));
+    ASSERT_EQ(process.specs.size(), 3);
+    for (const auto& spec : process.specs) EXPECT_EQ(spec.cancel, &cancelled);
+    process.specs.clear();
+    report.official.clear();
+    process.preview.out = "target 1-1 extra 42\n";
+    auto install = source->prepare({.kind = "install", .packageId = "target"});
+    ASSERT_TRUE(install(cancelled));
+    ASSERT_EQ(process.specs.size(), 3);
+    for (const auto& spec : process.specs) EXPECT_EQ(spec.cancel, &cancelled);
+}
 
 TEST_F(JobsLivePlan, UpdateDigestBindsExactOutputAndListsNewInstalls) {
     const auto snapshot = source->snapshot({.kind = "update-system"});

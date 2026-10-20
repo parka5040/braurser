@@ -237,6 +237,7 @@ std::expected<GitReply, ManualError> CurlGitHttp::request(
 
 std::expected<GitReply, ManualError> CurlGitHttp::request_bounded(
     std::string_view url, std::string_view body, bool post, std::size_t max_bytes) {
+    if (cancel_ && cancel_->load()) return std::unexpected(fail("cancelled"));
     if (url.size() > 8192 || !url.starts_with("https://") ||
         (post && body.size() > 512ULL * 1024 * 1024)) return std::unexpected(fail("git-request"));
     static const bool initialized = curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
@@ -277,6 +278,14 @@ std::expected<GitReply, ManualError> CurlGitHttp::request_bounded(
     curl_easy_setopt(handle.get(), CURLOPT_NOPROXY, "*");
     curl_easy_setopt(handle.get(), CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(handle.get(), CURLOPT_TIMEOUT, 600L);
+    if (cancel_) {
+        curl_easy_setopt(handle.get(), CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(handle.get(), CURLOPT_XFERINFOFUNCTION,
+            +[](void* data, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
+                return static_cast<const std::atomic<bool>*>(data)->load() ? 1 : 0;
+            });
+        curl_easy_setopt(handle.get(), CURLOPT_XFERINFODATA, cancel_);
+    }
     curl_easy_setopt(handle.get(), CURLOPT_MAXFILESIZE_LARGE,
                      static_cast<curl_off_t>(std::min(max_bytes, GitReply::Body::kMaxBytes)));
     curl_easy_setopt(handle.get(), CURLOPT_OPENSOCKETFUNCTION, guarded_socket);
@@ -290,6 +299,7 @@ std::expected<GitReply, ManualError> CurlGitHttp::request_bounded(
         curl_easy_setopt(handle.get(), CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size()));
     }
     const auto status = curl_easy_perform(handle.get());
+    if (status == CURLE_ABORTED_BY_CALLBACK) return std::unexpected(fail("cancelled"));
     if (state.error) return std::unexpected(std::move(*state.error));
     if (status != CURLE_OK)
         return std::unexpected(fail(status == CURLE_FILESIZE_EXCEEDED ? "git-size" : "git-connect"));

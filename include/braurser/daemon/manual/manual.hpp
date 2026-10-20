@@ -2,6 +2,7 @@
 #define BRAURSER_DAEMON_MANUAL_MANUAL_HPP
 
 #include <braurser/daemon/core/process.hpp>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -92,9 +93,10 @@ public:
 
 class CurlGitHttp final : public GitHttp {
 public:
-    /// in: cache_root is an absolute XDG cache root, or empty for the environment default.
-    /// out: configures anonymous response spools beneath the manual cache.
-    explicit CurlGitHttp(std::filesystem::path cache_root = {}) : cache_root_(std::move(cache_root)) {}
+    /// in: cache_root is an absolute XDG cache root, or empty for the environment default; cancel, when set, outlives this object.
+    /// out: configures anonymous response spools beneath the manual cache; a set cancel flag aborts transfers in progress.
+    explicit CurlGitHttp(std::filesystem::path cache_root = {}, const std::atomic<bool>* cancel = nullptr)
+        : cache_root_(std::move(cache_root)), cancel_(cancel) {}
     /// in: url is HTTPS and body is bounded smart-HTTP request data.
     /// out: a bounded anonymous response spool without following redirects.
     std::expected<GitReply, ManualError> request(
@@ -106,6 +108,7 @@ public:
         std::string_view url, std::string_view body, bool post, std::size_t max_bytes) override;
 private:
     std::filesystem::path cache_root_;
+    const std::atomic<bool>* cancel_{};
 };
 
 class GuardedGitTransport {

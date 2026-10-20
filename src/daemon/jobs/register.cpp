@@ -1,4 +1,5 @@
 #include <braurser/daemon/jobs/register.hpp>
+#include <braurser/daemon/jobs/planner.hpp>
 #include <braurser/daemon/core/process.hpp>
 #include <braurser/domain/vercmp.hpp>
 #include <braurser/daemon/jobs/aur.hpp>
@@ -224,10 +225,14 @@ private:
 class Coordinator {
 public:
     Coordinator(api::Services& services, const core::XdgPaths& paths,
-                api::Broadcaster& broadcaster, LivePlanSource::Report report, LivePlanSource::PreviewLookup preview)
+                api::Broadcaster& broadcaster, LivePlanSource::Report report, LivePlanSource::PreviewLookup preview,
+                LivePlanSource::Detail detail, api::Server& server)
         : services_(services), paths_(paths), broadcaster_(broadcaster),
-          report_(std::move(report)), source_(services, read_runner_, report_, paths.state, paths.cache, std::move(preview)),
-          plans_(source_), qt_askpass_(preferred_ui(services) == "qt"), manual_installer_(read_runner_, paths_, qt_askpass_),
+          report_(std::move(report)), source_(services, read_runner_, report_, paths.state, paths.cache, std::move(preview),
+                                              std::move(detail)),
+          plans_(source_, std::chrono::steady_clock::now, &executor_,
+                 [&server](api::ConnectionId id) { return server.alive(id); }),
+          qt_askpass_(preferred_ui(services) == "qt"), manual_installer_(read_runner_, paths_, qt_askpass_),
           runner_(plans_, [] { return std::make_unique<GioStreamingProcess>(); },
           [this](std::string_view, const protocol::JobEvent& event, api::ConnectionId owner) { notify(event, owner); },
           paths.state, auth(),
@@ -241,6 +246,9 @@ public:
           }, std::chrono::steady_clock::now,
           [this](const Snapshot& snapshot) { return after_success(snapshot); }, &manual_installer_) {}
 
+    ~Coordinator() { executor_.stop(); }
+
+    PlanExecutor& executor() { return executor_; }
     PlanManager& plans() { return plans_; }
     JobRunner& runner() { return runner_; }
     void refresh_ui() { qt_askpass_ = preferred_ui(services_) == "qt"; }
@@ -256,6 +264,7 @@ private:
     LivePlanSource::Report report_;
     core::PosixProcessRunner read_runner_;
     LivePlanSource source_;
+    ThreadPlanExecutor executor_;
     PlanManager plans_;
     std::atomic<bool> qt_askpass_;
     UserManualInstaller manual_installer_;
@@ -484,43 +493,70 @@ void bind(api::HandlerRegistry& registry, std::shared_ptr<Coordinator> coordinat
         else reply.error(result.error());
     });
 }
+
+template<class Method, class Action>
+void bind_async(api::HandlerRegistry& registry, std::shared_ptr<Coordinator> coordinator,
+                Action action) {
+    registry.register_handler<Method>([coordinator, action](const auto& params, api::RequestContext request, auto reply) {
+        const auto owner = request.connection;
+        if (!owner || request.uid != getuid()) { reply.error(unavailable()); return; }
+        action(*coordinator, params, owner,
+            std::function<void(Result<typename Method::Result>)>{[reply](Result<typename Method::Result> result) {
+                if (result) reply.ok(*result);
+                else reply.error(result.error());
+            }});
+    });
+}
+
 }
 
 std::function<void()> register_handlers(api::HandlerRegistry& registry, api::Services& services,
                        const core::XdgPaths& paths, api::Broadcaster& broadcaster,
-                       LivePlanSource::Report report, api::Server& server, LivePlanSource::PreviewLookup preview) {
-    auto coordinator = std::make_shared<Coordinator>(services, paths, broadcaster, std::move(report), std::move(preview));
+                       LivePlanSource::Report report, api::Server& server, LivePlanSource::PreviewLookup preview,
+                       LivePlanSource::Detail detail) {
+    auto coordinator = std::make_shared<Coordinator>(services, paths, broadcaster, std::move(report), std::move(preview),
+                                                     std::move(detail), server);
     server.on_disconnect([weak = std::weak_ptr(coordinator)](api::ConnectionId id) {
-        if (auto owner = weak.lock()) owner->runner().disconnect(id);
+        if (auto owner = weak.lock()) {
+            owner->plans().disconnect(id);
+            owner->runner().disconnect(id);
+        }
     });
-    bind<api::PlanParamsMethod>(registry, coordinator,
-        [](auto& context, const protocol::PlanParams& params, api::ConnectionId owner) { return context.plans().create(params, owner); });
-    bind<api::UpdatesPlanParamsMethod>(registry, coordinator,
-        [](auto& context, const protocol::UpdatesPlanParams& params, api::ConnectionId owner) -> Result<protocol::UpdatesPlanResult> {
+    bind_async<api::PlanParamsMethod>(registry, coordinator,
+        [](auto& context, const protocol::PlanParams& params, api::ConnectionId owner, auto done) {
+            context.plans().create(params, owner, std::move(done));
+        });
+    bind_async<api::UpdatesPlanParamsMethod>(registry, coordinator,
+        [](auto& context, const protocol::UpdatesPlanParams& params, api::ConnectionId owner, auto done) {
             protocol::PlanParams selection;
-            if (params.selection.kind.value != "system" || params.selection.id || params.alsoInstallPackageId)
-                return std::unexpected(Error{protocol::kUnsupportedCapability, "error.generic_title"});
-            if (!context.matches_report(params.reportId))
-                return std::unexpected(Error{protocol::kStalePlan, "error.generic_title"});
+            if (params.selection.kind.value != "system" || params.selection.id || params.alsoInstallPackageId) {
+                done(std::unexpected(Error{protocol::kUnsupportedCapability, "error.generic_title"}));
+                return;
+            }
+            if (!context.matches_report(params.reportId)) {
+                done(std::unexpected(Error{protocol::kStalePlan, "error.generic_title"}));
+                return;
+            }
             selection.kind = "update-system";
-            auto plan = context.plans().create(selection, owner);
-            if (!plan) return std::unexpected(plan.error());
-            return protocol::UpdatesPlanResult{plan->plan_id, {*plan}, plan->restart, true, plan->blockers};
+            context.plans().create(selection, owner, [done = std::move(done)](Result<protocol::TransactionPlan> plan) {
+                if (!plan) { done(std::unexpected(plan.error())); return; }
+                done(protocol::UpdatesPlanResult{plan->plan_id, {*plan}, plan->restart, true, plan->blockers});
+            });
         });
     auto enqueue = [](std::string_view kind) {
-        return [kind](auto& context, const auto& params, api::ConnectionId owner) {
+        return [kind](auto& context, const auto& params, api::ConnectionId owner, auto done) {
             context.refresh_ui();
-            return context.runner().enqueue(params.planId, params.approvalToken, owner, kind);
+            context.runner().enqueue(params.planId, params.approvalToken, owner, kind, std::move(done));
         };
     };
-    bind<api::InstallParamsMethod>(registry, coordinator, enqueue("install"));
-    bind<api::RemoveParamsMethod>(registry, coordinator, enqueue("remove"));
-    bind<api::UpgradeSystemParamsMethod>(registry, coordinator, enqueue("update-system"));
-    bind<api::UpgradeCommunityParamsMethod>(registry, coordinator, enqueue("update-community"));
-    bind<api::ManualInstallParamsMethod>(registry, coordinator, enqueue("manual-install"));
-    bind<api::ManualUpgradeParamsMethod>(registry, coordinator, enqueue("manual-upgrade"));
-    bind<api::ManualRemoveParamsMethod>(registry, coordinator, enqueue("manual-remove"));
-    bind<api::SetupHelperParamsMethod>(registry, coordinator, enqueue("setup-helper"));
+    bind_async<api::InstallParamsMethod>(registry, coordinator, enqueue("install"));
+    bind_async<api::RemoveParamsMethod>(registry, coordinator, enqueue("remove"));
+    bind_async<api::UpgradeSystemParamsMethod>(registry, coordinator, enqueue("update-system"));
+    bind_async<api::UpgradeCommunityParamsMethod>(registry, coordinator, enqueue("update-community"));
+    bind_async<api::ManualInstallParamsMethod>(registry, coordinator, enqueue("manual-install"));
+    bind_async<api::ManualUpgradeParamsMethod>(registry, coordinator, enqueue("manual-upgrade"));
+    bind_async<api::ManualRemoveParamsMethod>(registry, coordinator, enqueue("manual-remove"));
+    bind_async<api::SetupHelperParamsMethod>(registry, coordinator, enqueue("setup-helper"));
     bind<api::JobsGetParamsMethod>(registry, coordinator,
         [](auto& context, const protocol::JobsGetParams& params, api::ConnectionId owner) { return context.runner().get(params, owner); });
     bind<api::JobsListParamsMethod>(registry, coordinator,
@@ -532,7 +568,10 @@ std::function<void()> register_handlers(api::HandlerRegistry& registry, api::Ser
     bind<api::JobsDequeueParamsMethod>(registry, coordinator,
         [](auto& context, const protocol::JobsDequeueParams& params, api::ConnectionId owner) { return context.runner().dequeue(params.jobId, owner); });
     return [weak = std::weak_ptr(coordinator)] {
-        if (auto owner = weak.lock()) owner->runner().stop();
+        if (auto owner = weak.lock()) {
+            owner->executor().stop();
+            owner->runner().stop();
+        }
     };
 }
 

@@ -56,6 +56,9 @@ public:
     void broadcast(const protocol::Notification& notification);
     /// in: connection identifies the exact authenticated recipient.
     void emit_to(ConnectionId connection, const protocol::Notification& notification);
+    /// pre: runs on the daemon thread.
+    /// out: true only for a connected, non-closing client; false for zero or unknown identities.
+    bool alive(ConnectionId connection) const;
     /// in: callback is invoked when an authenticated connection closes.
     void on_disconnect(std::function<void(ConnectionId)> callback);
 

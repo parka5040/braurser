@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstring>
 #include <mutex>
+#include <map>
 #include <braurser/validate/validate.hpp>
 #include <array>
 #include <functional>
@@ -140,19 +141,20 @@ int create_transport(git_transport** output, git_remote* owner, void* param) {
     return git_transport_smart(output, owner, &definition);
 }
 
-std::mutex registration_mutex;
+std::mutex repository_mutexes_mutex;
+std::map<std::string, std::weak_ptr<std::mutex>> repository_mutexes;
 
-class Registered {
-public:
-    explicit Registered(GitHttp& http) : lock_(registration_mutex) {
-        ok_ = git_transport_register("https", create_transport, &http) == 0;
+std::shared_ptr<std::mutex> repository_mutex(const std::filesystem::path& path) {
+    std::lock_guard lock(repository_mutexes_mutex);
+    std::erase_if(repository_mutexes, [](const auto& entry) { return entry.second.expired(); });
+    auto& entry = repository_mutexes[path.string()];
+    auto mutex = entry.lock();
+    if (!mutex) {
+        mutex = std::make_shared<std::mutex>();
+        entry = mutex;
     }
-    ~Registered() { if (ok_) git_transport_unregister("https"); }
-    bool ok() const { return ok_; }
-private:
-    std::unique_lock<std::mutex> lock_;
-    bool ok_{};
-};
+    return mutex;
+}
 
 }
 
@@ -168,10 +170,12 @@ std::expected<std::filesystem::path, ManualError> fetch_bare(
     static const int initialized = git_libgit2_init();
     if (initialized < 0) return std::unexpected(fail("git-init"));
     auto preview_dir = cache_root / "braurser/manual" / std::string(preview_id);
+    const auto bare = preview_dir / "repo.git";
+    const auto mutex = repository_mutex(bare);
+    std::lock_guard lock(*mutex);
     for (const auto& part : {cache_root / "braurser", cache_root / "braurser/manual", preview_dir}) {
         if (!core::ensure_private_dir(part)) return std::unexpected(fail("fetch-cache"));
     }
-    const auto bare = preview_dir / "repo.git";
     git_repository* raw = nullptr;
     if (std::filesystem::exists(bare)) {
         if (std::filesystem::is_symlink(bare) || git_repository_open_bare(&raw, bare.c_str()) != 0)
@@ -189,8 +193,6 @@ std::expected<std::filesystem::path, ManualError> fetch_bare(
         return std::unexpected(fail("fetch-remote"));
     std::unique_ptr<git_remote, decltype(&git_remote_free)> remote(raw_remote, git_remote_free);
     BudgetedHttp budgeted(http);
-    Registered guard(budgeted);
-    if (!guard.ok()) return std::unexpected(fail("fetch-register"));
     last_error.reset();
     const std::string branch = std::string(revision);
     const auto safe_ref = [](std::string_view name) {
@@ -215,6 +217,8 @@ std::expected<std::filesystem::path, ManualError> fetch_bare(
     git_fetch_options options;
     git_fetch_options_init(&options, GIT_FETCH_OPTIONS_VERSION);
     options.download_tags = GIT_REMOTE_DOWNLOAD_TAGS_NONE;
+    options.callbacks.transport = create_transport;
+    options.callbacks.payload = static_cast<GitHttp*>(&budgeted);
     if (git_remote_fetch(remote.get(), &array, &options, nullptr) != 0) {
         if (last_error) return std::unexpected(*last_error);
         auto failure = fail("fetch-failed");

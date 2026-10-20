@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 #include <chrono>
+#include <cerrno>
+#include <thread>
 #include <csignal>
 #include <fcntl.h>
 #include <string>
@@ -58,6 +60,41 @@ TEST(Process, TimeoutTerminatesGroupAndReaps) {
     EXPECT_TRUE(result->timed_out);
     EXPECT_TRUE(result->signaled);
     EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(4));
+}
+
+TEST(Process, PreCancelledDoesNotSpawn) {
+    PosixProcessRunner runner;
+    std::atomic<bool> cancelled{true};
+    auto input = spec("/usr/bin/touch");
+    const auto marker = std::filesystem::temp_directory_path() /
+        ("braurser-cancelled-process-" + std::to_string(getpid()));
+    ASSERT_FALSE(std::filesystem::exists(marker));
+    input.args = {marker.string()};
+    input.cancel = &cancelled;
+    auto result = runner.run(input);
+    EXPECT_FALSE(std::filesystem::exists(marker));
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, ECANCELED);
+    EXPECT_EQ(result.error().message, "cancelled");
+}
+
+TEST(Process, RunningCancelTerminatesAndReaps) {
+    PosixProcessRunner runner;
+    std::atomic<bool> cancelled{false};
+    auto input = spec("/usr/bin/sleep");
+    input.args = {"30"};
+    input.timeout = std::chrono::seconds(40);
+    input.cancel = &cancelled;
+    std::jthread cancel([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        cancelled.store(true);
+    });
+    const auto start = std::chrono::steady_clock::now();
+    auto result = runner.run(input);
+    ASSERT_TRUE(result);
+    EXPECT_TRUE(result->timed_out);
+    EXPECT_TRUE(result->signaled);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(3));
 }
 
 TEST(Process, SendsStdin) {

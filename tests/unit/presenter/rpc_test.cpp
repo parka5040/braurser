@@ -16,6 +16,15 @@
 
 namespace braurser::presenter {
 namespace {
+class TimeoutRpc final : public Rpc {
+public:
+    std::chrono::milliseconds timeout{};
+    void request(std::string_view, nlohmann::json, Callback, std::chrono::milliseconds value) override {
+        timeout = value;
+    }
+    Subscription subscribe(std::string_view, std::function<void(const nlohmann::json&)>) override { return {}; }
+};
+
 class MainLoop final : public Dispatcher {
 public:
     void post(std::function<void()> callback) override { std::lock_guard lock(mutex_); callbacks_.push_back(std::move(callback)); }
@@ -101,6 +110,32 @@ private:
 };
 RpcOptions options() { RpcOptions value; value.launch_daemon = false; value.initial_backoff = std::chrono::milliseconds(10); return value; }
 }
+TEST(RpcClient, PlanningAndMutationCallsAllowThePlanningDeadline) {
+    TimeoutRpc rpc;
+    const auto check = [&]<class Params>() {
+        using Descriptor = Method<Params>;
+        const auto params = payload(Descriptor::name, "params").template get<Params>();
+        rpc.call<Descriptor>(params, [](auto) {});
+        constexpr bool planning = Descriptor::name == Method<protocol::PlanParams>::name ||
+            Descriptor::name == Method<protocol::UpdatesPlanParams>::name ||
+            Descriptor::name == Method<protocol::InstallParams>::name ||
+            Descriptor::name == Method<protocol::RemoveParams>::name ||
+            Descriptor::name == Method<protocol::UpgradeSystemParams>::name ||
+            Descriptor::name == Method<protocol::UpgradeCommunityParams>::name ||
+            Descriptor::name == Method<protocol::ManualInstallParams>::name ||
+            Descriptor::name == Method<protocol::ManualUpgradeParams>::name ||
+            Descriptor::name == Method<protocol::ManualRemoveParams>::name ||
+            Descriptor::name == Method<protocol::SetupHelperParams>::name;
+        EXPECT_EQ(rpc.timeout, std::chrono::seconds(planning ? 200 : 30)) << Descriptor::name;
+    };
+#define BRAURSER_CHECK_TIMEOUT(name, params, result) check.operator()<protocol::params>();
+    BRAURSER_PROTOCOL_METHODS(BRAURSER_CHECK_TIMEOUT)
+#undef BRAURSER_CHECK_TIMEOUT
+    rpc.call<Method<protocol::PlanParams>>({.kind = "install", .packageId = "target"}, [](auto) {},
+        std::chrono::seconds(5));
+    EXPECT_EQ(rpc.timeout, std::chrono::seconds(5));
+}
+
 TEST(RpcClient, AllGoldenMethodsUseRealFramingAndDispatcher) {
     MainLoop loop; auto pairs = std::make_shared<Pairs>(); FakeServer server(pairs->add()); RpcClient client(loop, options(), pairs);
     const auto main_thread = std::this_thread::get_id(); std::size_t completed = 0;

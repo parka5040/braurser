@@ -1,6 +1,7 @@
 #ifndef BRAURSER_DAEMON_CORE_PROCESS_HPP
 #define BRAURSER_DAEMON_CORE_PROCESS_HPP
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <expected>
@@ -21,6 +22,7 @@ struct ProcessSpec {
     std::size_t max_stdout{1024 * 1024};
     std::size_t max_stderr{1024 * 1024};
     std::optional<std::string> stdin_data;
+    const std::atomic<bool>* cancel{};
 };
 
 struct ProcessResult {
@@ -42,8 +44,8 @@ struct ProcessError {
 class ProcessRunner {
 public:
     virtual ~ProcessRunner() = default;
-    /// in: spec contains an absolute executable and a bounded timeout.
-    /// out: returns the exit status and captured output, including on timeout.
+    /// in: spec contains an absolute executable and a bounded timeout; cancel, when set, outlives the call.
+    /// out: returns the exit status and captured output, including on timeout; a set cancel flag ends the run like a timeout.
     /// err: returns a process error if validation, setup or spawning fails.
     virtual std::expected<ProcessResult, ProcessError> run(const ProcessSpec& spec) = 0;
 };

@@ -193,6 +193,9 @@ ssize_t write_pipe(int fd, const char* data, std::size_t length) {
 }
 
 std::expected<ProcessResult, ProcessError> PosixProcessRunner::run(const ProcessSpec& spec) {
+    if (spec.cancel && spec.cancel->load()) {
+        return std::unexpected(ProcessError{ECANCELED, "cancelled"});
+    }
     if (auto status = validate(spec); !status) {
         return std::unexpected(status.error());
     }
@@ -262,7 +265,7 @@ std::expected<ProcessResult, ProcessError> PosixProcessRunner::run(const Process
     bool killed_for_output = false;
     while (!reaped || output->read.get() >= 0 || errors->read.get() >= 0) {
         const auto now = std::chrono::steady_clock::now();
-        if (!result.timed_out && now >= deadline &&
+        if (!result.timed_out && (now >= deadline || (spec.cancel && spec.cancel->load())) &&
             (!reaped || output->read.get() >= 0 || errors->read.get() >= 0)) {
             result.timed_out = true;
             signal_group(pid, SIGTERM, reaped);

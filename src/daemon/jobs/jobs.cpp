@@ -62,55 +62,184 @@ bool valid_target(std::string_view name) {
 }
 }
 
-Result<protocol::TransactionPlan> PlanManager::create(const protocol::PlanParams& selection, api::ConnectionId owner) {
-    if (owner == 0) return std::unexpected(failure(protocol::kAuthorizationUnavailable));
+void PlanManager::create(const protocol::PlanParams& selection, api::ConnectionId owner, Planned done) {
+    if (owner == 0) { done(std::unexpected(failure(protocol::kAuthorizationUnavailable))); return; }
     for (auto it = entries_.begin(); it != entries_.end();) {
         if (it->second.used || now_() >= it->second.expires) it = entries_.erase(it);
         else ++it;
     }
-    if (entries_.size() >= 256) return std::unexpected(failure(protocol::kBusy));
-    auto snapshot = source_.snapshot(selection);
-    if (!snapshot) return std::unexpected(snapshot.error());
-    if (snapshot->fingerprint.empty() || snapshot->fingerprint.size() > 16 * 1024 * 1024 ||
-        snapshot->targets.size() > 512)
-        return std::unexpected(failure(protocol::kUntrustedInput));
-    for (const auto& target : snapshot->targets)
-        if (target.size() > 4096 || target.find('\0') != std::string::npos)
-            return std::unexpected(failure(protocol::kUntrustedInput));
-    snapshot->selection = selection;
-    snapshot->fingerprint = digest(snapshot->fingerprint);
-    snapshot->plan.plan_id = random_token();
-    snapshot->plan.revision = ++revision_;
-    snapshot->plan.approval_token = random_token();
-    try { static_cast<void>(nlohmann::json(snapshot->plan)); }
-    catch (const std::exception&) { return std::unexpected(failure(protocol::kUntrustedInput)); }
-    auto token = snapshot->plan.approval_token;
-    auto plan = snapshot->plan;
-    entries_.emplace(plan.plan_id, Entry{selection, std::move(*snapshot), std::move(token), owner,
-                     now_() + std::chrono::minutes(10)});
-    return plan;
+    const auto creating = std::ranges::count_if(flights_, [](const auto& item) { return item.second.creating; });
+    const auto owned = std::ranges::count_if(flights_, [owner](const auto& item) { return item.second.owner == owner; });
+    if (entries_.size() + static_cast<std::size_t>(creating) >= 256 || owned >= 4) {
+        done(std::unexpected(failure(protocol::kBusy)));
+        return;
+    }
+    PlanTask task;
+    std::string inputs;
+    try { inputs = source_.inputs(selection); }
+    catch (...) { done(std::unexpected(failure(protocol::kStalePlan))); return; }
+    try { task = source_.prepare(selection); }
+    catch (const std::exception&) { done(std::unexpected(failure(protocol::kUntrustedInput))); return; }
+    const auto flight = ++next_flight_;
+    flights_.emplace(flight, InFlight{owner, 0, true, false});
+    const auto ticket = executor_.submit(PlanLane::Plan, std::move(task),
+        [this, lifetime = std::weak_ptr<int>(lifetime_), flight, selection, owner,
+         inputs = std::move(inputs), done](Result<Snapshot> snapshot) {
+            if (lifetime.expired()) return;
+            const auto it = flights_.find(flight);
+            if (it == flights_.end()) return;
+            const bool cancelled = it->second.cancelled;
+            flights_.erase(it);
+            if (cancelled) { done(std::unexpected(failure(protocol::kCancelled))); return; }
+            if (live_ && !live_(owner)) { done(std::unexpected(failure(protocol::kCancelled))); return; }
+            auto result = [&]() -> Result<protocol::TransactionPlan> {
+                if (!snapshot) return std::unexpected(snapshot.error());
+                try {
+                    if (source_.inputs(selection) != inputs) return std::unexpected(failure(protocol::kStalePlan));
+                } catch (...) { return std::unexpected(failure(protocol::kStalePlan)); }
+                try {
+                    if (snapshot->fingerprint.empty() || snapshot->fingerprint.size() > 16 * 1024 * 1024 ||
+                        snapshot->targets.size() > 512)
+                        return std::unexpected(failure(protocol::kUntrustedInput));
+                    for (const auto& target : snapshot->targets)
+                        if (target.size() > 4096 || target.find('\0') != std::string::npos)
+                            return std::unexpected(failure(protocol::kUntrustedInput));
+                    snapshot->selection = selection;
+                    snapshot->fingerprint = digest(snapshot->fingerprint);
+                    snapshot->plan.plan_id = random_token();
+                    snapshot->plan.revision = ++revision_;
+                    snapshot->plan.approval_token = random_token();
+                    static_cast<void>(nlohmann::json(snapshot->plan));
+                    auto token = snapshot->plan.approval_token;
+                    auto plan = snapshot->plan;
+                    entries_.emplace(plan.plan_id, Entry{selection, std::move(*snapshot), std::move(token), owner,
+                                     now_() + std::chrono::minutes(10)});
+                    return plan;
+                } catch (const std::exception&) { return std::unexpected(failure(protocol::kUntrustedInput)); }
+            }();
+            done(std::move(result));
+        });
+    if (auto it = flights_.find(flight); it != flights_.end()) {
+        if (ticket == 0) {
+            flights_.erase(it);
+            done(std::unexpected(failure(protocol::kBusy)));
+        } else {
+            it->second.ticket = ticket;
+            if (it->second.cancelled) executor_.cancel(ticket);
+        }
+    }
 }
 
-bool PlanManager::unchanged(const Snapshot& snapshot, const protocol::PlanParams& selection) {
+PlanManager::Flight PlanManager::unchanged(const Snapshot& snapshot, const protocol::PlanParams& selection, Checked done) {
+    PlanTask task;
+    std::string inputs;
     try {
-        auto current = source_.snapshot(selection);
-        if (!current || current->fingerprint.empty() || current->fingerprint.size() > 16 * 1024 * 1024)
-            return false;
-        current->fingerprint = digest(current->fingerprint);
-        return same(snapshot, *current);
-    } catch (const std::exception&) { return false; }
+        inputs = source_.inputs(selection);
+        task = source_.prepare(selection);
+    } catch (...) { done(false); return 0; }
+    const auto flight = ++next_flight_;
+    flights_.emplace(flight, InFlight{0, 0, false, false});
+    const auto ticket = executor_.submit(PlanLane::Approval, std::move(task),
+        [this, lifetime = std::weak_ptr<int>(lifetime_), flight, snapshot, selection,
+         inputs = std::move(inputs), done](Result<Snapshot> current) {
+            if (lifetime.expired()) return;
+            const auto it = flights_.find(flight);
+            if (it == flights_.end()) return;
+            const bool cancelled = it->second.cancelled;
+            flights_.erase(it);
+            bool matches = false;
+            try {
+                if (!cancelled && current && source_.inputs(selection) == inputs && !current->fingerprint.empty() &&
+                    current->fingerprint.size() <= 16 * 1024 * 1024) {
+                    current->fingerprint = digest(current->fingerprint);
+                    matches = same(snapshot, *current);
+                }
+            } catch (...) {}
+            done(matches);
+        });
+    if (auto it = flights_.find(flight); it != flights_.end()) {
+        if (ticket == 0) { flights_.erase(it); done(false); return 0; }
+        it->second.ticket = ticket;
+        if (it->second.cancelled) executor_.cancel(ticket);
+    }
+    return flight;
 }
 
-Result<Snapshot> PlanManager::approve(std::string_view id, std::string_view token, api::ConnectionId owner) {
+void PlanManager::approve(std::string_view id, std::string_view token, api::ConnectionId owner, Approved done) {
     auto entry = entries_.find(id);
     if (owner == 0 || entry == entries_.end() || entry->second.owner != owner ||
-        entry->second.token != token || entry->second.used ||
-        now_() >= entry->second.expires)
-        return std::unexpected(failure(protocol::kStalePlan));
+        entry->second.token != token || entry->second.used || now_() >= entry->second.expires) {
+        done(std::unexpected(failure(protocol::kStalePlan)));
+        return;
+    }
+    if (std::ranges::count_if(flights_, [owner](const auto& item) { return item.second.owner == owner; }) >= 4) {
+        done(std::unexpected(failure(protocol::kBusy)));
+        return;
+    }
     entry->second.used = true;
-    if (!unchanged(entry->second.snapshot, entry->second.selection))
-        return std::unexpected(failure(protocol::kStalePlan));
-    return entry->second.snapshot;
+    auto snapshot = std::move(entry->second.snapshot);
+    auto selection = std::move(entry->second.selection);
+    PlanTask task;
+    std::string inputs;
+    try {
+        inputs = source_.inputs(selection);
+        task = source_.prepare(selection);
+    } catch (...) { done(std::unexpected(failure(protocol::kStalePlan))); return; }
+    const auto flight = ++next_flight_;
+    flights_.emplace(flight, InFlight{owner, 0, false, false});
+    const auto ticket = executor_.submit(PlanLane::Approval, std::move(task),
+        [this, lifetime = std::weak_ptr<int>(lifetime_), flight, snapshot = std::move(snapshot),
+         selection = std::move(selection), owner, inputs = std::move(inputs), done](Result<Snapshot> current) mutable {
+            if (lifetime.expired()) return;
+            const auto it = flights_.find(flight);
+            if (it == flights_.end()) return;
+            const bool cancelled = it->second.cancelled;
+            flights_.erase(it);
+            if (cancelled || (!current && current.error().code == protocol::kCancelled)) {
+                done(std::unexpected(failure(protocol::kCancelled)));
+                return;
+            }
+            if (live_ && !live_(owner)) { done(std::unexpected(failure(protocol::kCancelled))); return; }
+            bool matches = false;
+            try {
+                if (current && source_.inputs(selection) == inputs && !current->fingerprint.empty() &&
+                    current->fingerprint.size() <= 16 * 1024 * 1024) {
+                    current->fingerprint = digest(current->fingerprint);
+                    matches = same(snapshot, *current);
+                }
+            } catch (...) {}
+            if (matches) {
+                snapshot.selection = std::move(selection);
+                done(std::move(snapshot));
+            } else done(std::unexpected(failure(protocol::kStalePlan)));
+        });
+    if (auto it = flights_.find(flight); it != flights_.end()) {
+        if (ticket == 0) {
+            flights_.erase(it);
+            done(std::unexpected(failure(protocol::kBusy)));
+        } else {
+            it->second.ticket = ticket;
+            if (it->second.cancelled) executor_.cancel(ticket);
+        }
+    }
+}
+
+void PlanManager::cancel(Flight flight) {
+    const auto it = flights_.find(flight);
+    if (it == flights_.end()) return;
+    it->second.cancelled = true;
+    executor_.cancel(it->second.ticket);
+}
+
+void PlanManager::disconnect(api::ConnectionId owner) {
+    if (owner == 0) return;
+    std::erase_if(entries_, [owner](const auto& item) { return item.second.owner == owner; });
+    for (auto& [flight, request] : flights_) {
+        static_cast<void>(flight);
+        if (request.owner != owner) continue;
+        request.cancelled = true;
+        executor_.cancel(request.ticket);
+    }
 }
 
 Result<core::ProcessSpec> official_spec(std::string_view kind, const std::vector<std::string>& targets,
@@ -247,51 +376,66 @@ void JobRunner::transition(Job& job, std::string_view state) {
                                                             {std::string(state)}});
 }
 
-Result<protocol::JobIdResult> JobRunner::enqueue(std::string_view id, std::string_view token, api::ConnectionId owner,
-                                                  std::string_view requested_kind) {
-    if (stopping_ || pending_.size() >= 256 || jobs_.size() >= 306)
-        return std::unexpected(failure(protocol::kBusy));
-    auto approved = plans_.approve(id, token, owner);
-    if (!approved) return std::unexpected(approved.error());
-    const auto& kind = approved->plan.kind.value;
-    if (!requested_kind.empty() && requested_kind != kind &&
-        !(requested_kind == "install" && kind == "update-and-install"))
-        return std::unexpected(failure(protocol::kInvalidParams));
-    if (!approved->plan.protected_blockers.empty() || !approved->plan.blockers.empty() ||
-        !approved->plan.conflicts.empty())
-        return std::unexpected(failure(protocol::kUnsafeTransaction));
-    auto job_id = random_token();
-    Job job;
-    job.enqueuing = true;
-    job.id = job_id;
-    job.owner = owner;
-    job.snapshot = std::move(*approved);
-    job.selection = job.snapshot.selection;
-    auto& queued = jobs_.emplace(job_id, std::move(job)).first->second;
-    transition(queued, "queued");
-    if (queued.snapshot.plan.requires_build_review) {
-        try {
-            protocol::QuestionChoice choice{protocol::BuildReviewQuestion{
-                queued.snapshot.plan.build_review_refs,
-                queued.snapshot.helper_build ?
-                    std::optional(queued.snapshot.helper_build->pkgbuild) : std::nullopt}};
-            ask(job_id, std::move(choice), {"ack"});
-        } catch (const std::exception&) {}
-        if (!queued.question) {
+void JobRunner::enqueue(std::string_view id, std::string_view token, api::ConnectionId owner,
+                        std::string_view requested_kind, Enqueued done) {
+    if (stopping_ || pending_.size() + approving_ >= 256 || jobs_.size() + approving_ >= 306) {
+        done(std::unexpected(failure(protocol::kBusy)));
+        return;
+    }
+    ++approving_;
+    plans_.approve(id, token, owner,
+        [this, lifetime = std::weak_ptr<int>(lifetime_), owner, requested_kind = std::string(requested_kind),
+         done = std::move(done)](Result<Snapshot> approved) {
+            if (lifetime.expired()) return;
+            --approving_;
+            if (!approved) { done(std::unexpected(approved.error())); return; }
+            if (stopping_) { done(std::unexpected(failure(protocol::kBusy))); return; }
+            const auto& kind = approved->plan.kind.value;
+            if (!requested_kind.empty() && requested_kind != kind &&
+                !(requested_kind == "install" && kind == "update-and-install")) {
+                done(std::unexpected(failure(protocol::kInvalidParams)));
+                return;
+            }
+            if (!approved->plan.protected_blockers.empty() || !approved->plan.blockers.empty() ||
+                !approved->plan.conflicts.empty()) {
+                done(std::unexpected(failure(protocol::kUnsafeTransaction)));
+                return;
+            }
+            auto job_id = random_token();
+            Job job;
+            job.enqueuing = true;
+            job.id = job_id;
+            job.owner = owner;
+            job.snapshot = std::move(*approved);
+            job.selection = job.snapshot.selection;
+            auto& queued = jobs_.emplace(job_id, std::move(job)).first->second;
+            transition(queued, "queued");
+            if (queued.snapshot.plan.requires_build_review) {
+                try {
+                    protocol::QuestionChoice choice{protocol::BuildReviewQuestion{
+                        queued.snapshot.plan.build_review_refs,
+                        queued.snapshot.helper_build ?
+                            std::optional(queued.snapshot.helper_build->pkgbuild) : std::nullopt}};
+                    ask(job_id, std::move(choice), {"ack"});
+                } catch (const std::exception&) {}
+                if (!queued.question) {
+                    queued.enqueuing = false;
+                    transition(queued, "failed");
+                    finish_job(queued);
+                    done(std::unexpected(failure(protocol::kUnsafeTransaction)));
+                    return;
+                }
+            }
             queued.enqueuing = false;
-            transition(queued, "failed");
-            finish_job(queued);
-            return std::unexpected(failure(protocol::kUnsafeTransaction));
-        }
-    }
-    queued.enqueuing = false;
-    if (queued.orphaned) {
-        finish_job(queued);
-        return protocol::JobIdResult{job_id};
-    }
-    pending_.push_back(job_id);
-    pump();
-    return protocol::JobIdResult{job_id};
+            if (queued.orphaned) {
+                finish_job(queued);
+                done(protocol::JobIdResult{job_id});
+                return;
+            }
+            pending_.push_back(job_id);
+            pump();
+            done(protocol::JobIdResult{job_id});
+        });
 }
 
 void JobRunner::line(Job& job, std::string_view text) {
@@ -432,9 +576,9 @@ void JobRunner::pump() {
     } reset{pumping_};
     do {
         pump_again_ = false;
-        if (stopping_ || !active_.empty()) return;
+        if (stopping_ || !active_.empty() || !checking_.empty()) return;
         while (!pending_.empty()) {
-            if (stopping_ || !active_.empty()) return;
+            if (stopping_ || !active_.empty() || !checking_.empty()) return;
             const auto id = pending_.front();
             auto& job = jobs_.at(id);
             if (job.question) {
@@ -446,13 +590,31 @@ void JobRunner::pump() {
                 finish_job(job);
                 continue;
             }
-            pending_.pop_front();
             if (job.snapshot.plan.requires_build_review && !job.reviewed) {
+                pending_.pop_front();
                 transition(job, "failed");
                 finish_job(job);
                 continue;
             }
-            if (!plans_.unchanged(job.snapshot, job.selection)) {
+            if (job.check == Job::Check::None) {
+                job.check = Job::Check::Running;
+                checking_ = id;
+                const auto flight = plans_.unchanged(job.snapshot, job.selection,
+                    [this, lifetime = std::weak_ptr<int>(lifetime_), id](bool matches) {
+                        if (lifetime.expired()) return;
+                        if (checking_ == id) checking_.clear();
+                        const auto it = jobs_.find(id);
+                        if (it != jobs_.end() && !it->second.finished && it->second.check == Job::Check::Running)
+                            it->second.check = matches ? Job::Check::Passed : Job::Check::Failed;
+                        pump();
+                    });
+                if (auto it = jobs_.find(id); it != jobs_.end() && !it->second.finished)
+                    it->second.check_flight = flight;
+                break;
+            }
+            if (job.check == Job::Check::Running) return;
+            pending_.pop_front();
+            if (job.check == Job::Check::Failed) {
                 transition(job, "needs-attention");
                 finish_job(job);
                 continue;
@@ -553,6 +715,10 @@ Result<protocol::JobsCancelResult> JobRunner::cancel(std::string_view id, api::C
     auto& job = it->second;
     if (job.state == "queued" || (job.state == "needs-attention" && job.question)) {
         std::erase(pending_, job.id);
+        if (job.check == Job::Check::Running) {
+            plans_.cancel(job.check_flight);
+            if (checking_ == job.id) checking_.clear();
+        }
         job.question.reset();
         job.choices.clear();
         transition(job, "cancelled");

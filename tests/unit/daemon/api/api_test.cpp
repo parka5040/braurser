@@ -266,6 +266,53 @@ TEST(DaemonSocket, RoundTripsAndBroadcastsWhileIdle) {
     close(fd);
 }
 
+TEST(DaemonSocket, AliveRejectsUnknownAndDeferredClosingConnections) {
+    Gio::init();
+    Runtime runtime;
+    ASSERT_FALSE(runtime.path.empty());
+    api::HandlerRegistry registry;
+    std::atomic<api::ConnectionId> owner{};
+    registry.register_handler<api::HelloParamsMethod>([&](const protocol::HelloParams&, api::RequestContext context, auto reply) {
+        owner = context.connection;
+        protocol::Capabilities capabilities{{"auto"}, "", {"unavailable"}, {"unknown"}, "arch", {}};
+        reply.ok({"0.1.0", protocol::kApiVersion, {"auto"}, capabilities, {{"gtk"}}});
+    });
+    api::Server server(registry, runtime.path);
+    EXPECT_FALSE(server.alive(0));
+    EXPECT_FALSE(server.alive(999));
+    bool disconnected = false;
+    std::promise<void> closed;
+    server.on_disconnect([&](api::ConnectionId id) {
+        EXPECT_EQ(id, owner.load());
+        EXPECT_FALSE(server.alive(id));
+        disconnected = true;
+        closed.set_value();
+    });
+    auto started = server.start();
+    if (!started && started.error() == "cannot create listener: 1") GTEST_SKIP() << "AF_UNIX denied by sandbox";
+    ASSERT_TRUE(started) << started.error();
+    RunningServer running(server);
+    const int fd = connect_client(runtime.path / "braurser/core.sock");
+    ASSERT_GE(fd, 0);
+    ASSERT_TRUE(hello(fd, 1));
+    ASSERT_NE(owner.load(), 0U);
+    std::promise<void> marked;
+    Glib::MainContext::get_default()->invoke([&] {
+        EXPECT_TRUE(server.alive(owner.load()));
+        EXPECT_FALSE(server.alive(0));
+        EXPECT_FALSE(server.alive(owner.load() + 1));
+        server.broadcast({std::string(api::CatalogChangedNotificationEvent::wire_name), nlohmann::json::object()});
+        EXPECT_FALSE(disconnected);
+        EXPECT_FALSE(server.alive(owner.load()));
+        marked.set_value();
+        return false;
+    });
+    marked.get_future().wait();
+    EXPECT_TRUE(closed_by_peer(fd));
+    EXPECT_EQ(closed.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+    close(fd);
+}
+
 TEST(DaemonSocket, ConnectionIdentitiesAreMonotonicAndNotificationsStayPrivate) {
     Gio::init();
     Runtime runtime;
@@ -476,6 +523,17 @@ TEST(DaemonCatalog, SearchesOfficialPackagesWithoutOptionalSourcesAndListsFacets
     EXPECT_EQ(facets->groups[0].name, "utilities");
     ASSERT_EQ(facets->categories.size(), 1U);
     EXPECT_EQ(facets->categories[0].id, "Utility");
+    std::optional<api::ServiceResult<protocol::GetResult>> background;
+    std::jthread worker([&] { background = services.catalog_detail({"core/demo"}); });
+    auto detail = services.get({"core/demo"});
+    worker.join();
+    ASSERT_TRUE(detail);
+    ASSERT_TRUE(detail->appMetadata);
+    ASSERT_TRUE(background);
+    ASSERT_TRUE(*background);
+    EXPECT_FALSE((*background)->appMetadata);
+    detail->appMetadata.reset();
+    EXPECT_EQ(nlohmann::json(**background), nlohmann::json(*detail));
 }
 
 TEST(DaemonCatalog, ResolvesShadowedRepositoriesThroughSearchAndGet) {

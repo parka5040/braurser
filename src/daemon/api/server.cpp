@@ -449,6 +449,15 @@ bool Server::still_connected(const std::shared_ptr<Client>& client) const {
     return found != clients_.end() && found->second == client;
 }
 
+bool Server::alive(ConnectionId connection) const {
+    if (!connection) return false;
+    for (const auto& [fd, client] : clients_) {
+        static_cast<void>(fd);
+        if (client->id == connection) return !client->closing && client->socket->is_connected();
+    }
+    return false;
+}
+
 void Server::on_disconnect(std::function<void(ConnectionId)> callback) {
     disconnect_callbacks_.push_back(std::move(callback));
 }

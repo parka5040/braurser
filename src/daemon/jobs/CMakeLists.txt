@@ -1,6 +1,6 @@
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(JobsGio REQUIRED IMPORTED_TARGET giomm-2.68)
-add_library(braurser-daemon-jobs STATIC process.cpp jobs.cpp live.cpp register.cpp srcinfo.cpp aur.cpp)
+add_library(braurser-daemon-jobs STATIC process.cpp planner.cpp jobs.cpp live.cpp register.cpp srcinfo.cpp aur.cpp)
 target_include_directories(braurser-daemon-jobs PUBLIC "${PROJECT_SOURCE_DIR}/include")
 set(BRAURSER_LIBEXEC_DIR "${CMAKE_INSTALL_PREFIX}/libexec/braurser" CACHE PATH "Private executable directory")
 target_compile_definitions(braurser-daemon-jobs PUBLIC BRAURSER_LIBEXEC_DIR="${BRAURSER_LIBEXEC_DIR}")

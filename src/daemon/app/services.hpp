@@ -29,6 +29,7 @@ public:
     void startup_refresh();
     std::optional<manual::Preview> preview_result(std::string_view id) const;
     std::optional<protocol::UpdateReport> latest_report() const;
+    api::ServiceResult<protocol::GetResult> catalog_detail(const protocol::GetParams& params) const;
 
     api::ServiceResult<protocol::HelloResult> hello(const protocol::HelloParams&) override;
     api::ServiceResult<protocol::StatusResult> status(const protocol::StatusParams&) override;

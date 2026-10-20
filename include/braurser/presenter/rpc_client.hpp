@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <type_traits>
 
 namespace braurser::presenter {
 
@@ -61,6 +62,21 @@ BRAURSER_PROTOCOL_NOTIFICATIONS(BRAURSER_PRESENTER_EVENT)
 using RpcError = protocol::ErrorObject;
 template<class T> using Reply = std::expected<T, RpcError>;
 
+inline constexpr std::chrono::seconds kPlanTimeout{200};
+
+template<class Params>
+inline constexpr std::chrono::seconds kRequestTimeout =
+    std::is_same_v<Params, protocol::PlanParams> ||
+    std::is_same_v<Params, protocol::UpdatesPlanParams> ||
+    std::is_same_v<Params, protocol::InstallParams> ||
+    std::is_same_v<Params, protocol::RemoveParams> ||
+    std::is_same_v<Params, protocol::UpgradeSystemParams> ||
+    std::is_same_v<Params, protocol::UpgradeCommunityParams> ||
+    std::is_same_v<Params, protocol::ManualInstallParams> ||
+    std::is_same_v<Params, protocol::ManualUpgradeParams> ||
+    std::is_same_v<Params, protocol::ManualRemoveParams> ||
+    std::is_same_v<Params, protocol::SetupHelperParams> ? kPlanTimeout : std::chrono::seconds(30);
+
 class Rpc {
 public:
     using Callback = std::function<void(Reply<nlohmann::json>)>;
@@ -71,7 +87,7 @@ public:
     template<class Descriptor>
     void call(const typename Descriptor::Params& params,
               std::function<void(Reply<typename Descriptor::Result>)> callback,
-              std::chrono::milliseconds timeout = std::chrono::seconds(30)) {
+              std::chrono::milliseconds timeout = kRequestTimeout<typename Descriptor::Params>) {
         request(Descriptor::name, nlohmann::json(params), [callback = std::move(callback)](Reply<nlohmann::json> reply) {
             if (!reply) { callback(std::unexpected(reply.error())); return; }
             Reply<typename Descriptor::Result> result = std::unexpected(RpcError{protocol::kInvalidRequest, "error.core_title", nlohmann::json::object()});

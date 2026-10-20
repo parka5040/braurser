@@ -6,6 +6,11 @@
 #include <cstdint>
 #include <array>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <future>
+#include <mutex>
+#include <thread>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <filesystem>
@@ -28,6 +33,20 @@ public:
     std::filesystem::path path;
 };
 
+TEST(Git, CurlPreCancelledDoesNotCreateSpool) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    std::atomic<bool> cancelled{true};
+    CurlGitHttp http(temp.path, &cancelled);
+    auto result = http.request("https://example.com/repo.git/info/refs", {}, false);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, "cancelled");
+    auto bounded = http.request_bounded("https://example.com/repo.git/git-upload-pack", "data", true, 1024);
+    ASSERT_FALSE(bounded);
+    EXPECT_EQ(bounded.error().code, "cancelled");
+    EXPECT_TRUE(std::filesystem::is_empty(temp.path));
+}
+
 class FakeHttp final : public GitHttp {
 public:
     GitReply reply;
@@ -42,7 +61,9 @@ class FakeUploadPack final : public GitHttp {
 public:
     explicit FakeUploadPack(std::filesystem::path repo) : repo_(std::move(repo)) {}
     std::size_t largest_response{};
-    std::expected<GitReply, ManualError> request(std::string_view, std::string_view body, bool post) override {
+    std::vector<std::string> urls;
+    std::expected<GitReply, ManualError> request(std::string_view url, std::string_view body, bool post) override {
+        urls.emplace_back(url);
         braurser::daemon::core::ProcessSpec spec;
         spec.executable = "/usr/bin/git-upload-pack";
         spec.args = {"--stateless-rpc"};
@@ -65,6 +86,41 @@ public:
 private:
     std::filesystem::path repo_;
     braurser::daemon::core::PosixProcessRunner runner_;
+};
+
+class BlockingUploadPack final : public GitHttp {
+public:
+    explicit BlockingUploadPack(std::filesystem::path repo) : upload_(std::move(repo)) {}
+    bool wait_until_entered(std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+        std::unique_lock lock(mutex_);
+        return changed_.wait_for(lock, timeout, [&] { return entered_; });
+    }
+    void release() {
+        std::lock_guard lock(mutex_);
+        released_ = true;
+        changed_.notify_all();
+    }
+    std::expected<GitReply, ManualError> request(
+        std::string_view url, std::string_view body, bool post) override {
+        return request_bounded(url, body, post, 64 * 1024 * 1024);
+    }
+    std::expected<GitReply, ManualError> request_bounded(
+        std::string_view url, std::string_view body, bool post, std::size_t max_bytes) override {
+        {
+            std::unique_lock lock(mutex_);
+            entered_ = true;
+            changed_.notify_all();
+            if (!changed_.wait_for(lock, std::chrono::seconds(5), [&] { return released_; }))
+                return std::unexpected(ManualError{"fixture-http-timeout", {}, {}, {}});
+        }
+        return upload_.request_bounded(url, body, post, max_bytes);
+    }
+private:
+    FakeUploadPack upload_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_{};
+    bool released_{};
 };
 
 std::string build_repo(const std::filesystem::path& path, std::string_view script,
@@ -349,6 +405,73 @@ TEST(GitFetch, FetchesThroughInjectedSmartHttpWithoutNetwork) {
     ASSERT_TRUE(result.has_value()) << result.error().code << " " << result.error().detail;
     EXPECT_EQ(result->commit, commit);
     EXPECT_EQ(result->selected_script_text, "printf test > \"$PREFIX/bin/demo\"\n");
+    EXPECT_EQ(http.urls, (std::vector<std::string>{
+        "https://example.org/demo.git/info/refs?service=git-upload-pack",
+        "https://example.org/demo.git/git-upload-pack"}));
+}
+
+TEST(GitFetch, DifferentRepositoriesFetchWhileAnotherRequestIsBlocked) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    const auto source = temp.path / "source.git";
+    const auto commit = build_repo(source, "true\n");
+    ASSERT_EQ(commit.size(), 40U);
+    BlockingUploadPack first(source);
+    std::expected<Preview, ManualError> first_result = std::unexpected(ManualError{"not-finished", {}, {}, {}});
+    std::jthread worker([&] {
+        first_result = fetch_preview(first, "https://example.org/demo.git", temp.path / "cache", "aur-one");
+    });
+    ASSERT_TRUE(first.wait_until_entered());
+    FakeUploadPack second(source);
+    auto second_result = fetch_preview(second, "https://example.org/demo.git", temp.path / "cache", "aur-two");
+    first.release();
+    worker.join();
+    ASSERT_TRUE(second_result) << second_result.error().code << " " << second_result.error().detail;
+    ASSERT_TRUE(first_result) << first_result.error().code << " " << first_result.error().detail;
+    EXPECT_EQ(second_result->commit, commit);
+    EXPECT_EQ(first_result->commit, commit);
+}
+
+TEST(GitFetch, SameRepositorySerializesOpenAndFetch) {
+    Temp temp;
+    ASSERT_FALSE(temp.path.empty());
+    const auto source = temp.path / "source.git";
+    const auto commit = build_repo(source, "true\n");
+    ASSERT_EQ(commit.size(), 40U);
+    BlockingUploadPack first(source);
+    BlockingUploadPack second(source);
+    second.release();
+    std::expected<Preview, ManualError> first_result = std::unexpected(ManualError{"not-finished", {}, {}, {}});
+    std::expected<Preview, ManualError> second_result = std::unexpected(ManualError{"not-finished", {}, {}, {}});
+    std::jthread first_worker([&] {
+        first_result = fetch_preview(first, "https://example.org/demo.git", temp.path / "cache", "aur-one");
+    });
+    ASSERT_TRUE(first.wait_until_entered());
+    std::promise<void> started;
+    auto ready = started.get_future();
+    std::jthread second_worker([&] {
+        started.set_value();
+        second_result = fetch_preview(second, "https://example.org/demo.git", temp.path / "cache", "aur-one");
+    });
+    EXPECT_EQ(ready.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_FALSE(second.wait_until_entered(std::chrono::milliseconds(200)));
+    first.release();
+    first_worker.join();
+    second_worker.join();
+    ASSERT_TRUE(first_result) << first_result.error().code << " " << first_result.error().detail;
+    ASSERT_TRUE(second_result) << second_result.error().code << " " << second_result.error().detail;
+    EXPECT_TRUE(second.wait_until_entered(std::chrono::milliseconds(0)));
+    EXPECT_EQ(first_result->commit, commit);
+    EXPECT_EQ(second_result->commit, commit);
+    git_repository* raw = nullptr;
+    const auto bare = temp.path / "cache/braurser/manual/aur-one/repo.git";
+    ASSERT_EQ(git_repository_open_bare(&raw, bare.c_str()), 0);
+    std::unique_ptr<git_repository, decltype(&git_repository_free)> repo(raw, git_repository_free);
+    git_oid oid{};
+    ASSERT_EQ(git_reference_name_to_id(&oid, repo.get(), "refs/heads/braurser-preview"), 0);
+    std::array<char, GIT_OID_MAX_HEXSIZE + 1> hex{};
+    git_oid_tostr(hex.data(), hex.size(), &oid);
+    EXPECT_EQ(std::string(hex.data()), commit);
 }
 
 TEST(GitFetch, PinsAndValidatesHelperBuildFileWithoutNetwork) {
